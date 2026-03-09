@@ -18,11 +18,11 @@ Requires Unreal Engine running with Remote Control API plugin enabled (port 3001
 """
 
 import argparse
-import sys
+import logging
 import json
+import sys
 
-sys.path.insert(0, __file__.rsplit("\\", 1)[0] if "\\" in __file__ else __file__.rsplit("/", 1)[0])
-from unreal_remote import UnrealRemote, UnrealRemoteError
+from ramms_tools.unreal_remote import UnrealRemote, UnrealRemoteError
 
 
 def find_kinova_actor(ue: UnrealRemote, actor_hint: str = "") -> tuple:
@@ -32,38 +32,35 @@ def find_kinova_actor(ue: UnrealRemote, actor_hint: str = "") -> tuple:
     Returns (actor_proxy, component_proxy) or (None, None).
     """
     if actor_hint:
-        # User specified an actor path directly
         actor = ue.actor(actor_hint)
-        comp = _find_component_on_actor(ue, actor.object_path, "KinovaGen3")
+        comp = _find_component(ue, actor.object_path, "KinovaGen3")
         return (actor, comp) if comp else (actor, None)
 
-    # Auto-discover: search for actors, then check each for the component
+    # Single server-side call to find actors with matching component
+    results = ue.find_actors_by_component("KinovaGen3")
+    if results:
+        r = results[0]
+        return r["actor_proxy"], ue.actor(r["component_path"])
+
+    # Fallback: iterate actors (slower)
     actors = ue.find_actors()
     for actor in actors:
-        comp = _find_component_on_actor(ue, actor.object_path, "KinovaGen3")
+        comp = _find_component(ue, actor.object_path, "KinovaGen3")
         if comp:
             return actor, comp
     return None, None
 
 
-def _find_component_on_actor(ue: UnrealRemote, actor_path: str, class_hint: str):
+def _find_component(ue: UnrealRemote, actor_path: str, class_hint: str):
     """
-    Find a component on an actor whose type contains class_hint.
+    Find a component on an actor whose class name contains class_hint.
 
-    Uses the built-in /remote/object/describe endpoint which returns all
-    properties and their types — no custom function library needed.
+    Uses ue.find_components() which resolves actual component instance names
+    (not UPROPERTY variable names) for correct Remote Control object paths.
     """
-    try:
-        desc = ue.describe_object(actor_path)
-    except UnrealRemoteError:
-        return None
-
-    for prop in desc.get("Properties", []):
-        prop_type = prop.get("Type", "")
-        if class_hint.lower() in prop_type.lower() and "Component" in prop_type:
-            comp_name = prop.get("Name", "")
-            comp_path = f"{actor_path}.{comp_name}"
-            return ue.actor(comp_path)
+    comps = ue.find_components(actor_path, class_hint)
+    if comps:
+        return ue.actor(comps[0]["path"])
     return None
 
 
@@ -78,8 +75,14 @@ def get_joint_angles(comp) -> list:
 
 
 def set_all_joints(comp, angles: list[float]):
-    """Set all joint targets."""
-    comp.call("SetAllJointTargets", TargetAngles=angles)
+    """Set all joint targets.
+
+    Uses individual SetJointTarget calls because UE Remote Control has a
+    serialization bug with TArray<float> input parameters (each value gets
+    doubled with a zero prepended).
+    """
+    for i, angle in enumerate(angles):
+        comp.call("SetJointTarget", JointIndex=i, TargetAngle=float(angle))
 
 
 def set_joint(comp, index: int, angle: float):
@@ -163,6 +166,8 @@ def main():
                         help="Component name override")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30010)
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging (shows raw API requests/responses)")
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--list-actors", action="store_true",
@@ -180,6 +185,9 @@ def main():
 
     args = parser.parse_args()
 
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
     ue = UnrealRemote(host=args.host, http_port=args.port)
     print(f"Connecting to UE at http://{args.host}:{args.port}...")
     if not ue.ping():
@@ -189,16 +197,12 @@ def main():
 
     if args.list_actors:
         print("Searching for actors with KinovaGen3ControllerComponent...")
-        actors = ue.find_actors()
-        found = 0
-        for actor in actors:
-            comp = _find_component_on_actor(ue, actor.object_path, "KinovaGen3")
-            if comp:
-                found += 1
-                print(f"  Actor: {actor.object_path}")
-                print(f"  Component: {comp.object_path}")
-                print()
-        if not found:
+        results = ue.find_actors_by_component("KinovaGen3")
+        for r in results:
+            print(f"  Actor: {r['actor_path']}")
+            print(f"  Component: {r['component_path']} ({r['component_class']})")
+            print()
+        if not results:
             print("  No actors with KinovaGen3ControllerComponent found")
         return
 

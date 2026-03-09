@@ -18,9 +18,7 @@ import argparse
 import sys
 import time
 
-# Add parent so we can import the unreal_remote module
-sys.path.insert(0, __file__.rsplit("\\", 1)[0] if "\\" in __file__ else __file__.rsplit("/", 1)[0])
-from unreal_remote import UnrealRemote
+from ramms_tools.unreal_remote import UnrealRemote
 
 # Map friendly level names to UE enum strings
 LEVEL_MAP = {
@@ -39,7 +37,7 @@ def send_notification(ue: UnrealRemote, message: str, level: str = "info",
         print(f"Unknown level '{level}'. Valid: {', '.join(LEVEL_MAP.keys())}")
         return False
 
-    result = ue.bridge.ShowNotification(
+    result = ue.ui_bridge.ShowNotification(
         Message=message,
         Level=level_enum,
         Duration=duration,
@@ -51,7 +49,7 @@ def send_notification(ue: UnrealRemote, message: str, level: str = "info",
 
 def dismiss_all(ue: UnrealRemote) -> int:
     """Dismiss all active notifications."""
-    result = ue.bridge.DismissAllNotifications()
+    result = ue.ui_bridge.DismissAllNotifications()
     return int(result) if result else 0
 
 
@@ -180,7 +178,8 @@ def main():
 
     # Connect
     print(f"Connecting to UE Remote Control at http://{args.host}:{args.port}...")
-    ue = UnrealRemote(host=args.host, http_port=args.port)
+    ue = UnrealRemote(host=args.host, http_port=args.port,
+                      ui_bridge="/Script/RammsUI.Default__RammsRemoteBridge")
     try:
         ue.ping()
         print("Connected!\n")
