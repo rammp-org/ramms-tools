@@ -277,7 +277,7 @@ class UnrealRemote:
             result = self._call_function(
                 self.RAMMS_CORE_BRIDGE,
                 "FindActorsByComponent",
-                {"ComponentClassFilter": component_class_filter}
+                {"ComponentFilter": component_class_filter}
             )
             if isinstance(result, dict):
                 result = result.get("ReturnValue", result)

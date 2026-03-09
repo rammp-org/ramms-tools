@@ -143,6 +143,7 @@ class RammsTUI(App):
 
     def action_refresh(self) -> None:
         self._check_connection()
+        self._discover_components()
         # Force refresh the active page
         for page_id in ("page-dashboard", "page-arm", "page-mebot"):
             try:
