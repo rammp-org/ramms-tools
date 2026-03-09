@@ -107,3 +107,62 @@ def quat_to_euler(x: float, y: float, z: float, w: float) -> dict:
         1.0 - 2.0 * (y * y + z * z)))
 
     return {"roll": roll, "pitch": pitch, "yaw": yaw}
+
+
+# ── Signal filtering ────────────────────────────────────────────────
+
+CM_TO_M = 0.01
+
+
+def apply_deadzone(vec: dict, threshold_cm: float) -> dict:
+    """Zero out a position-delta vector if its magnitude is below threshold.
+
+    *threshold_cm* is in centimetres (UE native unit).  Returns a new dict.
+    """
+    mag_sq = sum(v * v for v in vec.values())
+    if mag_sq < threshold_cm * threshold_cm:
+        return {k: 0.0 for k in vec}
+    return dict(vec)
+
+
+def cm_to_m_vec(vec: dict) -> dict:
+    """Convert a ``{x, y, z}`` vector from centimetres to metres."""
+    return {k: v * CM_TO_M for k, v in vec.items()}
+
+
+class LowPassFilter:
+    """First-order exponential low-pass filter for ``{x, y, z}`` dicts.
+
+    Parameters
+    ----------
+    alpha : float
+        Smoothing factor in (0, 1].  Smaller = smoother / more lag.
+        A good starting point is ``alpha = dt / (rc + dt)`` where *rc* is
+        the desired time-constant and *dt* the sample period.
+    """
+
+    def __init__(self, alpha: float = 0.3) -> None:
+        self._alpha = max(0.0, min(1.0, alpha))
+        self._state: dict | None = None
+
+    @property
+    def alpha(self) -> float:
+        return self._alpha
+
+    @alpha.setter
+    def alpha(self, value: float) -> None:
+        self._alpha = max(0.0, min(1.0, value))
+
+    def reset(self) -> None:
+        self._state = None
+
+    def __call__(self, raw: dict) -> dict:
+        if self._state is None:
+            self._state = dict(raw)
+            return dict(raw)
+        a = self._alpha
+        self._state = {
+            k: a * raw[k] + (1.0 - a) * self._state[k]
+            for k in raw
+        }
+        return dict(self._state)

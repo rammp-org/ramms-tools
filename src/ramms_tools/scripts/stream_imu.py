@@ -35,7 +35,10 @@ import math
 import sys
 import time
 
-from ramms_tools.transforms import angle_diff, quat_to_euler, rotation_matrix_from_euler, world_to_local
+from ramms_tools.transforms import (
+    LowPassFilter, angle_diff, apply_deadzone, cm_to_m_vec,
+    quat_to_euler, rotation_matrix_from_euler, world_to_local,
+)
 from ramms_tools.unreal_remote import UnrealRemote, UnrealRemoteError
 
 
@@ -92,7 +95,10 @@ def resolve_target(ue: UnrealRemote, actor_hint: str,
 
 def read_imu_sample(ue: UnrealRemote, target: dict,
                     prev_sample: dict | None, dt: float,
-                    frame: str = "world") -> dict:
+                    frame: str = "world",
+                    deadzone_cm: float = 0.0,
+                    ori_deadzone_deg: float = 0.0,
+                    lpf: dict | None = None) -> dict:
     """
     Read one IMU sample from the target.
 
@@ -103,14 +109,22 @@ def read_imu_sample(ue: UnrealRemote, target: dict,
                       transformed into the body's local coordinate frame
                       (like a real IMU).
             "both"  — includes both world and local variants.
+        deadzone_cm: Position changes below this threshold (cm) are zeroed
+            before computing velocity/acceleration, reducing jitter from
+            physics micro-motion.  Default 0 (disabled).
+        ori_deadzone_deg: Orientation changes below this threshold (degrees)
+            are zeroed before computing angular velocity.  Default 0 (disabled).
+        lpf: Optional dict of LowPassFilter instances keyed by signal name
+            ("velocity", "acceleration", "angular_velocity").  When provided,
+            filtered values replace the raw derivatives.
 
     Returns a dict with:
       - timestamp: float (seconds since epoch)
       - orientation: {roll, pitch, yaw} in degrees (always world frame)
-      - linear_acceleration: {x, y, z} in cm/s²
+      - linear_acceleration: {x, y, z} in m/s²
       - angular_velocity: {x, y, z} in degrees/s
-      - position: {x, y, z} in cm (always world frame)
-      - linear_velocity: {x, y, z} in cm/s
+      - position: {x, y, z} in m (always world frame)
+      - linear_velocity: {x, y, z} in m/s
     When frame="both", also includes *_local variants of the above vectors.
     """
     obj_path = target["object_path"]
@@ -201,47 +215,138 @@ def read_imu_sample(ue: UnrealRemote, target: dict,
             except UnrealRemoteError:
                 orientation = {"roll": 0, "pitch": 0, "yaw": 0}
 
-    # Try to read velocity (GetVelocity is on AActor)
-    linear_velocity = {"x": 0, "y": 0, "z": 0}
-    if not is_component:
+    # -- Fetch physics velocity and angular velocity from UE when available --
+    phys_velocity_cm = {"x": 0, "y": 0, "z": 0}
+    phys_angular_vel = {"x": 0, "y": 0, "z": 0}
+
+    if bone:
+        # Skeletal mesh bone — use physics APIs with bone name
         try:
-            vel = ue._call_function(obj_path, "GetVelocity")
+            vel = ue._call_function(
+                obj_path, "GetPhysicsLinearVelocity",
+                {"BoneName": bone})
             if isinstance(vel, dict):
-                linear_velocity = {
+                phys_velocity_cm = {
                     "x": vel.get("X", 0.0),
                     "y": vel.get("Y", 0.0),
                     "z": vel.get("Z", 0.0),
                 }
-        except UnrealRemoteError:
+        except (UnrealRemoteError, Exception):
+            pass
+        try:
+            av = ue._call_function(
+                obj_path, "GetPhysicsAngularVelocityInDegrees",
+                {"BoneName": bone})
+            if isinstance(av, dict):
+                phys_angular_vel = {
+                    "x": av.get("X", 0.0),
+                    "y": av.get("Y", 0.0),
+                    "z": av.get("Z", 0.0),
+                }
+        except (UnrealRemoteError, Exception):
+            pass
+    elif is_component:
+        # Scene/primitive component — try physics APIs without bone
+        try:
+            vel = ue._call_function(
+                obj_path, "GetPhysicsLinearVelocity")
+            if isinstance(vel, dict):
+                phys_velocity_cm = {
+                    "x": vel.get("X", 0.0),
+                    "y": vel.get("Y", 0.0),
+                    "z": vel.get("Z", 0.0),
+                }
+        except (UnrealRemoteError, Exception):
+            pass
+        try:
+            av = ue._call_function(
+                obj_path, "GetPhysicsAngularVelocityInDegrees")
+            if isinstance(av, dict):
+                phys_angular_vel = {
+                    "x": av.get("X", 0.0),
+                    "y": av.get("Y", 0.0),
+                    "z": av.get("Z", 0.0),
+                }
+        except (UnrealRemoteError, Exception):
+            pass
+    else:
+        # Actor — GetVelocity for linear, no direct angular velocity API
+        try:
+            vel = ue._call_function(obj_path, "GetVelocity")
+            if isinstance(vel, dict):
+                phys_velocity_cm = {
+                    "x": vel.get("X", 0.0),
+                    "y": vel.get("Y", 0.0),
+                    "z": vel.get("Z", 0.0),
+                }
+        except (UnrealRemoteError, Exception):
             pass
 
-    # Estimate linear acceleration from position delta
+    # -- Determine velocity and angular velocity --
+    # Use physics values when available, else derive from deltas.
     linear_acceleration = {"x": 0, "y": 0, "z": 0}
     angular_velocity = {"x": 0, "y": 0, "z": 0}
+    has_phys_vel = any(phys_velocity_cm.values())
+    has_phys_angvel = any(phys_angular_vel.values())
 
     if prev_sample and dt > 0:
         prev_pos = prev_sample["position"]
-        prev_vel = prev_sample.get("_velocity", {"x": 0, "y": 0, "z": 0})
-        cur_vel = {
-            "x": (position["x"] - prev_pos["x"]) / dt,
-            "y": (position["y"] - prev_pos["y"]) / dt,
-            "z": (position["z"] - prev_pos["z"]) / dt,
-        }
+
+        # -- Linear velocity --
+        if has_phys_vel:
+            velocity_cm = phys_velocity_cm
+        else:
+            pos_delta = {
+                "x": position["x"] - prev_pos["x"],
+                "y": position["y"] - prev_pos["y"],
+                "z": position["z"] - prev_pos["z"],
+            }
+            if deadzone_cm > 0:
+                pos_delta = apply_deadzone(pos_delta, deadzone_cm)
+            velocity_cm = {k: pos_delta[k] / dt for k in pos_delta}
+
+        velocity_m = cm_to_m_vec(velocity_cm)
+        prev_vel_m = prev_sample.get("_velocity", {"x": 0, "y": 0, "z": 0})
+
+        # -- Linear acceleration (always from velocity delta) --
         linear_acceleration = {
-            "x": (cur_vel["x"] - prev_vel["x"]) / dt,
-            "y": (cur_vel["y"] - prev_vel["y"]) / dt,
-            "z": (cur_vel["z"] - prev_vel["z"]) / dt,
+            "x": (velocity_m["x"] - prev_vel_m["x"]) / dt,
+            "y": (velocity_m["y"] - prev_vel_m["y"]) / dt,
+            "z": (velocity_m["z"] - prev_vel_m["z"]) / dt,
         }
 
-        prev_ori = prev_sample["orientation"]
-        angular_velocity = {
-            "x": _angle_diff(orientation["roll"], prev_ori["roll"]) / dt,
-            "y": _angle_diff(orientation["pitch"], prev_ori["pitch"]) / dt,
-            "z": _angle_diff(orientation["yaw"], prev_ori["yaw"]) / dt,
-        }
-        velocity_for_next = cur_vel
+        # -- Angular velocity --
+        if has_phys_angvel:
+            angular_velocity = phys_angular_vel
+        else:
+            prev_ori = prev_sample["orientation"]
+            ori_delta = {
+                "x": _angle_diff(orientation["roll"], prev_ori["roll"]),
+                "y": _angle_diff(orientation["pitch"], prev_ori["pitch"]),
+                "z": _angle_diff(orientation["yaw"], prev_ori["yaw"]),
+            }
+            if ori_deadzone_deg > 0:
+                ori_delta = apply_deadzone(ori_delta, ori_deadzone_deg)
+            angular_velocity = {k: ori_delta[k] / dt for k in ori_delta}
+
+        velocity_for_next = velocity_m
     else:
-        velocity_for_next = {"x": 0, "y": 0, "z": 0}
+        velocity_for_next = cm_to_m_vec(phys_velocity_cm) if has_phys_vel \
+            else {"x": 0, "y": 0, "z": 0}
+
+    # Convert position cm → m for output
+    position_m = cm_to_m_vec(position)
+    linear_velocity = velocity_for_next if prev_sample else cm_to_m_vec(
+        phys_velocity_cm)
+
+    # Apply low-pass filters when provided
+    if lpf:
+        if "velocity" in lpf:
+            linear_velocity = lpf["velocity"](linear_velocity)
+        if "acceleration" in lpf:
+            linear_acceleration = lpf["acceleration"](linear_acceleration)
+        if "angular_velocity" in lpf:
+            angular_velocity = lpf["angular_velocity"](angular_velocity)
 
     # Apply coordinate frame transforms
     want_local = frame in ("local", "both")
@@ -254,9 +359,9 @@ def read_imu_sample(ue: UnrealRemote, target: dict,
 
     result = {
         "timestamp": now,
-        "orientation": orientation,  # always world-referenced
-        "position": position,        # always world frame
-        "_velocity": velocity_for_next,
+        "orientation": orientation,   # always world-referenced, degrees
+        "position": position_m,       # metres, always world frame
+        "_velocity": velocity_for_next,  # m/s, internal
     }
 
     if frame == "world":
@@ -301,27 +406,27 @@ def format_sample_human(sample: dict, label: str, frame: str = "world") -> str:
     w = sample["angular_velocity"]
     line = (
         f"\r[{label}] "
-        f"pos=({p['x']:8.1f}, {p['y']:8.1f}, {p['z']:8.1f})cm  "
+        f"pos=({p['x']:8.3f}, {p['y']:8.3f}, {p['z']:8.3f})m  "
         f"ori=({o['roll']:7.2f}, {o['pitch']:7.2f}, {o['yaw']:7.2f})°  "
     )
     if frame == "local":
         line += (
             f"ω_L=({w['x']:7.1f}, {w['y']:7.1f}, {w['z']:7.1f})°/s  "
-            f"a_L=({a['x']:7.0f}, {a['y']:7.0f}, {a['z']:7.0f})cm/s²"
+            f"a_L=({a['x']:7.2f}, {a['y']:7.2f}, {a['z']:7.2f})m/s²"
         )
     elif frame == "both":
         al = sample["linear_acceleration_local"]
         wl = sample["angular_velocity_local"]
         line += (
             f"ω=({w['x']:7.1f}, {w['y']:7.1f}, {w['z']:7.1f})°/s  "
-            f"a=({a['x']:7.0f}, {a['y']:7.0f}, {a['z']:7.0f})cm/s²  "
+            f"a=({a['x']:7.2f}, {a['y']:7.2f}, {a['z']:7.2f})m/s²  "
             f"ω_L=({wl['x']:7.1f}, {wl['y']:7.1f}, {wl['z']:7.1f})°/s  "
-            f"a_L=({al['x']:7.0f}, {al['y']:7.0f}, {al['z']:7.0f})cm/s²"
+            f"a_L=({al['x']:7.2f}, {al['y']:7.2f}, {al['z']:7.2f})m/s²"
         )
     else:
         line += (
             f"ω=({w['x']:7.1f}, {w['y']:7.1f}, {w['z']:7.1f})°/s  "
-            f"a=({a['x']:7.0f}, {a['y']:7.0f}, {a['z']:7.0f})cm/s²"
+            f"a=({a['x']:7.2f}, {a['y']:7.2f}, {a['z']:7.2f})m/s²"
         )
     return line
 
@@ -395,6 +500,17 @@ def main():
                         help="Coordinate frame for accel/velocity/angular-vel: "
                              "'world' (default), 'local' (body frame, like a "
                              "real IMU), or 'both'")
+    parser.add_argument("--deadzone", type=float, default=0.5,
+                        help="Position deadzone in cm — changes smaller than "
+                             "this are zeroed before computing velocity/"
+                             "acceleration (default: 0.5, 0 = disabled)")
+    parser.add_argument("--ori-deadzone", type=float, default=0.5,
+                        help="Orientation deadzone in degrees — angular changes "
+                             "smaller than this are zeroed before computing "
+                             "angular velocity (default: 0.5, 0 = disabled)")
+    parser.add_argument("--lpf", type=float, default=0.0, metavar="ALPHA",
+                        help="Low-pass filter alpha in (0,1]. Smaller = "
+                             "smoother / more lag. 0 = disabled (default)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30010)
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -426,9 +542,27 @@ def main():
         print(f"Object path: {target['object_path']}")
         if target["bone_name"]:
             print(f"Bone: {target['bone_name']}")
+        extras = []
+        if args.deadzone > 0:
+            extras.append(f"deadzone={args.deadzone}cm")
+        if args.ori_deadzone > 0:
+            extras.append(f"ori-deadzone={args.ori_deadzone}°")
+        if args.lpf > 0:
+            extras.append(f"LPF α={args.lpf}")
+        if extras:
+            print(f"Filters: {', '.join(extras)}")
         print("Press Ctrl+C to stop.\n")
     elif args.format == "csv":
         print(format_sample_csv({}, header=True, frame=args.frame))
+
+    # Build low-pass filters if requested
+    lpf = None
+    if args.lpf > 0:
+        lpf = {
+            "velocity": LowPassFilter(args.lpf),
+            "acceleration": LowPassFilter(args.lpf),
+            "angular_velocity": LowPassFilter(args.lpf),
+        }
 
     prev_sample = None
     prev_time = time.time()
@@ -441,7 +575,10 @@ def main():
             dt = now - prev_time
 
             sample = read_imu_sample(ue, target, prev_sample, dt,
-                                     frame=args.frame)
+                                     frame=args.frame,
+                                     deadzone_cm=args.deadzone,
+                                     ori_deadzone_deg=args.ori_deadzone,
+                                     lpf=lpf)
             sample_count += 1
 
             if args.format == "human":

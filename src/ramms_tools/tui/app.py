@@ -45,6 +45,7 @@ class RammsTUI(App):
     ue: UnrealRemote | None = None
     arm_comp = None  # RemoteObjectProxy | None
     mebot_comp = None  # RemoteObjectProxy | None
+    gripper_comp = None  # RemoteObjectProxy | None
 
     def __init__(self, host: str = "127.0.0.1", port: int = 30010,
                  **kwargs) -> None:
@@ -115,6 +116,14 @@ class RammsTUI(App):
             results = self.ue.find_actors_by_component("MebotController")
             if results:
                 self.mebot_comp = self.ue.actor(results[0]["component_path"])
+        except Exception:
+            pass
+
+        # Gripper
+        try:
+            results = self.ue.find_actors_by_component("GripperController")
+            if results:
+                self.gripper_comp = self.ue.actor(results[0]["component_path"])
         except Exception:
             pass
 

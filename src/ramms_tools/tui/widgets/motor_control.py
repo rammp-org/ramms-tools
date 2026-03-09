@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
+import re
+
 from textual.app import ComposeResult
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Button, Input, Label, Static
+
+
+def _slugify(name: str) -> str:
+    """Convert a name to a safe CSS ID slug."""
+    return re.sub(r'[^a-zA-Z0-9_-]', '_', name)
 
 
 class MotorControl(Widget):
@@ -82,7 +89,7 @@ class MotorControl(Widget):
         self.step = step
         self._current: float = current
         self._unit = "°" if motor_type == "angular" else "cm"
-        self._widget_id = f"mc-{motor_name.replace(' ', '_')}"
+        self._widget_id = f"mc-{_slugify(motor_name)}"
 
     def compose(self) -> ComposeResult:
         tag = "ANG" if self.motor_type == "angular" else "LIN"

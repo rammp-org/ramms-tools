@@ -97,7 +97,7 @@ class DashboardPage(Container):
         if not app.ue or not app.connected:
             return
 
-        # Arm summary
+        # Arm summary (includes gripper)
         arm_status = "Not found"
         arm_detail = ""
         arm_found = False
@@ -111,6 +111,17 @@ class DashboardPage(Container):
                     arm_detail = "  ".join(parts)
             except Exception:
                 arm_detail = "(read error)"
+            # Append gripper info
+            if app.gripper_comp:
+                try:
+                    gs = app.gripper_comp.call("GetGripperState")
+                    gs_str = (gs.split("::")[-1] if isinstance(gs, str)
+                              and "::" in gs else str(gs))
+                    arm_detail += f"\nGripper: {gs_str}"
+                except Exception:
+                    arm_detail += "\nGripper: (error)"
+            else:
+                arm_detail += "\nGripper: not found"
 
         # Mebot summary
         mebot_status = "Not found"

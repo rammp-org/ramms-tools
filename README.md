@@ -19,7 +19,7 @@ pip install git+https://github.com/ATDev-Inc/ramms-tools.git
 - Unreal Engine running with the **Remote Control API** plugin enabled (default port 30010)
 - For robot control: the **RammsCore** plugin with `URammsCoreBridge`
 - For UI features: the **RammsUI** plugin with `URammsRemoteBridge`
-- The **Textual** TUI library (installed automatically with the package)
+- The **Textual** TUI library (`pip install 'ramms-tools[tui]'` or `pip install textual`)
 
 ## Library Usage
 
@@ -84,8 +84,8 @@ ramms-tui --host 192.168.1.10      # Connect to a remote UE instance
 
 | Tab | Description |
 |-----|-------------|
-| Dashboard | Overview cards for arm, mebot, system status, and IMU |
-| Arm | 7 joint controls with ±buttons, input fields, Home/Refresh |
+| Dashboard | Overview cards for arm, gripper, mebot, system status, and IMU |
+| Arm | 7 joint controls with ±buttons, input fields, Home/Refresh; gripper state, Open/Close/Toggle, finger angle controls |
 | Mebot | Dynamic motor controls (angular & linear) |
 | IMU | Real-time streaming with target selection and coordinate frame toggle |
 
@@ -102,6 +102,18 @@ ramms-kinova --set-joint 0 45.0                  # Set joint 0 to 45°
 ramms-kinova --set-all 0 15 180 -150 0 -10 90   # Set all 7 joints
 ramms-kinova --home                              # All joints to 0°
 ramms-kinova --interactive                       # REPL mode
+```
+
+### `ramms-gripper` — Gripper Control
+
+```bash
+ramms-gripper --describe                         # Show gripper state and finger angles
+ramms-gripper --open                             # Open the gripper
+ramms-gripper --close                            # Close the gripper
+ramms-gripper --toggle                           # Toggle open/closed
+ramms-gripper --set-fingers 45.0 45.0            # Set individual finger angles (degrees)
+ramms-gripper --speed 2.0                        # Set motor speed multiplier
+ramms-gripper --interactive                      # REPL mode
 ```
 
 ### `ramms-mebot` — Mebot Motor Control
@@ -138,8 +150,21 @@ The `--frame` flag controls the coordinate frame for velocity and acceleration:
 | `local` | Velocity & acceleration in the body's local frame |
 | `both` | Both world and local values side by side |
 
-Output includes: position, orientation (roll/pitch/yaw), linear velocity,
-estimated linear acceleration, and estimated angular velocity.
+Output includes: position (m), orientation (roll/pitch/yaw in degrees),
+linear velocity (m/s), estimated linear acceleration (m/s²), and estimated
+angular velocity (deg/s).
+
+When available, UE physics APIs (`GetVelocity`, `GetPhysicsLinearVelocity`,
+`GetPhysicsAngularVelocityInDegrees`) are used for velocity and angular
+velocity; otherwise, values are derived from position/orientation deltas.
+
+Signal filtering options:
+
+| Flag | Description |
+|------|-------------|
+| `--deadzone` | Position change deadzone in cm (default: 0.5, 0 = off) |
+| `--ori-deadzone` | Orientation change deadzone in deg (default: 0.5, 0 = off) |
+| `--lpf` | Low-pass filter alpha in (0,1], smaller = smoother (default: 0 = off) |
 
 ### `ramms-notify` — UI Notifications
 

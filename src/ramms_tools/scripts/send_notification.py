@@ -15,6 +15,7 @@ Requires Unreal Engine running with Remote Control API plugin enabled (port 3001
 """
 
 import argparse
+import logging
 import sys
 import time
 
@@ -173,8 +174,13 @@ def main():
                         help="Interactive REPL mode")
     parser.add_argument("--demo", action="store_true",
                         help="Send demo notifications")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     # Connect
     print(f"Connecting to UE Remote Control at http://{args.host}:{args.port}...")

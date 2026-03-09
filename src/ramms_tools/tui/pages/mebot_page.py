@@ -10,6 +10,7 @@ from textual import work
 from textual.widgets import Button, Static
 
 from ramms_tools.tui.widgets import MotorControl
+from ramms_tools.tui.widgets.motor_control import _slugify
 
 if TYPE_CHECKING:
     from ramms_tools.tui.app import RammsTUI
@@ -124,13 +125,14 @@ class MebotPage(Container):
             for m in angular:
                 name = m.get("ConstraintName", "?")
                 target = m.get("TargetAngle", 0.0)
+                slug = _slugify(name)
                 widget = MotorControl(
                     motor_name=name,
                     motor_type="angular",
                     min_val=-180.0,
                     max_val=180.0,
                     current=float(target),
-                    id=f"mc-ang-{name}",
+                    id=f"mc-ang-{slug}",
                 )
                 scroll.mount(widget)
 
@@ -140,13 +142,14 @@ class MebotPage(Container):
             for m in linear:
                 name = m.get("ConstraintName", "?")
                 target = m.get("TargetPosition", 0.0)
+                slug = _slugify(name)
                 widget = MotorControl(
                     motor_name=name,
                     motor_type="linear",
                     min_val=-200.0,
                     max_val=200.0,
                     current=float(target),
-                    id=f"mc-lin-{name}",
+                    id=f"mc-lin-{slug}",
                 )
                 scroll.mount(widget)
 
@@ -161,8 +164,9 @@ class MebotPage(Container):
         for m in angular:
             name = m.get("ConstraintName", "?")
             target = m.get("TargetAngle", 0.0)
+            slug = _slugify(name)
             try:
-                mc = self.query_one(f"#mc-ang-{name}", MotorControl)
+                mc = self.query_one(f"#mc-ang-{slug}", MotorControl)
                 mc.update_value(float(target))
             except Exception:
                 pass
@@ -170,8 +174,9 @@ class MebotPage(Container):
         for m in linear:
             name = m.get("ConstraintName", "?")
             target = m.get("TargetPosition", 0.0)
+            slug = _slugify(name)
             try:
-                mc = self.query_one(f"#mc-lin-{name}", MotorControl)
+                mc = self.query_one(f"#mc-lin-{slug}", MotorControl)
                 mc.update_value(float(target))
             except Exception:
                 pass

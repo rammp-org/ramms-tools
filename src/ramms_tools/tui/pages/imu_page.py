@@ -11,7 +11,10 @@ from textual import work
 from textual.widgets import Button, Input, Label, Static
 
 from ramms_tools.tui.widgets import ValueDisplay
-from ramms_tools.transforms import angle_diff, quat_to_euler, world_to_local
+from ramms_tools.transforms import (
+    LowPassFilter, angle_diff, apply_deadzone, cm_to_m_vec,
+    quat_to_euler, world_to_local,
+)
 
 if TYPE_CHECKING:
     from ramms_tools.tui.app import RammsTUI
@@ -103,6 +106,10 @@ class IMUPage(Container):
     _prev_sample: dict | None = None
     _prev_time: float = 0.0
     _sample_count: int = 0
+    _deadzone_cm: float = 0.5
+    _ori_deadzone_deg: float = 0.5
+    _lpf_alpha: float = 0.0
+    _lpf: dict | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("🧭 IMU Data Stream", classes="imu-header")
@@ -128,6 +135,17 @@ class IMUPage(Container):
             yield Input(value="10", restrict=r"[\d]+", id="imu-rate",
                         classes="imu-rate-input")
             yield Label("Hz", classes="imu-rate-unit")
+            yield Label("DZ:", classes="imu-rate-label")
+            yield Input(value="0.5", restrict=r"[\d.]+", id="imu-deadzone",
+                        classes="imu-rate-input")
+            yield Label("cm", classes="imu-rate-unit")
+            yield Label("ODZ:", classes="imu-rate-label")
+            yield Input(value="0.5", restrict=r"[\d.]+", id="imu-ori-deadzone",
+                        classes="imu-rate-input")
+            yield Label("°", classes="imu-rate-unit")
+            yield Label("LPF:", classes="imu-rate-label")
+            yield Input(value="0", restrict=r"[\d.]+", id="imu-lpf-alpha",
+                        classes="imu-rate-input")
 
         with Horizontal(classes="imu-frame-row"):
             yield Label("Frame:", classes="imu-frame-label")
@@ -140,12 +158,12 @@ class IMUPage(Container):
 
         with Horizontal(classes="imu-data"):
             with Vertical(classes="imu-data-row"):
-                yield ValueDisplay("Position", ("x", "y", "z"), "cm",
+                yield ValueDisplay("Position", ("x", "y", "z"), "m",
                                     id="imu-position")
                 yield ValueDisplay("Lin Velocity", ("x", "y", "z"),
-                                    "cm/s", id="imu-lin-vel")
+                                    "m/s", id="imu-lin-vel")
                 yield ValueDisplay("Lin Velocity Local", ("x", "y", "z"),
-                                    "cm/s", id="imu-lin-vel-local")
+                                    "m/s", id="imu-lin-vel-local")
             with Vertical(classes="imu-data-row"):
                 yield ValueDisplay("Orientation",
                                     ("roll", "pitch", "yaw"), "deg",
@@ -156,9 +174,9 @@ class IMUPage(Container):
                                     "deg/s", id="imu-ang-vel-local")
             with Vertical(classes="imu-data-row"):
                 yield ValueDisplay("Lin Accel", ("x", "y", "z"),
-                                    "cm/s²", id="imu-lin-accel")
+                                    "m/s²", id="imu-lin-accel")
                 yield ValueDisplay("Lin Accel Local", ("x", "y", "z"),
-                                    "cm/s²", id="imu-lin-accel-local")
+                                    "m/s²", id="imu-lin-accel-local")
 
         yield Static("  Configure target and press Start",
                       classes="imu-status", id="imu-status-bar")
@@ -214,6 +232,33 @@ class IMUPage(Container):
             rate_hz = int(self.query_one("#imu-rate", Input).value)
         except ValueError:
             rate_hz = 10
+
+        try:
+            self._deadzone_cm = float(
+                self.query_one("#imu-deadzone", Input).value)
+        except ValueError:
+            self._deadzone_cm = 0.5
+
+        try:
+            self._ori_deadzone_deg = float(
+                self.query_one("#imu-ori-deadzone", Input).value)
+        except ValueError:
+            self._ori_deadzone_deg = 0.5
+
+        try:
+            alpha = float(
+                self.query_one("#imu-lpf-alpha", Input).value)
+        except ValueError:
+            alpha = 0.0
+        self._lpf_alpha = alpha
+        if alpha > 0:
+            self._lpf = {
+                "velocity": LowPassFilter(alpha),
+                "acceleration": LowPassFilter(alpha),
+                "angular_velocity": LowPassFilter(alpha),
+            }
+        else:
+            self._lpf = None
 
         self._resolve_and_stream(actor_input, comp_input, rate_hz)
 
@@ -301,7 +346,8 @@ class IMUPage(Container):
         obj_path = self._target_path
         position = {"x": 0, "y": 0, "z": 0}
         orientation = {"roll": 0, "pitch": 0, "yaw": 0}
-        linear_velocity = {"x": 0, "y": 0, "z": 0}
+        phys_velocity_cm = {"x": 0, "y": 0, "z": 0}
+        phys_angular_vel = {"x": 0, "y": 0, "z": 0}
 
         try:
             if self._bone_name:
@@ -318,6 +364,27 @@ class IMUPage(Container):
                     orientation = quat_to_euler(
                         rot.get("X", 0.0), rot.get("Y", 0.0),
                         rot.get("Z", 0.0), rot.get("W", 1.0))
+                # Physics APIs for bone
+                try:
+                    vel = app.ue._call_function(
+                        obj_path, "GetPhysicsLinearVelocity",
+                        {"BoneName": self._bone_name})
+                    if isinstance(vel, dict):
+                        phys_velocity_cm = {"x": vel.get("X", 0),
+                                            "y": vel.get("Y", 0),
+                                            "z": vel.get("Z", 0)}
+                except Exception:
+                    pass
+                try:
+                    av = app.ue._call_function(
+                        obj_path, "GetPhysicsAngularVelocityInDegrees",
+                        {"BoneName": self._bone_name})
+                    if isinstance(av, dict):
+                        phys_angular_vel = {"x": av.get("X", 0),
+                                            "y": av.get("Y", 0),
+                                            "z": av.get("Z", 0)}
+                except Exception:
+                    pass
             elif self._is_component:
                 loc = app.ue._get_property(obj_path, "RelativeLocation")
                 if isinstance(loc, dict):
@@ -329,6 +396,24 @@ class IMUPage(Container):
                     orientation = {"roll": rot.get("Roll", 0),
                                    "pitch": rot.get("Pitch", 0),
                                    "yaw": rot.get("Yaw", 0)}
+                try:
+                    vel = app.ue._call_function(
+                        obj_path, "GetPhysicsLinearVelocity")
+                    if isinstance(vel, dict):
+                        phys_velocity_cm = {"x": vel.get("X", 0),
+                                            "y": vel.get("Y", 0),
+                                            "z": vel.get("Z", 0)}
+                except Exception:
+                    pass
+                try:
+                    av = app.ue._call_function(
+                        obj_path, "GetPhysicsAngularVelocityInDegrees")
+                    if isinstance(av, dict):
+                        phys_angular_vel = {"x": av.get("X", 0),
+                                            "y": av.get("Y", 0),
+                                            "z": av.get("Z", 0)}
+                except Exception:
+                    pass
             else:
                 loc = app.ue._call_function(obj_path, "K2_GetActorLocation")
                 if isinstance(loc, dict):
@@ -342,60 +427,101 @@ class IMUPage(Container):
                                    "yaw": rot.get("Yaw", 0)}
                 vel = app.ue._call_function(obj_path, "GetVelocity")
                 if isinstance(vel, dict):
-                    linear_velocity = {"x": vel.get("X", 0),
-                                       "y": vel.get("Y", 0),
-                                       "z": vel.get("Z", 0)}
+                    phys_velocity_cm = {"x": vel.get("X", 0),
+                                        "y": vel.get("Y", 0),
+                                        "z": vel.get("Z", 0)}
         except Exception:
             pass
 
-        # Derived quantities
+        # Determine velocity and angular velocity from physics or deltas
         angular_velocity = {"x": 0, "y": 0, "z": 0}
         linear_accel = {"x": 0, "y": 0, "z": 0}
+        has_phys_vel = any(phys_velocity_cm.values())
+        has_phys_angvel = any(phys_angular_vel.values())
 
         if self._prev_sample and dt > 0:
-            pp = self._prev_sample["position"]
-            po = self._prev_sample["orientation"]
+            pp = self._prev_sample["position"]  # cm
 
-            if not any(linear_velocity.values()):
-                linear_velocity = {
-                    "x": (position["x"] - pp["x"]) / dt,
-                    "y": (position["y"] - pp["y"]) / dt,
-                    "z": (position["z"] - pp["z"]) / dt,
+            # Linear velocity
+            if has_phys_vel:
+                velocity_cm = phys_velocity_cm
+            else:
+                pos_delta = {
+                    "x": position["x"] - pp["x"],
+                    "y": position["y"] - pp["y"],
+                    "z": position["z"] - pp["z"],
                 }
+                if self._deadzone_cm > 0:
+                    pos_delta = apply_deadzone(pos_delta, self._deadzone_cm)
+                velocity_cm = {k: pos_delta[k] / dt for k in pos_delta}
 
-            angular_velocity = {
-                "x": angle_diff(orientation["roll"], po["roll"]) / dt,
-                "y": angle_diff(orientation["pitch"], po["pitch"]) / dt,
-                "z": angle_diff(orientation["yaw"], po["yaw"]) / dt,
-            }
+            velocity_m = cm_to_m_vec(velocity_cm)
+            prev_vel = self._prev_sample.get(
+                "velocity_m", {"x": 0, "y": 0, "z": 0})
 
-            pv = self._prev_sample.get("velocity", {"x": 0, "y": 0, "z": 0})
+            # Acceleration from velocity delta (consistent source)
             linear_accel = {
-                "x": (linear_velocity["x"] - pv["x"]) / dt,
-                "y": (linear_velocity["y"] - pv["y"]) / dt,
-                "z": (linear_velocity["z"] - pv["z"]) / dt,
+                "x": (velocity_m["x"] - prev_vel["x"]) / dt,
+                "y": (velocity_m["y"] - prev_vel["y"]) / dt,
+                "z": (velocity_m["z"] - prev_vel["z"]) / dt,
             }
+
+            # Angular velocity
+            if has_phys_angvel:
+                angular_velocity = phys_angular_vel
+            else:
+                po = self._prev_sample["orientation"]
+                ori_delta = {
+                    "x": angle_diff(orientation["roll"], po["roll"]),
+                    "y": angle_diff(orientation["pitch"], po["pitch"]),
+                    "z": angle_diff(orientation["yaw"], po["yaw"]),
+                }
+                if self._ori_deadzone_deg > 0:
+                    ori_delta = apply_deadzone(ori_delta,
+                                               self._ori_deadzone_deg)
+                angular_velocity = {k: ori_delta[k] / dt for k in ori_delta}
+
+            vel_for_next = velocity_m
+        else:
+            vel_for_next = cm_to_m_vec(phys_velocity_cm) if has_phys_vel \
+                else {"x": 0, "y": 0, "z": 0}
+
+        linear_velocity_m = vel_for_next if self._prev_sample \
+            else cm_to_m_vec(phys_velocity_cm)
+
+        # Apply low-pass filters
+        if self._lpf:
+            if "velocity" in self._lpf:
+                linear_velocity_m = self._lpf["velocity"](linear_velocity_m)
+            if "acceleration" in self._lpf:
+                linear_accel = self._lpf["acceleration"](linear_accel)
+            if "angular_velocity" in self._lpf:
+                angular_velocity = self._lpf["angular_velocity"](
+                    angular_velocity)
+
+        # Convert position to metres for display
+        position_m = cm_to_m_vec(position)
 
         self._prev_sample = {
-            "position": position,
+            "position": position,   # keep cm for delta computation
             "orientation": orientation,
-            "velocity": linear_velocity,
+            "velocity_m": vel_for_next,  # m/s for next iteration
         }
         self._sample_count += 1
 
         # Compute local-frame values
-        lin_vel_local = world_to_local(linear_velocity, orientation)
+        lin_vel_local = world_to_local(linear_velocity_m, orientation)
         ang_vel_local = world_to_local(angular_velocity, orientation)
         lin_accel_local = world_to_local(linear_accel, orientation)
 
         def _update():
             try:
                 self.query_one("#imu-position", ValueDisplay).update_values(
-                    position)
+                    position_m)
                 self.query_one("#imu-orientation", ValueDisplay).update_values(
                     orientation)
                 self.query_one("#imu-lin-vel", ValueDisplay).update_values(
-                    linear_velocity)
+                    linear_velocity_m)
                 self.query_one("#imu-ang-vel", ValueDisplay).update_values(
                     angular_velocity)
                 self.query_one("#imu-lin-accel", ValueDisplay).update_values(

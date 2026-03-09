@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import logging
 import sys
 
 
@@ -21,8 +22,13 @@ def main() -> None:
                         help="UE Remote Control API host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=30010,
                         help="UE Remote Control API port (default: 30010)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     try:
         import textual  # noqa: F401

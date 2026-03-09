@@ -9,7 +9,7 @@ description = "Python tools for interacting with RAMMS-based Unreal Engine proje
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
-dependencies = ["textual>=8.0.0"]
+dependencies = []
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -27,6 +27,7 @@ classifiers = [
 tui = ["textual>=8.0.0"]
 
 [project.scripts]
+ramms-gripper = "ramms_tools.scripts.control_gripper:main"
 ramms-kinova = "ramms_tools.scripts.control_kinova:main"
 ramms-mebot = "ramms_tools.scripts.control_mebot:main"
 ramms-notify = "ramms_tools.scripts.send_notification:main"

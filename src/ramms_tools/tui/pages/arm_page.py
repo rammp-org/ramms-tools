@@ -1,4 +1,4 @@
-"""Arm control page — Kinova Gen3 joint controls."""
+"""Arm control page — Kinova Gen3 joint controls + gripper."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual import work
 from textual.widgets import Button, Static
 
-from ramms_tools.tui.widgets import JointControl
+from ramms_tools.tui.widgets import GripperControl, JointControl
 
 if TYPE_CHECKING:
     from ramms_tools.tui.app import RammsTUI
 
 
 class ArmPage(Container):
-    """Kinova Gen3 arm control page with 7 joint controls."""
+    """Kinova Gen3 arm control page with 7 joint controls and gripper."""
 
     DEFAULT_CSS = """
     ArmPage {
@@ -50,6 +50,10 @@ class ArmPage(Container):
         text-align: center;
         color: $error;
     }
+    ArmPage .arm-separator {
+        height: 1;
+        margin: 1 0 0 0;
+    }
     """
 
     _active: bool = False
@@ -61,6 +65,8 @@ class ArmPage(Container):
             for i in range(self.NUM_JOINTS):
                 yield JointControl(joint_index=i, name=f"Joint {i}",
                                    id=f"arm-joint-{i}")
+            yield Static("", classes="arm-separator")
+            yield GripperControl(id="arm-gripper")
         with Horizontal(classes="arm-actions"):
             yield Button("🏠 Home All", id="arm-home", variant="warning")
             yield Button("🔄 Refresh", id="arm-refresh")
@@ -92,6 +98,34 @@ class ArmPage(Container):
         except Exception:
             angles = []
 
+        # Read gripper state
+        gripper_state = "Not found"
+        gripper_f1 = 0.0
+        gripper_f2 = 0.0
+        has_gripper = False
+        if app.gripper_comp:
+            has_gripper = True
+            try:
+                state_raw = app.gripper_comp.call("GetGripperState")
+                if isinstance(state_raw, str):
+                    gripper_state = (state_raw.split("::")[-1]
+                                     if "::" in state_raw else state_raw)
+                else:
+                    gripper_state = str(state_raw) if state_raw else "Unknown"
+            except Exception:
+                gripper_state = "Error"
+            try:
+                finger_result = app.gripper_comp.call("GetFingerAngles")
+                if isinstance(finger_result, dict):
+                    gripper_f1 = float(finger_result.get(
+                        "OutFinger1Angle",
+                        finger_result.get("Finger1Angle", 0.0)))
+                    gripper_f2 = float(finger_result.get(
+                        "OutFinger2Angle",
+                        finger_result.get("Finger2Angle", 0.0)))
+            except Exception:
+                pass
+
         def _update():
             for i, angle in enumerate(angles):
                 try:
@@ -99,9 +133,21 @@ class ArmPage(Container):
                     jc.update_angle(float(angle))
                 except Exception:
                     pass
+            # Update gripper
             try:
+                gc = self.query_one("#arm-gripper", GripperControl)
+                if has_gripper:
+                    gc.update_state(gripper_state, gripper_f1, gripper_f2)
+                else:
+                    gc.update_state("Not found", 0.0, 0.0)
+            except Exception:
+                pass
+            try:
+                parts = [f"{len(angles)} joints"]
+                if has_gripper:
+                    parts.append(f"gripper: {gripper_state}")
                 self.query_one("#arm-status-bar", Static).update(
-                    f"  {len(angles)} joints  |  Last update: OK")
+                    f"  {' | '.join(parts)}  |  Last update: OK")
             except Exception:
                 pass
 
@@ -119,6 +165,11 @@ class ArmPage(Container):
     ) -> None:
         self._send_joint_target(event.joint_index, event.angle)
 
+    def on_gripper_control_gripper_action(
+        self, event: GripperControl.GripperAction
+    ) -> None:
+        self._send_gripper_action(event.action, event.data)
+
     @work(thread=True)
     def _send_joint_target(self, index: int, angle: float) -> None:
         app: RammsTUI = self.app  # type: ignore[assignment]
@@ -130,6 +181,33 @@ class ArmPage(Container):
         except Exception as exc:
             self.app.call_from_thread(
                 self._set_status, f"  ✗ Error setting joint {index}: {exc}")
+
+    @work(thread=True)
+    def _send_gripper_action(self, action: str, data: dict) -> None:
+        app: RammsTUI = self.app  # type: ignore[assignment]
+        if not app.gripper_comp:
+            self.app.call_from_thread(
+                self._set_status, "  ✗ Gripper not found")
+            return
+        try:
+            if action == "open":
+                app.gripper_comp.call("Open")
+            elif action == "close":
+                app.gripper_comp.call("Close")
+            elif action == "toggle":
+                app.gripper_comp.call("Toggle")
+            elif action == "set_fingers":
+                app.gripper_comp.call(
+                    "SetFingerAngles",
+                    Finger1Angle=data.get("finger1", 0.0),
+                    Finger2Angle=data.get("finger2", 0.0))
+            elif action == "set_speed":
+                app.gripper_comp.call(
+                    "SetMotorSpeedMultiplier",
+                    SpeedMultiplier=data.get("multiplier", 1.0))
+        except Exception as exc:
+            self.app.call_from_thread(
+                self._set_status, f"  ✗ Gripper error: {exc}")
 
     def _set_status(self, text: str) -> None:
         try:

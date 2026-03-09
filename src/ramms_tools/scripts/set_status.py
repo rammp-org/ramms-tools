@@ -20,6 +20,7 @@ and calls functions on URammsRemoteBridge to update StatusPanel widgets.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 
@@ -261,8 +262,13 @@ def main():
                         help="Run demo sequence")
     parser.add_argument("--discover", action="store_true",
                         help="Discover RAMMS widgets and actors")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging")
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     ue = UnrealRemote(host=args.host, http_port=args.port,
                       ui_bridge="/Script/RammsUI.Default__RammsRemoteBridge")
