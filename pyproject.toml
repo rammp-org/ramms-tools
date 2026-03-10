@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ramms-tools"
+version = "0.1.0"
+description = "Python tools for interacting with RAMMS-based Unreal Engine projects via Remote Control API"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=8.0.0"]
+
+[project.scripts]
+ramms-gripper = "ramms_tools.scripts.control_gripper:main"
+ramms-kinova = "ramms_tools.scripts.control_kinova:main"
+ramms-mebot = "ramms_tools.scripts.control_mebot:main"
+ramms-notify = "ramms_tools.scripts.send_notification:main"
+ramms-status = "ramms_tools.scripts.set_status:main"
+ramms-imu = "ramms_tools.scripts.stream_imu:main"
+ramms-tui = "ramms_tools.scripts.tui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

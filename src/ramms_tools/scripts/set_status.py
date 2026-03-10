@@ -20,12 +20,13 @@ and calls functions on URammsRemoteBridge to update StatusPanel widgets.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 
-from unreal_remote import UnrealRemote, UnrealRemoteError
+from ramms_tools.unreal_remote import UnrealRemote, UnrealRemoteError
 
-# Bridge CDO path
+# Bridge CDO path (UI-specific bridge stays in RammsUI)
 BRIDGE = "/Script/RammsUI.Default__RammsRemoteBridge"
 
 # Mode name -> ERammsRobotMode enum string (UE Remote Control uses enum name strings)
@@ -261,10 +262,16 @@ def main():
                         help="Run demo sequence")
     parser.add_argument("--discover", action="store_true",
                         help="Discover RAMMS widgets and actors")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Enable debug logging")
 
     args = parser.parse_args()
 
-    ue = UnrealRemote(host=args.host, http_port=args.port)
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
+
+    ue = UnrealRemote(host=args.host, http_port=args.port,
+                      ui_bridge="/Script/RammsUI.Default__RammsRemoteBridge")
 
     # Check connectivity
     print(f"Connecting to UE Remote Control at {ue.base_url}...")

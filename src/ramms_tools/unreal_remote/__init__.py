@@ -6,6 +6,16 @@ Supports querying actors/components, getting/setting properties, and calling
 functions — all via dynamic proxy objects that translate attribute access
 and method calls into remote API requests.
 
+Core features (RammsCore plugin only):
+    - Actor and component discovery via URammsCoreBridge
+    - Property read/write on any UObject
+    - Function calls on any UObject
+    - Object description (introspection)
+
+Optional UI features (requires RammsUI plugin):
+    - Widget discovery, notifications, status panel control
+    - Pass ui_bridge="/Script/RammsUI.Default__RammsRemoteBridge" to enable
+
 Usage:
     from unreal_remote import UnrealRemote
 
@@ -16,6 +26,9 @@ Usage:
 
     # Find actors by class
     cameras = ue.find_actors(class_filter="CameraActor")
+
+    # Find components on an actor
+    comps = ue.find_components(actor_path, "Controller")
 
     # Get a proxy for a specific actor by path
     actor = ue.actor("/Game/MyMap.MyMap:PersistentLevel.MyActor_0")
@@ -91,7 +104,8 @@ class RemoteObjectProxy:
     def get_components(self, class_filter: Optional[str] = None) -> list[RemoteObjectProxy]:
         """Get components of this actor, optionally filtered by class name."""
         client = object.__getattribute__(self, '_client')
-        return client._get_components(self.object_path, class_filter)
+        comps = client.find_components(self.object_path, class_filter or "")
+        return [RemoteObjectProxy(client, c["path"]) for c in comps]
 
     def __getattr__(self, name: str):
         """
@@ -124,14 +138,23 @@ class UnrealRemote:
     """
 
     def __init__(self, host: str = "127.0.0.1", http_port: int = 30010,
-                 timeout: float = 5.0):
+                 timeout: float = 5.0, ui_bridge: Optional[str] = None):
         self.base_url = f"http://{host}:{http_port}"
         self.timeout = timeout
+        if ui_bridge is not None:
+            self.ramms_ui_bridge = ui_bridge
 
     # Well-known object paths
     EDITOR_ACTOR_SUBSYSTEM = "/Script/UnrealEd.Default__EditorActorSubsystem"
     EDITOR_ASSET_LIBRARY = "/Script/EditorScriptingUtilities.Default__EditorAssetLibrary"
-    RAMMS_REMOTE_BRIDGE = "/Script/RammsUI.Default__RammsRemoteBridge"
+    RAMMS_CORE_BRIDGE = "/Script/RammsCore.Default__RammsCoreBridge"
+
+    # Optional: set to the RammsUI bridge CDO path if the RammsUI plugin is installed.
+    # Default is None (UI bridge not available).
+    ramms_ui_bridge: Optional[str] = None
+
+    # Backward-compat alias
+    RAMMS_REMOTE_BRIDGE = RAMMS_CORE_BRIDGE
 
     # ── High-level API ──────────────────────────────────────────────
 
@@ -141,15 +164,32 @@ class UnrealRemote:
 
     @property
     def bridge(self) -> RemoteObjectProxy:
-        """Get a proxy for the URammsRemoteBridge function library CDO."""
-        return RemoteObjectProxy(self, self.RAMMS_REMOTE_BRIDGE)
+        """Get a proxy for the URammsCoreBridge function library CDO."""
+        return RemoteObjectProxy(self, self.RAMMS_CORE_BRIDGE)
+
+    @property
+    def ui_bridge(self) -> RemoteObjectProxy:
+        """
+        Get a proxy for the URammsRemoteBridge (UI-specific) function library CDO.
+        Requires the RammsUI plugin to be installed and the ui_bridge path to be set,
+        either via the constructor or by setting ramms_ui_bridge on the instance.
+
+        Raises:
+            ValueError: If no UI bridge path has been configured.
+        """
+        if not self.ramms_ui_bridge:
+            raise ValueError(
+                "No UI bridge configured. Pass ui_bridge='/Script/RammsUI.Default__RammsRemoteBridge' "
+                "to UnrealRemote() or set instance.ramms_ui_bridge."
+            )
+        return RemoteObjectProxy(self, self.ramms_ui_bridge)
 
     def find_actors(self, class_filter: Optional[str] = None,
                     name_filter: Optional[str] = None) -> list[RemoteObjectProxy]:
         """
         Find actors in the current level.
 
-        Tries the RammsRemoteBridge first (uses GEngine->GetWorldContexts()),
+        Tries the RammsCoreBridge first (uses GEngine->GetWorldContexts()),
         then falls back to EditorActorSubsystem.
 
         Args:
@@ -159,40 +199,43 @@ class UnrealRemote:
         Returns:
             List of RemoteObjectProxy for matching actors.
         """
-        # Try RammsRemoteBridge (works with proper world context via GEngine)
+        # Try RammsCoreBridge (works with proper world context via GEngine)
         try:
             if class_filter:
                 result = self._call_function(
-                    self.RAMMS_REMOTE_BRIDGE,
+                    self.RAMMS_CORE_BRIDGE,
                     "FindActors",
                     {"ClassNameFilter": class_filter}
                 )
             else:
                 result = self._call_function(
-                    self.RAMMS_REMOTE_BRIDGE,
+                    self.RAMMS_CORE_BRIDGE,
                     "GetAllActorPaths"
                 )
-            actors = self._parse_path_list(result, name_filter)
-            if actors:
-                return actors
+            return self._parse_path_list(result, name_filter)
         except UnrealRemoteError as e:
-            logger.debug(f"RammsRemoteBridge actor search failed: {e}")
+            logger.debug(f"RammsCoreBridge actor search failed: {e}")
 
-        # Fallback: EditorActorSubsystem
+        # Fallback: EditorActorSubsystem (only reached if bridge call failed)
         try:
             result = self._call_function(
                 self.EDITOR_ACTOR_SUBSYSTEM,
                 "GetAllLevelActors"
             )
-            return self._parse_actor_list(result, name_filter)
+            actors = self._parse_actor_list(result, name_filter)
+            # Apply class_filter client-side since EditorActorSubsystem doesn't support it
+            if class_filter:
+                actors = [a for a in actors
+                          if class_filter.lower() in a.object_path.lower()]
+            return actors
         except UnrealRemoteError as e:
             logger.warning(f"EditorActorSubsystem call failed: {e}")
             return []
 
     def find_ramms_widgets(self, class_filter: str = "") -> list[RemoteObjectProxy]:
         """
-        Find live URammsBaseWidget instances using the RammsRemoteBridge.
-        Uses TObjectIterator so doesn't need world context.
+        Find live URammsBaseWidget instances using the RammsUI bridge.
+        Requires the RammsUI plugin and a configured ui_bridge path.
 
         Args:
             class_filter: Class name substring (e.g. "StatusPanel", "Toolbar").
@@ -200,22 +243,144 @@ class UnrealRemote:
         Returns:
             List of RemoteObjectProxy for matching widget instances.
         """
+        if not self.ramms_ui_bridge:
+            logger.warning("find_ramms_widgets: No UI bridge configured (RammsUI plugin required)")
+            return []
+
         try:
             if class_filter:
                 result = self._call_function(
-                    self.RAMMS_REMOTE_BRIDGE,
+                    self.ramms_ui_bridge,
                     "FindRammsWidgets",
                     {"ClassNameFilter": class_filter}
                 )
             else:
                 result = self._call_function(
-                    self.RAMMS_REMOTE_BRIDGE,
+                    self.ramms_ui_bridge,
                     "GetAllRammsWidgetPaths"
                 )
             return self._parse_path_list(result)
         except UnrealRemoteError as e:
             logger.warning(f"FindRammsWidgets failed: {e}")
             return []
+
+    def find_actors_by_component(self, component_class_filter: str
+                                ) -> list[dict]:
+        """
+        Find actors that have a component matching a class name substring.
+
+        Returns list of dicts with 'actor_path', 'actor_proxy',
+        'component_name', 'component_class', and 'component_path' keys.
+        Single server-side call — much faster than iterating all actors.
+        """
+        try:
+            result = self._call_function(
+                self.RAMMS_CORE_BRIDGE,
+                "FindActorsByComponent",
+                {"ComponentFilter": component_class_filter}
+            )
+            if isinstance(result, dict):
+                result = result.get("ReturnValue", result)
+
+            entries = []
+            if isinstance(result, list):
+                for entry in result:
+                    if isinstance(entry, str) and "|" in entry:
+                        actor_path, comp_info = entry.split("|", 1)
+                        if ":" in comp_info:
+                            comp_name, comp_class = comp_info.split(":", 1)
+                            entries.append({
+                                "actor_path": actor_path,
+                                "actor_proxy": RemoteObjectProxy(self, actor_path),
+                                "component_name": comp_name,
+                                "component_class": comp_class,
+                                "component_path": f"{actor_path}.{comp_name}",
+                            })
+            return entries
+        except UnrealRemoteError as e:
+            logger.debug(f"FindActorsByComponent failed: {e}")
+            return []
+
+    def find_components(self, actor_path: str,
+                        class_filter: str = "") -> list[dict]:
+        """
+        Find components on an actor using the RammsCoreBridge.
+
+        Args:
+            actor_path: Full object path of the actor.
+            class_filter: Substring filter matched against both the component
+                instance name and the class name (empty = all).
+
+        Returns:
+            List of dicts with 'name', 'class_name', and 'path' keys.
+        """
+        try:
+            result = self._call_function(
+                self.RAMMS_CORE_BRIDGE,
+                "FindComponents",
+                {"ActorPath": actor_path, "ClassNameFilter": class_filter}
+            )
+            entries = []
+            if isinstance(result, dict):
+                result = result.get("ReturnValue", result)
+            if isinstance(result, list):
+                for entry in result:
+                    if isinstance(entry, str) and ":" in entry:
+                        name, cls = entry.split(":", 1)
+                        entries.append({
+                            "name": name,
+                            "class_name": cls,
+                            "path": f"{actor_path}.{name}",
+                        })
+            return entries
+        except UnrealRemoteError as e:
+            logger.debug(f"RammsCoreBridge FindComponents failed: {e}")
+            # Fallback to describe_object
+            return self._get_components_via_describe(actor_path, class_filter)
+
+    def _get_components_via_describe(self, actor_path: str,
+                                     class_filter: str = "") -> list[dict]:
+        """Fallback: get components via describe_object.
+
+        Note: describe_object returns UPROPERTY variable names, which may
+        differ from component instance names. We attempt to read the property
+        value to get the actual object path.
+        """
+        try:
+            desc = self.describe_object(actor_path)
+        except UnrealRemoteError:
+            return []
+
+        components = []
+        for prop in desc.get("Properties", []):
+            prop_type = prop.get("Type", "")
+            if not prop_type.endswith("Component"):
+                continue
+            prop_name = prop.get("Name", "")
+            if class_filter:
+                fl = class_filter.lower()
+                if fl not in prop_type.lower() and fl not in prop_name.lower():
+                    continue
+
+            # Try to read the property value to get the actual component path
+            comp_path = None
+            try:
+                val = self._get_property(actor_path, prop_name)
+                if isinstance(val, str) and val:
+                    comp_path = val
+            except UnrealRemoteError:
+                pass
+
+            if not comp_path:
+                # Best-effort: use property name (may differ from instance name)
+                comp_path = f"{actor_path}.{prop_name}"
+
+            components.append({
+                "name": prop_name,
+                "class_name": prop_type,
+                "path": comp_path,
+            })
+        return components
 
     def _parse_path_list(self, result: Any,
                          name_filter: Optional[str] = None) -> list[RemoteObjectProxy]:
@@ -399,26 +564,6 @@ class UnrealRemote:
             return result["ReturnValue"]
         return result
 
-    def _get_components(self, actor_path: str,
-                        class_filter: Optional[str] = None) -> list[RemoteObjectProxy]:
-        """Get components of an actor by describing it and filtering."""
-        try:
-            desc = self.describe_object(actor_path)
-        except UnrealRemoteError:
-            return []
-
-        components = []
-        # The describe response includes component info
-        for prop in desc.get("Properties", []):
-            if prop.get("Type", "").endswith("Component"):
-                comp_name = prop.get("Name", "")
-                if class_filter and class_filter.lower() not in prop.get("Type", "").lower():
-                    continue
-                comp_path = f"{actor_path}.{comp_name}"
-                components.append(RemoteObjectProxy(self, comp_path))
-
-        return components
-
     # ── HTTP transport ──────────────────────────────────────────────
 
     def _request(self, method: str, endpoint: str,
@@ -431,12 +576,19 @@ class UnrealRemote:
         else:
             data = None
 
+        _debug = logger.isEnabledFor(logging.DEBUG)
+        if _debug:
+            body_preview = data.decode("utf-8")[:500] if data else None
+            logger.debug(f"→ {method} {endpoint} body={body_preview}")
+
         headers = {"Content-Type": "application/json"}
         req = Request(url, data=data, headers=headers, method=method)
 
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 resp_data = resp.read().decode("utf-8")
+                if _debug:
+                    logger.debug(f"← {resp.status} {resp_data[:500] if resp_data else '(empty)'}")
                 if resp_data:
                     return json.loads(resp_data)
                 return {}
@@ -446,6 +598,8 @@ class UnrealRemote:
                 body_text = e.read().decode("utf-8")
             except Exception:
                 pass
+            if _debug:
+                logger.debug(f"← HTTP {e.code}: {body_text[:500]}")
             raise UnrealRemoteError(
                 f"HTTP {e.code} on {method} {endpoint}: {body_text}"
             ) from e
