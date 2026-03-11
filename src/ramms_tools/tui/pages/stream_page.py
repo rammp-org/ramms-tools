@@ -160,7 +160,7 @@ class StreamPage(Static):
                 self.query_one("#stream-disconnect-btn", Button).disabled = False
                 self.query_one("#stream-sub-btn", Button).disabled = False
 
-            self.call_from_thread(_update)
+            self.app.call_from_thread(_update)
         except Exception as exc:
 
             def _err():
@@ -168,7 +168,7 @@ class StreamPage(Static):
                     f"❌ Connection failed: {exc}"
                 )
 
-            self.call_from_thread(_err)
+            self.app.call_from_thread(_err)
 
     def _do_disconnect(self) -> None:
         if self._client:
@@ -191,7 +191,7 @@ class StreamPage(Static):
                         f"✅ Subscribed to all channels"
                     )
 
-                self.call_from_thread(_ok)
+                self.app.call_from_thread(_ok)
             except Exception as exc:
 
                 def _err():
@@ -199,7 +199,7 @@ class StreamPage(Static):
                         f"⚠️ Subscribe failed: {exc}"
                     )
 
-                self.call_from_thread(_err)
+                self.app.call_from_thread(_err)
 
     # ── Stats refresh ────────────────────────────────────────────────
 
