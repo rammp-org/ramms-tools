@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
-import time
-import threading
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Static, DataTable, Label, Button, Input
 from textual import work
 
-from ramms_tools.streaming.client import StreamClient, ChannelStats
+from ramms_tools.streaming.client import StreamClient
 from ramms_tools.streaming.compression import has_jpeg, has_lz4
 
 
 class StreamPage(Static):
     """Real-time stream monitoring page.
 
-    Shows connection status, per-channel FPS/bandwidth/latency,
+    Shows connection status, per-channel FPS/bandwidth/compression,
     and allows subscribe/unsubscribe control.
     """
 
@@ -162,23 +160,30 @@ class StreamPage(Static):
 
             self.app.call_from_thread(_update)
         except Exception as exc:
+            err_msg = str(exc)
 
             def _err():
                 self.query_one("#stream-status", Label).update(
-                    f"❌ Connection failed: {exc}"
+                    f"❌ Connection failed: {err_msg}"
                 )
 
             self.app.call_from_thread(_err)
 
+    @work(thread=True)
     def _do_disconnect(self) -> None:
-        if self._client:
-            self._client.disconnect()
-            self._client = None
-        self._stream_connected = False
-        self.query_one("#stream-status", Label).update("Disconnected")
-        self.query_one("#stream-connect-btn", Button).disabled = False
-        self.query_one("#stream-disconnect-btn", Button).disabled = True
-        self.query_one("#stream-sub-btn", Button).disabled = True
+        client = self._client
+        self._client = None
+        if client:
+            client.disconnect()
+
+        def _update():
+            self._stream_connected = False
+            self.query_one("#stream-status", Label).update("Disconnected")
+            self.query_one("#stream-connect-btn", Button).disabled = False
+            self.query_one("#stream-disconnect-btn", Button).disabled = True
+            self.query_one("#stream-sub-btn", Button).disabled = True
+
+        self.app.call_from_thread(_update)
 
     @work(thread=True)
     def _do_subscribe_all(self) -> None:
@@ -193,10 +198,11 @@ class StreamPage(Static):
 
                 self.app.call_from_thread(_ok)
             except Exception as exc:
+                err_msg = str(exc)
 
                 def _err():
                     self.query_one("#stream-status", Label).update(
-                        f"⚠️ Subscribe failed: {exc}"
+                        f"⚠️ Subscribe failed: {err_msg}"
                     )
 
                 self.app.call_from_thread(_err)
@@ -216,7 +222,7 @@ class StreamPage(Static):
             fps = cs.fps
             avg_size = cs.bytes_total / max(cs.frames, 1)
             avg_comp = cs.bytes_compressed / max(cs.frames, 1)
-            bw_mbps = fps * avg_size / (1024 * 1024)
+            bw_mib_s = fps * avg_size / (1024 * 1024)
             ratio = (
                 f"{avg_comp / avg_size * 100:.0f}%"
                 if avg_size > 0 and avg_comp != avg_size
@@ -228,7 +234,7 @@ class StreamPage(Static):
                 "—",
                 str(cs.frames),
                 f"{fps:.1f}",
-                f"{bw_mbps:.2f} MB/s",
+                f"{bw_mib_s:.2f} MiB/s",
                 ratio,
                 str(cs.dropped),
                 str(cs.last_seq),

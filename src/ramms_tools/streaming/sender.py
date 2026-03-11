@@ -8,12 +8,21 @@ Usage::
     sender = StreamSender("127.0.0.1", 30030)
     sender.connect()
 
-    # Send a numpy RGB image
+    # Send a numpy BGRA image (preferred)
     img = np.zeros((720, 1280, 4), dtype=np.uint8)  # BGRA
-    sender.send_image(channel=0, image=img, width=1280, height=720)
+    sender.send_numpy_image(channel=0, array=img)
 
-    # Send from a file (e.g., CameraCapture EXR/JSON)
-    sender.send_capture_dir("path/to/Saved/CameraCaptures/Actor/Camera/")
+    # Send raw bytes
+    sender.send_image(channel=0, image_bytes=img.tobytes(),
+                      width=1280, height=720, fmt="bgra8")
+
+    # Send with JPEG compression
+    from ramms_tools.streaming.compression import compress_payload, Compression
+    raw = img.tobytes()
+    compressed = compress_payload(raw, Compression.JPEG, quality=85)
+    sender.send_image(channel=0, image_bytes=compressed,
+                      width=1280, height=720, fmt="bgra8",
+                      compression=Compression.JPEG)
 
     sender.disconnect()
 """
@@ -22,9 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import socket
-import struct
 import time
 from pathlib import Path
 from typing import Optional, Union
@@ -92,13 +99,23 @@ class StreamSender:
     def send_image(self, channel: int, image_bytes: bytes,
                    width: int, height: int,
                    fmt: str = "bgra8",
+                   compression: Compression = Compression.NONE,
                    metadata: Optional[dict] = None) -> None:
-        """Send a raw image to UE as an IMAGE_DATA message."""
+        """Send a raw image to UE as an IMAGE_DATA message.
+
+        If *compression* is not NONE, the caller must have already
+        compressed *image_bytes* (e.g. via
+        ``ramms_tools.streaming.compression.compress_payload``).
+        The compression flag is set in the header so the receiver
+        knows how to decompress.
+        """
         msg = StreamMessage()
         msg.header.message_type = MessageType.IMAGE_DATA
         msg.header.channel_id = channel
         msg.header.sequence_num = self._next_seq(channel)
         msg.header.timestamp = StreamHeader.now_timestamp()
+        if compression != Compression.NONE:
+            msg.header.set_compression(compression)
 
         meta = metadata or {}
         meta.setdefault("w", width)
