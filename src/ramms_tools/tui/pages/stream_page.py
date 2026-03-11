@@ -219,7 +219,7 @@ class StreamPage(Static):
         table.clear()
         for ch_id in sorted(stats.keys()):
             cs = stats[ch_id]
-            fps = cs.fps
+            fps = cs.fps()
             avg_size = cs.bytes_total / max(cs.frames, 1)
             avg_comp = cs.bytes_compressed / max(cs.frames, 1)
             bw_mib_s = fps * avg_size / (1024 * 1024)
@@ -242,7 +242,7 @@ class StreamPage(Static):
 
         # Update status with totals
         if self._stream_connected:
-            total_fps = sum(s.fps for s in stats.values())
+            total_fps = sum(s.fps() for s in stats.values())
             total_msgs = self._client.messages_received
             uptime = self._client.uptime
             mins, secs = divmod(int(uptime), 60)

@@ -17,9 +17,10 @@ Usage::
                       width=1280, height=720, fmt="bgra8")
 
     # Send with JPEG compression
-    from ramms_tools.streaming.compression import compress_payload, Compression
+    from ramms_tools.streaming.protocol import Compression
+    from ramms_tools.streaming.compression import compress_jpeg
     raw = img.tobytes()
-    compressed = compress_payload(raw, Compression.JPEG, quality=85)
+    compressed = compress_jpeg(raw, width=1280, height=720, quality=85)
     sender.send_image(channel=0, image_bytes=compressed,
                       width=1280, height=720, fmt="bgra8",
                       compression=Compression.JPEG)

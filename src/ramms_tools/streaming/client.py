@@ -69,23 +69,28 @@ class ChannelStats:
     last_seq: int = -1
     dropped: int = 0
     _timestamps: deque = field(default_factory=lambda: deque(maxlen=200), repr=False)
+    _lock: threading.Lock | threading.RLock | None = field(default=None, repr=False)
 
-    @property
     def fps(self) -> float:
         """Approximate FPS over the last 2 seconds of frames.
 
-        Read-only over _timestamps — does not mutate the deque, avoiding
-        races with the recv thread that appends to it.
+        Snapshots timestamps under lock (if set) to avoid racing
+        with the recv thread that appends to the deque.
         """
+        if self._lock is not None:
+            with self._lock:
+                ts = list(self._timestamps)
+        else:
+            ts = list(self._timestamps)
         now = time.monotonic()
         cutoff = now - 2.0
-        count = sum(1 for t in self._timestamps if t > cutoff)
+        count = sum(1 for t in ts if t > cutoff)
         return count / 2.0
 
     @property
-    def bandwidth_mbps(self) -> float:
-        """Approximate bandwidth in MB/s over last 2s window."""
-        return self.fps * (self.bytes_total / max(self.frames, 1)) / (1024 * 1024)
+    def bandwidth_mib_s(self) -> float:
+        """Approximate bandwidth in MiB/s over last 2s window."""
+        return self.fps() * (self.bytes_total / max(self.frames, 1)) / (1024 * 1024)
 
 
 class StreamClient:
@@ -115,7 +120,7 @@ class StreamClient:
         self.bytes_received = 0
         self.messages_received = 0
         self.errors = 0
-        self._stats_lock = threading.Lock()
+        self._stats_lock = threading.RLock()
         self._channel_stats: dict[int, ChannelStats] = {}
         self._connect_time: float = 0.0
 
@@ -202,7 +207,6 @@ class StreamClient:
         dequeued/dropped while waiting for the PING reply.
         """
         self._ping_event.clear()
-        t0 = time.monotonic()
         msg = StreamMessage()
         msg.header.message_type = MessageType.PING
         msg.header.timestamp = StreamHeader.now_timestamp()
@@ -282,7 +286,9 @@ class StreamClient:
                 if is_frame:
                     with self._stats_lock:
                         if ch not in self._channel_stats:
-                            self._channel_stats[ch] = ChannelStats(channel_id=ch)
+                            self._channel_stats[ch] = ChannelStats(
+                                channel_id=ch, _lock=self._stats_lock,
+                            )
                         cs = self._channel_stats[ch]
                         cs.frames += 1
                         cs.bytes_compressed += len(msg.payload)
@@ -374,4 +380,4 @@ class StreamClient:
     def total_fps(self) -> float:
         """Sum of FPS across all channels."""
         with self._stats_lock:
-            return sum(cs.fps for cs in self._channel_stats.values())
+            return sum(cs.fps() for cs in self._channel_stats.values())
