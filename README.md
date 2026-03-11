@@ -11,6 +11,9 @@ pip install -e .
 
 # Or install directly from GitHub
 pip install git+https://github.com/ATDev-Inc/ramms-tools.git
+
+# With EXR support (for camera capture replay)
+pip install -e '.[exr]'
 ```
 
 ## Requirements
@@ -19,7 +22,7 @@ pip install git+https://github.com/ATDev-Inc/ramms-tools.git
 - Unreal Engine running with the **Remote Control API** plugin enabled (default port 30010)
 - For robot control: the **RammsCore** plugin with `URammsCoreBridge`
 - For UI features: the **RammsUI** plugin with `URammsRemoteBridge`
-- For binary streaming: the **RammsStreaming** plugin (TCP port 30020)
+- For binary streaming: the **RammsStreaming** plugin (TCP port 30030)
 - The **Textual** TUI library (`pip install 'ramms-tools[tui]'` or `pip install textual`)
 
 ## Library Usage
@@ -189,8 +192,8 @@ ramms-status --discover                          # List widgets and actors
 
 ### `ramms-stream` — Binary Data Streaming
 
-Connects to the RMSS streaming server (default port 30020) to receive or send
-camera frames and other binary data.
+Connects to the RMSS streaming server (default port 30030) to receive and
+monitor camera frames and other binary data.
 
 ```bash
 # Receive and display stats
@@ -198,15 +201,14 @@ ramms-stream                                     # Subscribe to all channels
 ramms-stream -c 0,1                              # Subscribe to channels 0 and 1
 ramms-stream --save ./captures                   # Save frames to disk
 
-# Replay captured frames back to UE
-ramms-stream --replay ./captures/channel_00      # Replay from saved dir
-ramms-stream --replay ./Saved/CameraCaptures/Robot/HeadCam --replay-fps 30
-
 # Test connectivity
 ramms-stream --ping
 ```
 
-The streaming system uses a custom TCP binary protocol (port 30020) and requires
+For replaying captured frames or sending test data, see
+[`ramms-stream-test`](#ramms-stream-test--stream-test--capture-replay).
+
+The streaming system uses a custom TCP binary protocol (port 30030) and requires
 the **RammsStreaming** UE plugin.  Add `URammsStreamSourceComponent` to actors
 with cameras to stream their frames, and `URammsStreamSinkComponent` to receive
 images from external sources.  Use `URammsStreamCameraBridge` (RammsUI) to
@@ -241,7 +243,7 @@ print(f"JPEG: {has_jpeg()}, LZ4: {has_lz4()}")
 from ramms_tools.streaming import StreamClient, StreamSender
 
 # Receive frames from UE (auto-decompresses JPEG/LZ4)
-with StreamClient("127.0.0.1", 30020) as client:
+with StreamClient("127.0.0.1", 30030) as client:
     client.subscribe(channels=[0])
     for msg in client.iter_messages():
         meta = msg.get_metadata_json()
@@ -253,10 +255,49 @@ with StreamClient("127.0.0.1", 30020) as client:
             print(f"  Ch {ch}: {cs.fps:.1f} fps, {cs.frames} frames")
 
 # Send images to UE
-with StreamSender("127.0.0.1", 30020) as sender:
+with StreamSender("127.0.0.1", 30030) as sender:
     import numpy as np
     img = np.zeros((720, 1280, 4), dtype=np.uint8)
     sender.send_numpy_image(channel=0, array=img)
+```
+
+### `ramms-stream-test` — Stream Test & Capture Replay
+
+Sends test frames or replays captured camera data to UE via the RMSS streaming
+server. Useful for testing the streaming pipeline without a live camera source.
+
+```bash
+# Send synthetic color-bar test frames
+ramms-stream-test --synthetic -n 100
+
+# Replay a single camera's captured data
+ramms-stream-test --capture-dir ./Saved/CameraCaptures/Robot/HeadCam
+
+# Replay all cameras from an actor (auto-discovers camera subdirectories)
+ramms-stream-test --capture-dir ./Saved/CameraCaptures/BP_Mebot_Ramms_C_0
+
+# Include depth data and filter to specific camera
+ramms-stream-test --send-depth --capture-dir ./Saved/CameraCaptures/BP_Mebot_Ramms_C_0 --camera FR_GeminiCamera
+
+# Control chunk size and frame rate
+ramms-stream-test --capture-dir ./captures --prefetch 30 --fps 30 -n 0
+```
+
+| Flag | Description |
+|------|-------------|
+| `--synthetic` | Send animated color-bar test frames |
+| `--capture-dir` | Replay EXR+JSON data from CameraCapture plugin output |
+| `--send-depth` | Include depth channel when replaying captures |
+| `--camera` | Filter to a specific camera name |
+| `--prefetch` | Chunk size for double-buffered loading (default: 30, 0=all) |
+| `--channel` | Base RGB channel ID (default: 0) |
+| `--depth-channel` | Base depth channel ID (default: channel+100) |
+| `-n` / `--num-frames` | Max frames to send (default: 300, 0=all) |
+| `--loop` | Loop playback continuously |
+
+Requires the `exr` optional dependency for capture replay:
+```bash
+pip install 'ramms-tools[exr]'   # OpenEXR + Imath
 ```
 
 ## Common Options
