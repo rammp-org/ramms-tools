@@ -130,12 +130,15 @@ def _load_openexr():
         sys.exit(1)
 
 
-def load_exr_as_bgra8(exr_path: Path) -> tuple[np.ndarray, int, int] | None:
-    """Load an EXR file and return (bgra8_array, width, height).
+def load_exr_frame(
+    exr_path: Path,
+    want_depth: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None, int, int] | None:
+    """Load an EXR and return (bgra8_bytes, depth_f32_or_None, width, height).
 
-    Uses OpenEXR directly for reliable EXR support with UE capture data.
-    The CameraCapture EXR stores RGBA as FLinearColor (float32 per channel).
-    We convert to uint8 BGRA for the streaming sink.
+    Opens the file once, extracts RGB → BGRA8 (linear, no color space
+    conversion — UE handles sRGB via the SRGB texture flag) and optionally
+    depth (Depth channel, falling back to Alpha).
     """
     OpenEXR, Imath = _load_openexr()
 
@@ -150,68 +153,52 @@ def load_exr_as_bgra8(exr_path: Path) -> tuple[np.ndarray, int, int] | None:
     w = dw.max.x - dw.min.x + 1
     h = dw.max.y - dw.min.y + 1
     channels = header["channels"].keys()
-
     pt = Imath.PixelType(Imath.PixelType.FLOAT)
 
     if not all(ch in channels for ch in ("R", "G", "B")):
         logger.warning("%s missing RGB channels (has: %s)", exr_path, list(channels))
         return None
 
-    r = np.frombuffer(exr_file.channel("R", pt), dtype=np.float32).reshape((h, w))
-    g = np.frombuffer(exr_file.channel("G", pt), dtype=np.float32).reshape((h, w))
-    b = np.frombuffer(exr_file.channel("B", pt), dtype=np.float32).reshape((h, w))
+    # Read channels into byte buffers, then wrap as float32 views (zero-copy)
+    b_buf = exr_file.channel("B", pt)
+    g_buf = exr_file.channel("G", pt)
+    r_buf = exr_file.channel("R", pt)
 
-    # Linear float → sRGB uint8
-    rgb = np.dstack((r, g, b))
-    rgb_clipped = np.clip(rgb, 0.0, 1.0)
-    rgb_srgb = np.where(
-        rgb_clipped <= 0.0031308,
-        rgb_clipped * 12.92,
-        1.055 * np.power(rgb_clipped, 1.0 / 2.4) - 0.055,
-    )
-    rgb_u8 = (rgb_srgb * 255.0).astype(np.uint8)
+    # Assemble BGRA8 with minimal allocations:
+    #  - np.float32 multiplier avoids float64 promotion (halves temp memory)
+    #  - Single scratch buffer reused per channel (no per-channel temps)
+    #  - np.copyto(casting='unsafe') converts float32→uint8 without extra arrays
+    #  - No clip — rendered EXR data is [0,1]; UE handles any edge values
+    bgra = np.empty((h, w, 4), dtype=np.uint8)
+    bgra[:, :, 3] = 255
+    _f32_255 = np.float32(255.0)
+    scratch = np.empty((h, w), dtype=np.float32)
 
-    # Build BGRA8 (swap R↔B, add full alpha)
-    bgra = np.zeros((h, w, 4), dtype=np.uint8)
-    bgra[:, :, 0] = rgb_u8[:, :, 2]  # B
-    bgra[:, :, 1] = rgb_u8[:, :, 1]  # G
-    bgra[:, :, 2] = rgb_u8[:, :, 0]  # R
-    bgra[:, :, 3] = 255               # A
+    for buf, ch in ((b_buf, 0), (g_buf, 1), (r_buf, 2)):
+        np.multiply(
+            np.frombuffer(buf, dtype=np.float32).reshape((h, w)),
+            _f32_255, out=scratch,
+        )
+        np.copyto(bgra[:, :, ch], scratch, casting="unsafe")
 
-    return bgra, w, h
-
-
-def extract_depth_from_exr(exr_path: Path) -> tuple[np.ndarray, int, int] | None:
-    """Extract depth channel from EXR (alpha channel or explicit Depth channel)."""
-    OpenEXR, Imath = _load_openexr()
-
-    try:
-        exr_file = OpenEXR.InputFile(str(exr_path))
-    except Exception:
-        return None
-
-    header = exr_file.header()
-    dw = header["dataWindow"]
-    w = dw.max.x - dw.min.x + 1
-    h = dw.max.y - dw.min.y + 1
-    channels = header["channels"].keys()
-    pt = Imath.PixelType(Imath.PixelType.FLOAT)
-
-    # Prefer explicit Depth channel, fall back to Alpha
     depth = None
-    if "Depth" in channels:
-        depth = np.frombuffer(exr_file.channel("Depth", pt), dtype=np.float32).reshape((h, w))
-    elif "A" in channels:
-        depth = np.frombuffer(exr_file.channel("A", pt), dtype=np.float32).reshape((h, w))
+    if want_depth:
+        if "Depth" in channels:
+            depth = np.frombuffer(
+                exr_file.channel("Depth", pt), dtype=np.float32
+            ).reshape((h, w))
+        elif "A" in channels:
+            depth = np.frombuffer(
+                exr_file.channel("A", pt), dtype=np.float32
+            ).reshape((h, w))
+        # Filter out default alpha (1.0 everywhere = no real depth data)
+        # Use min/max instead of allclose to avoid allocating temp arrays
+        if depth is not None:
+            dmin, dmax = float(depth.min()), float(depth.max())
+            if abs(dmin - 1.0) < 1e-5 and abs(dmax - 1.0) < 1e-5:
+                depth = None
 
-    if depth is None:
-        return None
-
-    # Filter out default alpha (1.0 everywhere = no real depth data)
-    if np.allclose(depth, 1.0):
-        return None
-
-    return depth, w, h
+    return bgra, depth, w, h
 
 
 def discover_capture_cameras(capture_dir: Path) -> list[tuple[str, str, Path]]:
@@ -340,8 +327,125 @@ def discover_cameras_in_dir(
     return cameras
 
 
+def _load_single_frame(
+    ci: dict,
+    frame_idx: int,
+    want_depth: bool,
+) -> dict | None:
+    """Load one frame for one camera.  Returns a dict ready for sending, or None."""
+    jf, exr_path = ci["frames"][frame_idx]
+
+    with open(jf) as f:
+        file_meta = json.load(f)
+
+    result = load_exr_frame(exr_path, want_depth=want_depth)
+    if result is None:
+        return None
+
+    bgra, depth, w, h = result
+
+    meta: dict = {
+        "w": w, "h": h, "fmt": "bgra8",
+        "frame": file_meta.get("frame_number", frame_idx),
+        "source": "capture_replay",
+        "camera": file_meta.get("camera_id", ci["label"]),
+    }
+
+    if "intrinsics" in file_meta:
+        intr = file_meta["intrinsics"]
+        meta["intrinsics"] = {
+            "fx": intr.get("focal_length_x", 0),
+            "fy": intr.get("focal_length_y", 0),
+            "cx": intr.get("principal_point_x", 0),
+            "cy": intr.get("principal_point_y", 0),
+        }
+
+    xform_key = (
+        "relative_transform" if "relative_transform" in file_meta
+        else "world_transform"
+    )
+    if xform_key in file_meta:
+        wt = file_meta[xform_key]
+        loc = wt.get("location", [0, 0, 0])
+        rot = wt.get("rotation", [0, 0, 0])
+        meta["transform"] = {
+            "x": loc[0], "y": loc[1], "z": loc[2],
+            "pitch": rot[0], "yaw": rot[1], "roll": rot[2],
+        }
+        meta["transform_space"] = (
+            "relative" if xform_key == "relative_transform" else "world"
+        )
+
+    return {
+        "bgra": bgra.tobytes(),
+        "depth": depth.tobytes() if depth is not None else None,
+        "w": w,
+        "h": h,
+        "meta": meta,
+    }
+
+
+# Default number of frame-sets (one set = all cameras for one time-step) to
+# keep buffered ahead of the send loop.
+_DEFAULT_PREFETCH = 30
+
+
+def _load_camera_chunk(
+    ci: dict,
+    start: int,
+    end: int,
+    want_depth: bool,
+) -> list[dict | None]:
+    """Load frames [start, end) for one camera sequentially.
+
+    Called from a worker process — one process per camera, so file I/O and
+    decompression run with independent GILs.  Returns list of loaded frame
+    dicts (or None for failures).
+    """
+    loaded: list[dict | None] = []
+    for frame_idx in range(start, end):
+        loaded.append(_load_single_frame(ci, frame_idx, want_depth))
+    return loaded
+
+
+def _submit_chunk(
+    pool: "ProcessPoolExecutor",
+    camera_info: list[dict],
+    chunk_start: int,
+    chunk_end: int,
+    want_depth: bool,
+) -> "dict[Future, int]":
+    """Submit one chunk load — one future per camera, returns {future: cam_idx}."""
+    return {
+        pool.submit(
+            _load_camera_chunk, ci, chunk_start, chunk_end, want_depth,
+        ): idx
+        for idx, ci in enumerate(camera_info)
+    }
+
+
+def _collect_chunk(
+    futures: "dict[Future, int]",
+    num_cameras: int,
+) -> list[list["dict | None"]]:
+    """Block until all camera futures complete, return [cam_idx][local_frame]."""
+    from concurrent.futures import as_completed
+    result: list[list[dict | None]] = [[] for _ in range(num_cameras)]
+    for future in as_completed(futures):
+        idx = futures[future]
+        result[idx] = future.result()
+    return result
+
+
 def run_capture_replay(args: argparse.Namespace) -> None:
     """Replay captured EXR+JSON data, decoding EXR to BGRA8 pixels.
+
+    Uses double-buffered chunk loading: while chunk N is being sent, chunk N+1
+    is loaded in the background by a persistent process pool (one process per
+    camera).  ProcessPoolExecutor avoids GIL contention — loading in worker
+    processes doesn't starve the main thread's socket sends.  Memory is bounded
+    to roughly ``2 × chunk × cameras × frame_size`` (two chunks resident at
+    the transition point).
 
     Supports single-camera (flat folder) and multi-camera (actor or full
     capture tree).  Each camera gets its own channel pair:
@@ -349,6 +453,9 @@ def run_capture_replay(args: argparse.Namespace) -> None:
       camera 1 → RGB on base_channel+1,   depth on depth_base+1
       ...
     """
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
     capture_dir = Path(args.capture_dir)
     if not capture_dir.is_dir():
         print(f"ERROR: Capture directory not found: {capture_dir}")
@@ -388,116 +495,141 @@ def run_capture_replay(args: argparse.Namespace) -> None:
         print(f"ERROR: No frame pairs found for any camera in {capture_dir}")
         sys.exit(1)
 
-    print(f"Found {len(camera_info)} camera(s) in {capture_dir}:")
+    num_cameras = len(camera_info)
+    num_frames_per_cam = min(len(ci["frames"]) for ci in camera_info)
+    max_frames = args.num_frames if args.num_frames > 0 else 0
+    if max_frames > 0:
+        num_frames_per_cam = min(num_frames_per_cam, max_frames)
+
+    print(f"Found {num_cameras} camera(s) in {capture_dir}:")
     for ci in camera_info:
         n = len(ci["frames"])
         print(f"  {ci['label']:40s}  {n:>4d} frames  "
               f"RGB→stream/{ci['rgb_channel']}  "
               f"depth→stream/{ci['depth_channel']}")
 
+    # ── Connect ─────────────────────────────────────────────────────
     sender = StreamSender(args.host, args.port)
     print(f"\nConnecting to RMSS server at {args.host}:{args.port}...")
     sender.connect()
     print("Connected! Waiting for server to be ready...")
     time.sleep(0.2)
 
+    want_depth = args.send_depth
+    prefetch = args.prefetch
+    if prefetch <= 0:
+        prefetch = num_frames_per_cam  # 0 = preload everything
+
     fps = args.fps
     frame_interval = 1.0 / fps if fps > 0 else 0
-    max_frames = args.num_frames if args.num_frames > 0 else 0
     loop = args.loop
     total_sent = 0
+    frame_count = 0
+    send_time_accum = 0.0
+
+    # Build list of (chunk_start, chunk_end) ranges
+    def build_chunks() -> list[tuple[int, int]]:
+        chunks = []
+        for cs in range(0, num_frames_per_cam, prefetch):
+            chunks.append((cs, min(cs + prefetch, num_frames_per_cam)))
+        return chunks
+
+    print(f"Streaming (chunk_size={prefetch}, double-buffered)...\n")
+    t_start = time.monotonic()
+
+    pool = ProcessPoolExecutor(
+        max_workers=num_cameras,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
 
     try:
         while True:
-            # Determine how many frames to send (use the shortest camera's count
-            # if not specified, so all cameras stay in sync)
-            num_frames_per_cam = min(len(ci["frames"]) for ci in camera_info)
-            if max_frames > 0:
-                num_frames_per_cam = min(num_frames_per_cam, max_frames)
+            chunks = build_chunks()
 
-            for frame_idx in range(num_frames_per_cam):
-                t0 = time.monotonic()
+            # Kick off loading of the first chunk
+            next_futures = _submit_chunk(
+                pool, camera_info, chunks[0][0], chunks[0][1], want_depth,
+            )
+            t_first_load = time.monotonic()
 
-                for ci in camera_info:
-                    jf, exr_file = ci["frames"][frame_idx]
+            for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
+                chunk_size = chunk_end - chunk_start
 
-                    with open(jf) as f:
-                        file_meta = json.load(f)
+                # Wait for current chunk to finish loading
+                loaded_chunk = _collect_chunk(next_futures, num_cameras)
+                load_elapsed = time.monotonic() - t_first_load
+                load_fps = chunk_size / max(load_elapsed, 0.001)
+                print(f"  Loaded chunk [{chunk_start}..{chunk_end}) "
+                      f"in {load_elapsed:.2f}s ({load_fps:.0f} frames/s)")
 
-                    result = load_exr_as_bgra8(exr_file)
-                    if result is None:
-                        logger.warning("Failed to load %s, skipping", exr_file.name)
-                        continue
-
-                    bgra, w, h = result
-
-                    meta: dict = {
-                        "w": w, "h": h, "fmt": "bgra8",
-                        "frame": file_meta.get("frame_number", frame_idx),
-                        "source": "capture_replay",
-                        "camera": file_meta.get("camera_id", ci["label"]),
-                    }
-
-                    if "intrinsics" in file_meta:
-                        intr = file_meta["intrinsics"]
-                        meta["intrinsics"] = {
-                            "fx": intr.get("focal_length_x", 0),
-                            "fy": intr.get("focal_length_y", 0),
-                            "cx": intr.get("principal_point_x", 0),
-                            "cy": intr.get("principal_point_y", 0),
-                        }
-
-                    xform_key = "relative_transform" if "relative_transform" in file_meta else "world_transform"
-                    if xform_key in file_meta:
-                        wt = file_meta[xform_key]
-                        loc = wt.get("location", [0, 0, 0])
-                        rot = wt.get("rotation", [0, 0, 0])
-                        meta["transform"] = {
-                            "x": loc[0], "y": loc[1], "z": loc[2],
-                            "pitch": rot[0], "yaw": rot[1], "roll": rot[2],
-                        }
-                        meta["transform_space"] = "relative" if xform_key == "relative_transform" else "world"
-
-                    sender.send_image(
-                        channel=ci["rgb_channel"],
-                        image_bytes=bgra.tobytes(),
-                        width=w, height=h,
-                        fmt="bgra8",
-                        metadata=meta,
+                # Immediately kick off loading the NEXT chunk (double-buffer)
+                next_chunk_idx = chunk_idx + 1
+                if next_chunk_idx < len(chunks):
+                    nc_start, nc_end = chunks[next_chunk_idx]
+                    next_futures = _submit_chunk(
+                        pool, camera_info, nc_start, nc_end, want_depth,
                     )
+                    t_first_load = time.monotonic()
 
-                    if args.send_depth:
-                        depth_result = extract_depth_from_exr(exr_file)
-                        if depth_result is not None:
-                            depth, dw, dh = depth_result
-                            depth_meta = dict(meta)
+                # Send current chunk — pure network I/O
+                t_chunk_send = time.monotonic()
+                for local_idx in range(chunk_size):
+                    t0 = time.monotonic()
+
+                    for cam_idx, ci in enumerate(camera_info):
+                        frame = loaded_chunk[cam_idx][local_idx]
+                        if frame is None:
+                            continue
+
+                        sender.send_image(
+                            channel=ci["rgb_channel"],
+                            image_bytes=frame["bgra"],
+                            width=frame["w"], height=frame["h"],
+                            fmt="bgra8",
+                            metadata=frame["meta"],
+                        )
+
+                        if want_depth and frame["depth"] is not None:
+                            depth_meta = dict(frame["meta"])
                             depth_meta["fmt"] = "float32"
                             depth_meta["unit"] = "cm"
                             sender.send_depth(
                                 channel=ci["depth_channel"],
-                                depth_bytes=depth.tobytes(),
-                                width=dw, height=dh,
+                                depth_bytes=frame["depth"],
+                                width=frame["w"], height=frame["h"],
                                 metadata=depth_meta,
                             )
 
-                total_sent += len(camera_info)
+                    total_sent += num_cameras
+                    frame_count += 1
 
-                if frame_idx % 10 == 0 or frame_idx == 0:
-                    print(f"  Frame {frame_idx + 1}/{num_frames_per_cam} "
-                          f"({len(camera_info)} cameras, {total_sent} total sends)")
+                    if (frame_count - 1) % 10 == 0 or frame_count == 1:
+                        cur_send = send_time_accum + (time.monotonic() - t_chunk_send)
+                        send_fps = frame_count / max(cur_send, 0.001)
+                        print(f"  Frame {frame_count}/{num_frames_per_cam} "
+                              f"({num_cameras} cameras, {total_sent} sends, "
+                              f"tx {send_fps:.1f} fps)")
 
-                elapsed = time.monotonic() - t0
-                if frame_interval > elapsed:
-                    time.sleep(frame_interval - elapsed)
+                    elapsed = time.monotonic() - t0
+                    if frame_interval > elapsed:
+                        time.sleep(frame_interval - elapsed)
+
+                send_time_accum += time.monotonic() - t_chunk_send
+                del loaded_chunk
 
             if not loop:
                 break
             print(f"  Looping... ({total_sent} total sends so far)")
 
-        print(f"\nDone! Sent {num_frames_per_cam} frames × {len(camera_info)} cameras "
-              f"= {total_sent} total")
+        elapsed_total = time.monotonic() - t_start
+        send_fps = frame_count / max(send_time_accum, 0.001)
+        print(f"\nDone! Sent {frame_count} frames × {num_cameras} cameras "
+              f"= {total_sent} total in {elapsed_total:.1f}s "
+              f"(tx {send_fps:.1f} fps, "
+              f"overall {frame_count / max(elapsed_total, 0.001):.1f} fps)")
     finally:
         sender.disconnect()
+        pool.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +679,10 @@ def main() -> None:
                         help="Filter cameras by substring (e.g. 'FL_Capture', 'Gripper')")
     parser.add_argument("--list-cameras", action="store_true",
                         help="List available cameras in capture dir and exit")
+    parser.add_argument("--prefetch", type=int, default=_DEFAULT_PREFETCH,
+                        help=f"Frame-sets to buffer ahead of sending "
+                             f"(default: {_DEFAULT_PREFETCH}). "
+                             f"Use 0 to preload ALL frames into memory.")
 
     args = parser.parse_args()
 
