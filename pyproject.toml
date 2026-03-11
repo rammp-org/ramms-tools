@@ -9,7 +9,9 @@ description = "Python tools for interacting with RAMMS-based Unreal Engine proje
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "numpy>=1.24.0",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -25,14 +27,19 @@ classifiers = [
 
 [project.optional-dependencies]
 tui = ["textual>=8.0.0"]
+compression = ["Pillow>=10.0.0", "lz4>=4.0.0"]
+exr = ["OpenEXR>=3.0.0", "imath>=0.0.1"]
+all = ["textual>=8.0.0", "Pillow>=10.0.0", "lz4>=4.0.0", "OpenEXR>=3.0.0", "imath>=0.0.1"]
 
 [project.scripts]
+ramms-stream = "ramms_tools.scripts.stream_video:main"
 ramms-gripper = "ramms_tools.scripts.control_gripper:main"
 ramms-kinova = "ramms_tools.scripts.control_kinova:main"
 ramms-mebot = "ramms_tools.scripts.control_mebot:main"
 ramms-notify = "ramms_tools.scripts.send_notification:main"
 ramms-status = "ramms_tools.scripts.set_status:main"
 ramms-imu = "ramms_tools.scripts.stream_imu:main"
+ramms-stream-test = "ramms_tools.scripts.stream_test:main"
 ramms-tui = "ramms_tools.scripts.tui:main"
 
 [tool.setuptools.packages.find]
