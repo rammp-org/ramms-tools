@@ -7,7 +7,7 @@ IMU data streaming.
 Usage:
     ramms-tui                         # Connect to localhost:30010
     ramms-tui --host 192.168.1.10     # Connect to remote host
-    ramms-tui --port 30020            # Use non-default port
+    ramms-tui --port 30030            # Use non-default streaming port
 """
 
 import argparse

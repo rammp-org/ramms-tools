@@ -10,7 +10,7 @@ from textual.widgets import Footer, Header, TabbedContent, TabPane
 
 from ramms_tools.unreal_remote import UnrealRemote
 from ramms_tools.tui.widgets import ConnectionBar
-from ramms_tools.tui.pages import ArmPage, DashboardPage, IMUPage, MebotPage
+from ramms_tools.tui.pages import ArmPage, DashboardPage, IMUPage, MebotPage, StreamPage
 
 
 class RammsTUI(App):
@@ -39,6 +39,7 @@ class RammsTUI(App):
         Binding("2", "tab('arm')", "Arm", show=False),
         Binding("3", "tab('mebot')", "Mebot", show=False),
         Binding("4", "tab('imu')", "IMU", show=False),
+        Binding("5", "tab('stream')", "Stream", show=False),
     ]
 
     connected: reactive[bool] = reactive(False)
@@ -65,6 +66,8 @@ class RammsTUI(App):
                 yield MebotPage(id="page-mebot")
             with TabPane("🧭 IMU", id="tab-imu"):
                 yield IMUPage(id="page-imu")
+            with TabPane("📡 Stream", id="tab-stream"):
+                yield StreamPage(id="page-stream")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -138,6 +141,7 @@ class RammsTUI(App):
             "tab-arm": "page-arm",
             "tab-mebot": "page-mebot",
             "tab-imu": "page-imu",
+            "tab-stream": "page-stream",
         }
         for tab_id, page_id in pages.items():
             try:

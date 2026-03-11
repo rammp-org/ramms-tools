@@ -19,6 +19,7 @@ pip install git+https://github.com/ATDev-Inc/ramms-tools.git
 - Unreal Engine running with the **Remote Control API** plugin enabled (default port 30010)
 - For robot control: the **RammsCore** plugin with `URammsCoreBridge`
 - For UI features: the **RammsUI** plugin with `URammsRemoteBridge`
+- For binary streaming: the **RammsStreaming** plugin (TCP port 30020)
 - The **Textual** TUI library (`pip install 'ramms-tools[tui]'` or `pip install textual`)
 
 ## Library Usage
@@ -88,6 +89,7 @@ ramms-tui --host 192.168.1.10      # Connect to a remote UE instance
 | Arm | 7 joint controls with ±buttons, input fields, Home/Refresh; gripper state, Open/Close/Toggle, finger angle controls |
 | Mebot | Dynamic motor controls (angular & linear) |
 | IMU | Real-time streaming with target selection and coordinate frame toggle |
+| Stream | RMSS stream monitor — connect to streaming server, subscribe to channels, view per-channel FPS/bandwidth/dropped frames |
 
 The IMU page supports **World**, **Local**, or **Both** coordinate frames.
 In Local mode, linear velocity, angular velocity, and linear acceleration are
@@ -183,6 +185,78 @@ ramms-status --speed 1.5 --mode Autonomous
 ramms-status --estop
 ramms-status --demo                              # Cycle through states
 ramms-status --discover                          # List widgets and actors
+```
+
+### `ramms-stream` — Binary Data Streaming
+
+Connects to the RMSS streaming server (default port 30020) to receive or send
+camera frames and other binary data.
+
+```bash
+# Receive and display stats
+ramms-stream                                     # Subscribe to all channels
+ramms-stream -c 0,1                              # Subscribe to channels 0 and 1
+ramms-stream --save ./captures                   # Save frames to disk
+
+# Replay captured frames back to UE
+ramms-stream --replay ./captures/channel_00      # Replay from saved dir
+ramms-stream --replay ./Saved/CameraCaptures/Robot/HeadCam --replay-fps 30
+
+# Test connectivity
+ramms-stream --ping
+```
+
+The streaming system uses a custom TCP binary protocol (port 30020) and requires
+the **RammsStreaming** UE plugin.  Add `URammsStreamSourceComponent` to actors
+with cameras to stream their frames, and `URammsStreamSinkComponent` to receive
+images from external sources.  Use `URammsStreamCameraBridge` (RammsUI) to
+automatically pipe received stream data into the UI camera widget pipeline.
+
+#### Compression
+
+The server supports optional **JPEG** compression for RGB frames and **LZ4**
+for depth data.  Enable on the UE side by setting
+`URammsStreamingSubsystem::bEnableCompression = true` and adjusting
+`JpegQuality` (1–100, default 85).
+
+On the Python side, install the optional dependencies for transparent
+decompression:
+
+```bash
+pip install 'ramms-tools[compression]'   # Pillow + lz4
+pip install 'ramms-tools[all]'           # Pillow + lz4 + textual
+```
+
+The `StreamClient` auto-decompresses by default (pass `auto_decompress=False`
+to disable).  Compression availability can be checked at runtime:
+
+```python
+from ramms_tools.streaming import has_jpeg, has_lz4
+print(f"JPEG: {has_jpeg()}, LZ4: {has_lz4()}")
+```
+
+#### Python streaming library
+
+```python
+from ramms_tools.streaming import StreamClient, StreamSender
+
+# Receive frames from UE (auto-decompresses JPEG/LZ4)
+with StreamClient("127.0.0.1", 30020) as client:
+    client.subscribe(channels=[0])
+    for msg in client.iter_messages():
+        meta = msg.get_metadata_json()
+        # msg.payload contains raw pixel data (BGRA8 / float32)
+
+        # Per-channel stats
+        stats = client.get_channel_stats()
+        for ch, cs in stats.items():
+            print(f"  Ch {ch}: {cs.fps:.1f} fps, {cs.frames} frames")
+
+# Send images to UE
+with StreamSender("127.0.0.1", 30020) as sender:
+    import numpy as np
+    img = np.zeros((720, 1280, 4), dtype=np.uint8)
+    sender.send_numpy_image(channel=0, array=img)
 ```
 
 ## Common Options
