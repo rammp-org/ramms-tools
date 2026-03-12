@@ -47,6 +47,17 @@ from ramms_tools.streaming.compression import decompress_payload
 
 logger = logging.getLogger(__name__)
 
+# Message types that carry frame/sensor data (used for stats tracking)
+_FRAME_TYPES = frozenset({
+    MessageType.FRAME_RGB,
+    MessageType.FRAME_DEPTH,
+    MessageType.FRAME_RGBD,
+    MessageType.FRAME_MOTION,
+    MessageType.POINT_CLOUD,
+    MessageType.OCTO_MAP,
+    MessageType.IMAGE_DATA,
+})
+
 
 @dataclass
 class ChannelStats:
@@ -57,20 +68,29 @@ class ChannelStats:
     bytes_compressed: int = 0
     last_seq: int = -1
     dropped: int = 0
-    _timestamps: list = field(default_factory=list, repr=False)
+    _timestamps: deque = field(default_factory=lambda: deque(maxlen=200), repr=False)
+    _lock: threading.Lock | threading.RLock | None = field(default=None, repr=False)
 
-    @property
     def fps(self) -> float:
-        """Approximate FPS over the last 2 seconds of frames."""
+        """Approximate FPS over the last 2 seconds of frames.
+
+        Snapshots timestamps under lock (if set) to avoid racing
+        with the recv thread that appends to the deque.
+        """
+        if self._lock is not None:
+            with self._lock:
+                ts = list(self._timestamps)
+        else:
+            ts = list(self._timestamps)
         now = time.monotonic()
         cutoff = now - 2.0
-        self._timestamps = [t for t in self._timestamps if t > cutoff]
-        return len(self._timestamps) / 2.0 if self._timestamps else 0.0
+        count = sum(1 for t in ts if t > cutoff)
+        return count / 2.0
 
     @property
-    def bandwidth_mbps(self) -> float:
-        """Approximate bandwidth in MB/s over last 2s window."""
-        return self.fps * (self.bytes_total / max(self.frames, 1)) / (1024 * 1024)
+    def bandwidth_mib_s(self) -> float:
+        """Approximate bandwidth in MiB/s over last 2s window."""
+        return self.fps() * (self.bytes_total / max(self.frames, 1)) / (1024 * 1024)
 
 
 class StreamClient:
@@ -100,9 +120,13 @@ class StreamClient:
         self.bytes_received = 0
         self.messages_received = 0
         self.errors = 0
-        self._stats_lock = threading.Lock()
+        self._stats_lock = threading.RLock()
         self._channel_stats: dict[int, ChannelStats] = {}
         self._connect_time: float = 0.0
+
+        # Out-of-band PING reply handling
+        self._ping_event = threading.Event()
+        self._ping_rtt: float = 0.0
 
     # ── Connection ────────────────────────────────────────────────────
 
@@ -177,26 +201,31 @@ class StreamClient:
         self._send(msg)
 
     def ping(self) -> float:
-        """Send a PING and wait for the response.  Returns round-trip time in seconds."""
-        t0 = time.monotonic()
+        """Send a PING and wait for the response.  Returns round-trip time in seconds.
+
+        Uses an out-of-band Event so that arriving frames are not
+        dequeued/dropped while waiting for the PING reply.
+        """
+        self._ping_event.clear()
         msg = StreamMessage()
         msg.header.message_type = MessageType.PING
         msg.header.timestamp = StreamHeader.now_timestamp()
         self._send(msg)
-        # Wait for pong (simple blocking approach)
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            m = self.poll(timeout=0.1)
-            if m and m.header.message_type == MessageType.PING:
-                return time.monotonic() - t0
-        raise TimeoutError("PING timeout")
+        if not self._ping_event.wait(timeout=5.0):
+            raise TimeoutError("PING timeout")
+        return self._ping_rtt
 
     # ── Receive thread ────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start the background receive thread."""
+        """Start the background receive thread.
+
+        Raises RuntimeError if the client is not connected.
+        """
         if self._thread is not None:
             return
+        if self._sock is None:
+            raise RuntimeError("Cannot start receive thread: not connected. Call connect() first.")
         self._stopping.clear()
         self._thread = threading.Thread(target=self._recv_loop, daemon=True, name="rmss-recv")
         self._thread.start()
@@ -229,29 +258,45 @@ class StreamClient:
                     self._connected.clear()
                 break
 
-            # Parse complete messages
+            # Parse complete messages — convert to bytes once per recv
+            # iteration, then use offsets to avoid repeated copies.
+            buf_bytes = bytes(buf)
             offset = 0
             while True:
-                result = StreamMessage.deserialize(bytes(buf), offset)
+                result = StreamMessage.deserialize(buf_bytes, offset)
                 if result is None:
                     break
                 msg, consumed = result
                 offset += consumed
                 self.messages_received += 1
 
-                # Track per-channel stats
+                mtype = msg.header.message_type
+
+                # Handle PING replies out-of-band (don't enqueue)
+                if mtype == MessageType.PING:
+                    self._ping_rtt = (
+                        StreamHeader.now_timestamp() - msg.header.timestamp
+                    ) / 1_000_000.0  # µs → s
+                    self._ping_event.set()
+                    continue
+
+                # Track per-channel stats (frame-bearing messages only)
                 ch = msg.header.channel_id
-                with self._stats_lock:
-                    if ch not in self._channel_stats:
-                        self._channel_stats[ch] = ChannelStats(channel_id=ch)
-                    cs = self._channel_stats[ch]
-                    cs.frames += 1
-                    cs.bytes_compressed += len(msg.payload)
-                    cs._timestamps.append(time.monotonic())
-                    # Detect dropped frames
-                    if cs.last_seq >= 0 and msg.header.sequence_num > cs.last_seq + 1:
-                        cs.dropped += msg.header.sequence_num - cs.last_seq - 1
-                    cs.last_seq = msg.header.sequence_num
+                is_frame = mtype in _FRAME_TYPES
+                if is_frame:
+                    with self._stats_lock:
+                        if ch not in self._channel_stats:
+                            self._channel_stats[ch] = ChannelStats(
+                                channel_id=ch, _lock=self._stats_lock,
+                            )
+                        cs = self._channel_stats[ch]
+                        cs.frames += 1
+                        cs.bytes_compressed += len(msg.payload)
+                        cs._timestamps.append(time.monotonic())
+                        # Detect dropped frames
+                        if cs.last_seq >= 0 and msg.header.sequence_num > cs.last_seq + 1:
+                            cs.dropped += msg.header.sequence_num - cs.last_seq - 1
+                        cs.last_seq = msg.header.sequence_num
 
                 # Auto-decompress if enabled
                 comp = msg.header.get_compression()
@@ -264,8 +309,9 @@ class StreamClient:
                     except Exception:
                         logger.exception("Decompression failed for channel %d", ch)
 
-                with self._stats_lock:
-                    cs.bytes_total += len(msg.payload)
+                if is_frame:
+                    with self._stats_lock:
+                        cs.bytes_total += len(msg.payload)
 
                 # Deliver via callback
                 if self.on_message:
@@ -334,4 +380,4 @@ class StreamClient:
     def total_fps(self) -> float:
         """Sum of FPS across all channels."""
         with self._stats_lock:
-            return sum(cs.fps for cs in self._channel_stats.values())
+            return sum(cs.fps() for cs in self._channel_stats.values())
