@@ -105,8 +105,9 @@ class StreamSender:
         """Send a raw image to UE as an IMAGE_DATA message.
 
         If *compression* is not NONE, the caller must have already
-        compressed *image_bytes* (e.g. via
-        ``ramms_tools.streaming.compression.compress_payload``).
+        compressed *image_bytes* using the appropriate helper
+        (``compress_jpeg`` or ``compress_lz4`` from
+        ``ramms_tools.streaming.compression``).
         The compression flag is set in the header so the receiver
         knows how to decompress.
         """
