@@ -228,12 +228,11 @@ class ArmPage(Container):
         app: RammsTUI = self.app  # type: ignore[assignment]
         if not app.arm_comp:
             return
-        for i in range(self.NUM_JOINTS):
-            try:
-                app.arm_comp.call("SetJointTarget",
-                                  JointIndex=i, TargetAngle=0.0)
-            except Exception:
-                pass
+        try:
+            app.arm_comp.call("SetAllJointTargets",
+                              TargetAngles=[0.0] * self.NUM_JOINTS)
+        except Exception:
+            pass
         self.app.call_from_thread(
             self._set_status, f"  🏠 Homed {self.NUM_JOINTS} joints to 0°")
         self._refresh_angles()

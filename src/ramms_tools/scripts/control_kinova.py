@@ -75,14 +75,8 @@ def get_joint_angles(comp) -> list:
 
 
 def set_all_joints(comp, angles: list[float]):
-    """Set all joint targets.
-
-    Uses individual SetJointTarget calls because UE Remote Control has a
-    serialization bug with TArray<float> input parameters (each value gets
-    doubled with a zero prepended).
-    """
-    for i, angle in enumerate(angles):
-        comp.call("SetJointTarget", JointIndex=i, TargetAngle=float(angle))
+    """Set all joint targets in a single remote call."""
+    comp.call("SetAllJointTargets", TargetAngles=[float(a) for a in angles])
 
 
 def set_joint(comp, index: int, angle: float):
