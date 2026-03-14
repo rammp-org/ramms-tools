@@ -115,9 +115,8 @@ def get_num_meshes(comp) -> int:
 
 
 def set_all_joints(comp, values: list[float]):
-    """Set all joint targets via individual calls (TArray<float> workaround)."""
-    for i, val in enumerate(values):
-        comp.call("SetJointTarget", JointIndex=i, Value=float(val))
+    """Set all joint targets in a single remote call."""
+    comp.call("SetAllJointTargets", Values=[float(v) for v in values])
 
 
 def set_joint_by_name(comp, name: str, value: float):
@@ -160,6 +159,9 @@ def describe_pose(comp):
 
 def sweep_joint(comp, joint_index: int, lo: float, hi: float, period: float):
     """Continuously sweep a joint between lo and hi with given period."""
+    if period <= 0:
+        print(f"  Error: period must be positive, got {period}")
+        return
     mid = (lo + hi) / 2.0
     amp = (hi - lo) / 2.0
     print(f"Sweeping joint {joint_index}: {lo}..{hi} (period={period}s)")
@@ -210,68 +212,78 @@ def interactive_mode(comp):
         parts = line.split()
         cmd = parts[0].lower()
 
-        if cmd in ("quit", "exit", "q"):
-            break
+        try:
+            if cmd in ("quit", "exit", "q"):
+                break
 
-        elif cmd in ("state", "describe", "values", "read"):
-            describe_pose(comp)
+            elif cmd in ("state", "describe", "values", "read"):
+                describe_pose(comp)
 
-        elif cmd == "set" and len(parts) >= 3:
-            try:
-                idx = int(parts[1])
-                val = float(parts[2])
-                set_joint_by_index(comp, idx, val)
-                print(f"  Joint {idx} → {val}")
-            except (ValueError, IndexError) as e:
-                print(f"  Error: {e}")
+            elif cmd == "set" and len(parts) >= 3:
+                try:
+                    idx = int(parts[1])
+                    val = float(parts[2])
+                    set_joint_by_index(comp, idx, val)
+                    print(f"  Joint {idx} → {val}")
+                except (ValueError, IndexError) as e:
+                    print(f"  Error: {e}")
 
-        elif cmd == "setname" and len(parts) >= 3:
-            try:
-                name = parts[1]
-                val = float(parts[2])
-                set_joint_by_name(comp, name, val)
-                print(f"  Joint '{name}' → {val}")
-            except (ValueError, IndexError) as e:
-                print(f"  Error: {e}")
+            elif cmd == "setname" and len(parts) >= 3:
+                try:
+                    name = parts[1]
+                    val = float(parts[2])
+                    set_joint_by_name(comp, name, val)
+                    print(f"  Joint '{name}' → {val}")
+                except (ValueError, IndexError) as e:
+                    print(f"  Error: {e}")
 
-        elif cmd == "setall" and len(parts) >= 2:
-            try:
-                vals = [float(x) for x in parts[1:]]
-                set_all_joints(comp, vals)
-                print(f"  Set {len(vals)} joints: {vals}")
-            except ValueError as e:
-                print(f"  Error: {e}")
+            elif cmd == "setall" and len(parts) >= 2:
+                try:
+                    vals = [float(x) for x in parts[1:]]
+                    n = get_num_joints(comp)
+                    if n > 0 and len(vals) != n:
+                        print(f"  Warning: provided {len(vals)} values but component has {n} joints")
+                    set_all_joints(comp, vals)
+                    print(f"  Set {len(vals)} joints: {vals}")
+                except ValueError as e:
+                    print(f"  Error: {e}")
 
-        elif cmd == "home":
-            values = get_joint_values(comp)
-            home = [0.0] * len(values) if values else [0.0]
-            set_all_joints(comp, home)
-            print(f"  Homed {len(home)} joints to 0")
+            elif cmd == "home":
+                n = get_num_joints(comp)
+                if n == 0:
+                    print("  No joints to home (joint count is 0)")
+                else:
+                    home = [0.0] * n
+                    set_all_joints(comp, home)
+                    print(f"  Homed {n} joints to 0")
 
-        elif cmd == "snap":
-            snap_to_targets(comp)
-            print("  Snapped to targets")
+            elif cmd == "snap":
+                snap_to_targets(comp)
+                print("  Snapped to targets")
 
-        elif cmd == "sweep" and len(parts) >= 4:
-            try:
-                idx = int(parts[1])
-                lo = float(parts[2])
-                hi = float(parts[3])
-                period = float(parts[4]) if len(parts) > 4 else 4.0
-                sweep_joint(comp, idx, lo, hi, period)
-            except (ValueError, IndexError) as e:
-                print(f"  Error: {e}")
+            elif cmd == "sweep" and len(parts) >= 4:
+                try:
+                    idx = int(parts[1])
+                    lo = float(parts[2])
+                    hi = float(parts[3])
+                    period = float(parts[4]) if len(parts) > 4 else 4.0
+                    sweep_joint(comp, idx, lo, hi, period)
+                except (ValueError, IndexError) as e:
+                    print(f"  Error: {e}")
 
-        elif cmd == "meshes":
-            meshes = get_mesh_names(comp)
-            n = get_num_meshes(comp)
-            print(f"\n  {n} poseable mesh(es):")
-            for m in meshes:
-                print(f"    - {m}")
-            print()
+            elif cmd == "meshes":
+                meshes = get_mesh_names(comp)
+                n = get_num_meshes(comp)
+                print(f"\n  {n} poseable mesh(es):")
+                for m in meshes:
+                    print(f"    - {m}")
+                print()
 
-        else:
-            print(f"  Unknown command: {cmd}")
+            else:
+                print(f"  Unknown command: {cmd}")
+
+        except UnrealRemoteError as e:
+            print(f"  Remote error: {e}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────
@@ -324,7 +336,11 @@ def main():
 
     if args.list:
         print("Searching for actors with RammsSkeletalPoseComponent...")
-        actors = find_pose_actors(ue)
+        try:
+            actors = find_pose_actors(ue)
+        except UnrealRemoteError as e:
+            print(f"Remote error: {e}")
+            sys.exit(1)
         for a in actors:
             print(f"  Actor: {a['actor_path']}")
             print(f"  Component: {a['component_name']}")
@@ -338,39 +354,56 @@ def main():
         comp = ue.actor(args.component)
     else:
         print("Searching for SkeletalPoseComponent...")
-        actor, comp = find_pose_component(ue, args.actor)
+        try:
+            actor, comp = find_pose_component(ue, args.actor)
+        except UnrealRemoteError as e:
+            print(f"Remote error: {e}")
+            sys.exit(1)
         if not comp:
             print("No RammsSkeletalPoseComponent found!")
             print("Use --list to see available actors, or --actor / --component to specify.")
             sys.exit(1)
         print(f"Found: {comp.object_path}\n")
 
-    if args.describe:
-        describe_pose(comp)
-    elif args.set_all:
-        set_all_joints(comp, args.set_all)
-        print(f"Set {len(args.set_all)} joints: {args.set_all}")
-    elif args.set:
-        name, val = args.set[0], float(args.set[1])
-        set_joint_by_name(comp, name, val)
-        print(f"Joint '{name}' → {val}")
-    elif args.set_index:
-        idx, val = int(args.set_index[0]), float(args.set_index[1])
-        set_joint_by_index(comp, idx, val)
-        print(f"Joint {idx} → {val}")
-    elif args.home:
-        values = get_joint_values(comp)
-        home = [0.0] * len(values) if values else [0.0]
-        set_all_joints(comp, home)
-        print(f"Homed {len(home)} joints to 0")
-    elif args.sweep:
-        idx = int(args.sweep[0])
-        lo, hi = float(args.sweep[1]), float(args.sweep[2])
-        sweep_joint(comp, idx, lo, hi, args.period)
-    elif args.interactive:
-        interactive_mode(comp)
-    else:
-        parser.print_help()
+    try:
+        if args.describe:
+            describe_pose(comp)
+        elif args.set_all:
+            n = get_num_joints(comp)
+            if n > 0 and len(args.set_all) != n:
+                print(f"Warning: provided {len(args.set_all)} values but component has {n} joints")
+            set_all_joints(comp, args.set_all)
+            print(f"Set {len(args.set_all)} joints: {args.set_all}")
+        elif args.set:
+            name, val = args.set[0], float(args.set[1])
+            set_joint_by_name(comp, name, val)
+            print(f"Joint '{name}' → {val}")
+        elif args.set_index:
+            idx, val = int(args.set_index[0]), float(args.set_index[1])
+            set_joint_by_index(comp, idx, val)
+            print(f"Joint {idx} → {val}")
+        elif args.home:
+            n = get_num_joints(comp)
+            if n == 0:
+                print("No joints to home (joint count is 0)")
+            else:
+                home = [0.0] * n
+                set_all_joints(comp, home)
+                print(f"Homed {n} joints to 0")
+        elif args.sweep:
+            idx = int(args.sweep[0])
+            lo, hi = float(args.sweep[1]), float(args.sweep[2])
+            if args.period <= 0:
+                print(f"Error: --period must be positive, got {args.period}")
+                sys.exit(1)
+            sweep_joint(comp, idx, lo, hi, args.period)
+        elif args.interactive:
+            interactive_mode(comp)
+        else:
+            parser.print_help()
+    except UnrealRemoteError as e:
+        print(f"Remote error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
