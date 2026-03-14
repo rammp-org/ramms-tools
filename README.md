@@ -21,6 +21,7 @@ pip install -e '.[exr]'
 - Python ≥ 3.10
 - Unreal Engine running with the **Remote Control API** plugin enabled (default port 30010)
 - For robot control: the **RammsCore** plugin with `URammsCoreBridge`
+- For skeletal pose control: the **RammsCore** plugin with `URammsSkeletalPoseComponent`
 - For UI features: the **RammsUI** plugin with `URammsRemoteBridge`
 - For binary streaming: the **RammsStreaming** plugin (TCP port 30030)
 - The **Textual** TUI library (`pip install 'ramms-tools[tui]'` or `pip install textual`)
@@ -108,6 +109,39 @@ ramms-kinova --set-all 0 15 180 -150 0 -10 90   # Set all 7 joints
 ramms-kinova --home                              # All joints to 0°
 ramms-kinova --interactive                       # REPL mode
 ```
+
+### `ramms-pose` — Skeletal Pose Control
+
+Controls any actor with a `URammsSkeletalPoseComponent` (kinematic bone posing
+via `UPoseableMeshComponent`). Works with arbitrary skeletal meshes — not limited
+to a specific robot model.
+
+```bash
+ramms-pose --list                              # Find poseable actors
+ramms-pose --describe                          # Show joints, meshes, and current values
+ramms-pose --set-all 0 15 -90 30               # Set all joint targets
+ramms-pose --set Shoulder 45.0                 # Set joint by name
+ramms-pose --set-index 0 45.0                  # Set joint by index
+ramms-pose --home                              # All joints to 0
+ramms-pose --sweep 0 -90 90 --period 4         # Sweep joint 0 between -90°..90°
+ramms-pose --interactive                       # REPL mode
+```
+
+**Interactive commands:**
+
+| Command | Description |
+|---------|-------------|
+| `state` | Show current joint values and targets |
+| `set <idx> <value>` | Set joint by index |
+| `setname <name> <value>` | Set joint by name |
+| `setall <v0> <v1> ...` | Set all joints (validates count) |
+| `home` | All joints to 0 |
+| `snap` | Snap to targets (bypass interpolation) |
+| `sweep <idx> <lo> <hi> [period]` | Sweep joint (Ctrl+C to stop) |
+| `meshes` | List poseable meshes |
+
+Supports both revolute (rotation) and prismatic (translation) joints.
+Joint names are auto-populated from physics asset constraints.
 
 ### `ramms-gripper` — Gripper Control
 
