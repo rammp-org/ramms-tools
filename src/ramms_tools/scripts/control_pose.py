@@ -27,17 +27,14 @@ import time
 
 from ramms_tools.unreal_remote import UnrealRemote, UnrealRemoteError
 
-BRIDGE_CDO = "/Script/RammsCore.Default__RammsCoreBridge"
-
 
 # ── Discovery ───────────────────────────────────────────────────────
 
 
 def find_pose_actors(ue: UnrealRemote) -> list[dict]:
     """Find actors with URammsSkeletalPoseComponent via the bridge."""
-    bridge = ue.actor(BRIDGE_CDO)
-    raw = bridge.call("FindSkeletalPoseActors")
-    results = raw if isinstance(raw, list) else raw.get("ReturnValue", [])
+    raw = ue.bridge.call("FindSkeletalPoseActors")
+    results = _extract_return(raw)
     out = []
     for entry in results:
         parts = entry.split("|", 1)
