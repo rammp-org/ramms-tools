@@ -164,17 +164,27 @@ def load_exr_frame(
     bgra = np.empty((h, w, 4), dtype=np.uint8)
     bgra[:, :, 3] = 255
     scratch = np.empty((h, w), dtype=np.float32)
-    _f32_255 = np.float32(255.0)
     pt = Imath.PixelType(Imath.PixelType.FLOAT)
 
     b_buf = exr_file.channel("B", pt)
     g_buf = exr_file.channel("G", pt)
     r_buf = exr_file.channel("R", pt)
+
+    # Detect value range from the first channel to decide scaling.
+    # Linear HDR data lives in [0,1] (with some headroom) → needs ×255.
+    # Pre-quantized data is already [0,255] → no scaling needed.
+    first = np.frombuffer(b_buf, dtype=np.float32).reshape((h, w))
+    needs_scale = float(first.max()) <= 2.0
+    scale = np.float32(255.0) if needs_scale else np.float32(1.0)
+    logger.debug(
+        "%s: max=%.3f → %s",
+        exr_path.name, float(first.max()),
+        "scaling ×255 (linear)" if needs_scale else "no scale (already 0-255)",
+    )
+
     for buf, ch in ((b_buf, 0), (g_buf, 1), (r_buf, 2)):
-        np.multiply(
-            np.frombuffer(buf, dtype=np.float32).reshape((h, w)),
-            _f32_255, out=scratch,
-        )
+        raw = np.frombuffer(buf, dtype=np.float32).reshape((h, w))
+        np.multiply(raw, scale, out=scratch)
         np.copyto(bgra[:, :, ch], scratch, casting="unsafe")
 
     depth = None
