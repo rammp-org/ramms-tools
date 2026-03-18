@@ -5,6 +5,8 @@ Modes:
   --synthetic     Send animated color-bar test frames (no extra deps).
   --capture-dir   Replay captured EXR+JSON data from CameraCapture plugin
                   (requires: pip install ramms-tools[exr]).
+  --mask-dir      Replay single-channel mask EXRs as float32 on a dedicated
+                  channel (requires: pip install ramms-tools[exr]).
 
 Prerequisites in UE:
   - Start PIE
@@ -134,7 +136,7 @@ def load_exr_frame(
     exr_path: Path,
     want_depth: bool = False,
 ) -> tuple[np.ndarray, np.ndarray | None, int, int] | None:
-    """Load an EXR and return (bgra8_bytes, depth_f32_or_None, width, height).
+    """Load an EXR and return (bgra8_array, depth_f32_or_None, width, height).
 
     Opens the file once, extracts RGB → BGRA8 (linear, no color space
     conversion — UE handles sRGB via the SRGB texture flag) and optionally
@@ -153,27 +155,21 @@ def load_exr_frame(
     w = dw.max.x - dw.min.x + 1
     h = dw.max.y - dw.min.y + 1
     channels = header["channels"].keys()
-    pt = Imath.PixelType(Imath.PixelType.FLOAT)
 
     if not all(ch in channels for ch in ("R", "G", "B")):
         logger.warning("%s missing RGB channels (has: %s)", exr_path, list(channels))
         return None
 
-    # Read channels into byte buffers, then wrap as float32 views (zero-copy)
+    # Assemble BGRA8 with minimal allocations
+    bgra = np.empty((h, w, 4), dtype=np.uint8)
+    bgra[:, :, 3] = 255
+    scratch = np.empty((h, w), dtype=np.float32)
+    _f32_255 = np.float32(255.0)
+    pt = Imath.PixelType(Imath.PixelType.FLOAT)
+
     b_buf = exr_file.channel("B", pt)
     g_buf = exr_file.channel("G", pt)
     r_buf = exr_file.channel("R", pt)
-
-    # Assemble BGRA8 with minimal allocations:
-    #  - np.float32 multiplier avoids float64 promotion (halves temp memory)
-    #  - Single scratch buffer reused per channel (no per-channel temps)
-    #  - np.copyto(casting='unsafe') converts float32→uint8 without extra arrays
-    #  - No clip — rendered EXR data is [0,1]; UE handles any edge values
-    bgra = np.empty((h, w, 4), dtype=np.uint8)
-    bgra[:, :, 3] = 255
-    _f32_255 = np.float32(255.0)
-    scratch = np.empty((h, w), dtype=np.float32)
-
     for buf, ch in ((b_buf, 0), (g_buf, 1), (r_buf, 2)):
         np.multiply(
             np.frombuffer(buf, dtype=np.float32).reshape((h, w)),
@@ -192,13 +188,51 @@ def load_exr_frame(
                 exr_file.channel("A", pt), dtype=np.float32
             ).reshape((h, w))
         # Filter out default alpha (1.0 everywhere = no real depth data)
-        # Use min/max instead of allclose to avoid allocating temp arrays
         if depth is not None:
             dmin, dmax = float(depth.min()), float(depth.max())
             if abs(dmin - 1.0) < 1e-5 and abs(dmax - 1.0) < 1e-5:
                 depth = None
 
     return bgra, depth, w, h
+
+
+def load_mask_exr(exr_path: Path) -> tuple[np.ndarray, int, int] | None:
+    """Load a single-channel mask EXR and return (mask_f32, width, height).
+
+    Reads the Y channel as UINT and converts to float32 so that mask IDs
+    (0, 1, 2, …) are preserved as exact float values without normalization.
+    """
+    OpenEXR, Imath = _load_openexr()
+
+    try:
+        exr_file = OpenEXR.InputFile(str(exr_path))
+    except Exception as e:
+        logger.warning("Failed to open mask %s: %s", exr_path, e)
+        return None
+
+    header = exr_file.header()
+    dw = header["dataWindow"]
+    w = dw.max.x - dw.min.x + 1
+    h = dw.max.y - dw.min.y + 1
+    channels = header["channels"].keys()
+
+    if "Y" not in channels:
+        logger.warning("Mask EXR %s has no Y channel (has: %s)", exr_path, list(channels))
+        return None
+
+    pt_uint = Imath.PixelType(Imath.PixelType.UINT)
+    y_buf = exr_file.channel("Y", pt_uint)
+    raw = np.frombuffer(y_buf, dtype=np.uint32).reshape((h, w))
+
+    unique, counts = np.unique(raw, return_counts=True)
+    logger.info(
+        "Mask EXR %s: shape=%s min=%s max=%s unique_values(%d)=%s counts=%s",
+        exr_path.name, raw.shape,
+        raw.min(), raw.max(), len(unique),
+        unique[:20], counts[:20],
+    )
+
+    return raw.astype(np.float32), w, h
 
 
 def discover_capture_cameras(capture_dir: Path) -> list[tuple[str, str, Path]]:
@@ -452,6 +486,9 @@ def run_capture_replay(args: argparse.Namespace) -> None:
       camera 0 → RGB on base_channel+0,   depth on depth_base+0
       camera 1 → RGB on base_channel+1,   depth on depth_base+1
       ...
+
+    When ``--mask-dir`` is also provided, mask EXRs are loaded and sent
+    in lockstep on the mask channel.
     """
     from concurrent.futures import ProcessPoolExecutor
     import multiprocessing
@@ -508,6 +545,23 @@ def run_capture_replay(args: argparse.Namespace) -> None:
               f"RGB→stream/{ci['rgb_channel']}  "
               f"depth→stream/{ci['depth_channel']}")
 
+    # ── Mask setup (optional) ──────────────────────────────────────
+    mask_dir = Path(args.mask_dir) if getattr(args, "mask_dir", None) else None
+    mask_paths: list[Path] = []
+    mask_channel = getattr(args, "mask_channel", 200)
+    if mask_dir is not None:
+        if not mask_dir.is_dir():
+            print(f"ERROR: Mask directory not found: {mask_dir}")
+            sys.exit(1)
+        mask_paths = _discover_mask_frames(mask_dir)
+        if not mask_paths:
+            print(f"WARNING: No frame_*.exr files in {mask_dir}, masks disabled")
+        else:
+            mask_paths = mask_paths[:num_frames_per_cam]
+            print(f"  Masks: {len(mask_paths)} frames from {mask_dir} "
+                  f"→ stream/{mask_channel}")
+    send_masks = len(mask_paths) > 0
+
     # ── Connect ─────────────────────────────────────────────────────
     sender = StreamSender(args.host, args.port)
     print(f"\nConnecting to RMSS server at {args.host}:{args.port}...")
@@ -534,11 +588,12 @@ def run_capture_replay(args: argparse.Namespace) -> None:
             chunks.append((cs, min(cs + prefetch, num_frames_per_cam)))
         return chunks
 
+    pool_workers = num_cameras + (1 if send_masks else 0)
     print(f"Streaming (chunk_size={prefetch}, double-buffered)...\n")
     t_start = time.monotonic()
 
     pool = ProcessPoolExecutor(
-        max_workers=num_cameras,
+        max_workers=pool_workers,
         mp_context=multiprocessing.get_context("spawn"),
     )
 
@@ -550,6 +605,10 @@ def run_capture_replay(args: argparse.Namespace) -> None:
             next_futures = _submit_chunk(
                 pool, camera_info, chunks[0][0], chunks[0][1], want_depth,
             )
+            next_mask_future = (
+                pool.submit(_load_mask_chunk, mask_paths, chunks[0][0], chunks[0][1])
+                if send_masks else None
+            )
             t_first_load = time.monotonic()
 
             for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
@@ -557,6 +616,9 @@ def run_capture_replay(args: argparse.Namespace) -> None:
 
                 # Wait for current chunk to finish loading
                 loaded_chunk = _collect_chunk(next_futures, num_cameras)
+                loaded_masks = (
+                    next_mask_future.result() if next_mask_future else None
+                )
                 load_elapsed = time.monotonic() - t_first_load
                 load_fps = chunk_size / max(load_elapsed, 0.001)
                 print(f"  Loaded chunk [{chunk_start}..{chunk_end}) "
@@ -568,6 +630,10 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                     nc_start, nc_end = chunks[next_chunk_idx]
                     next_futures = _submit_chunk(
                         pool, camera_info, nc_start, nc_end, want_depth,
+                    )
+                    next_mask_future = (
+                        pool.submit(_load_mask_chunk, mask_paths, nc_start, nc_end)
+                        if send_masks else None
                     )
                     t_first_load = time.monotonic()
 
@@ -600,14 +666,33 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                                 metadata=depth_meta,
                             )
 
-                    total_sent += num_cameras
+                    # Send mask frame (if available for this index)
+                    if loaded_masks is not None:
+                        mf = loaded_masks[local_idx]
+                        if mf is not None:
+                            mask_meta = {
+                                "w": mf["w"], "h": mf["h"],
+                                "fmt": "float32",
+                                "source": "mask_replay",
+                            }
+                            sender.send_depth(
+                                channel=mask_channel,
+                                depth_bytes=mf["mask"],
+                                width=mf["w"], height=mf["h"],
+                                metadata=mask_meta,
+                            )
+
+                    total_sent += num_cameras + (1 if send_masks else 0)
                     frame_count += 1
 
                     if (frame_count - 1) % 10 == 0 or frame_count == 1:
                         cur_send = send_time_accum + (time.monotonic() - t_chunk_send)
                         send_fps = frame_count / max(cur_send, 0.001)
+                        streams = f"{num_cameras} cam"
+                        if send_masks:
+                            streams += " + mask"
                         print(f"  Frame {frame_count}/{num_frames_per_cam} "
-                              f"({num_cameras} cameras, {total_sent} sends, "
+                              f"({streams}, {total_sent} sends, "
                               f"tx {send_fps:.1f} fps)")
 
                     elapsed = time.monotonic() - t0
@@ -625,6 +710,179 @@ def run_capture_replay(args: argparse.Namespace) -> None:
         send_fps = frame_count / max(send_time_accum, 0.001)
         print(f"\nDone! Sent {frame_count} frames × {num_cameras} cameras "
               f"= {total_sent} total in {elapsed_total:.1f}s "
+              f"(tx {send_fps:.1f} fps, "
+              f"overall {frame_count / max(elapsed_total, 0.001):.1f} fps)")
+    finally:
+        sender.disconnect()
+        pool.shutdown(wait=False)
+
+
+# ---------------------------------------------------------------------------
+# Mask-only replay pipeline
+# ---------------------------------------------------------------------------
+
+def _discover_mask_frames(
+    mask_dir: Path,
+) -> list[Path]:
+    """Find mask EXR files in a flat directory, sorted by name."""
+    return sorted(mask_dir.glob("frame_*.exr"))
+
+
+def _load_single_mask(exr_path: Path) -> dict | None:
+    """Load one mask frame.  Returns a dict ready for sending, or None."""
+    result = load_mask_exr(exr_path)
+    if result is None:
+        return None
+    mask, w, h = result
+    return {
+        "mask": mask.tobytes(),
+        "w": w,
+        "h": h,
+    }
+
+
+def _load_mask_chunk(
+    exr_paths: list[Path],
+    start: int,
+    end: int,
+) -> list[dict | None]:
+    """Load mask frames [start, end) sequentially.  Called from a worker."""
+    return [_load_single_mask(exr_paths[i]) for i in range(start, end)]
+
+
+def run_mask_replay(args: argparse.Namespace) -> None:
+    """Replay mask EXRs from a masks directory as float32 depth-channel data.
+
+    Sends each mask frame on a dedicated channel using ``send_depth`` so
+    that UE receives raw float32 mask IDs (0.0, 1.0, 2.0, …) without
+    uint8 normalization.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
+    mask_dir = Path(args.mask_dir)
+    if not mask_dir.is_dir():
+        print(f"ERROR: Mask directory not found: {mask_dir}")
+        sys.exit(1)
+
+    exr_paths = _discover_mask_frames(mask_dir)
+    if not exr_paths:
+        print(f"ERROR: No frame_*.exr files found in {mask_dir}")
+        sys.exit(1)
+
+    num_frames = len(exr_paths)
+    max_frames = args.num_frames if args.num_frames > 0 else 0
+    if max_frames > 0:
+        num_frames = min(num_frames, max_frames)
+        exr_paths = exr_paths[:num_frames]
+
+    channel = args.mask_channel
+    print(f"Found {num_frames} mask frames in {mask_dir}")
+    print(f"  Sending on channel {channel} as float32")
+
+    # ── Connect ─────────────────────────────────────────────────────
+    sender = StreamSender(args.host, args.port)
+    print(f"\nConnecting to RMSS server at {args.host}:{args.port}...")
+    sender.connect()
+    print("Connected!")
+    time.sleep(0.2)
+
+    fps = args.fps
+    frame_interval = 1.0 / fps if fps > 0 else 0
+    loop = args.loop
+    prefetch = args.prefetch
+    if prefetch <= 0:
+        prefetch = num_frames
+
+    total_sent = 0
+    frame_count = 0
+    send_time_accum = 0.0
+
+    def build_chunks() -> list[tuple[int, int]]:
+        chunks = []
+        for cs in range(0, num_frames, prefetch):
+            chunks.append((cs, min(cs + prefetch, num_frames)))
+        return chunks
+
+    print(f"Streaming masks (chunk_size={prefetch})...\n")
+    t_start = time.monotonic()
+
+    pool = ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
+
+    try:
+        while True:
+            chunks = build_chunks()
+
+            next_future = pool.submit(
+                _load_mask_chunk, exr_paths, chunks[0][0], chunks[0][1],
+            )
+            t_load = time.monotonic()
+
+            for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
+                chunk_size = chunk_end - chunk_start
+
+                loaded = next_future.result()
+                load_elapsed = time.monotonic() - t_load
+                load_fps = chunk_size / max(load_elapsed, 0.001)
+                print(f"  Loaded chunk [{chunk_start}..{chunk_end}) "
+                      f"in {load_elapsed:.2f}s ({load_fps:.0f} frames/s)")
+
+                # Kick off next chunk
+                next_chunk_idx = chunk_idx + 1
+                if next_chunk_idx < len(chunks):
+                    nc_start, nc_end = chunks[next_chunk_idx]
+                    next_future = pool.submit(
+                        _load_mask_chunk, exr_paths, nc_start, nc_end,
+                    )
+                    t_load = time.monotonic()
+
+                # Send current chunk
+                t_chunk_send = time.monotonic()
+                for local_idx in range(chunk_size):
+                    t0 = time.monotonic()
+
+                    frame = loaded[local_idx]
+                    if frame is not None:
+                        meta = {
+                            "w": frame["w"],
+                            "h": frame["h"],
+                            "fmt": "float32",
+                            "source": "mask_replay",
+                        }
+                        sender.send_depth(
+                            channel=channel,
+                            depth_bytes=frame["mask"],
+                            width=frame["w"], height=frame["h"],
+                            metadata=meta,
+                        )
+
+                    total_sent += 1
+                    frame_count += 1
+
+                    if (frame_count - 1) % 10 == 0 or frame_count == 1:
+                        cur_send = send_time_accum + (time.monotonic() - t_chunk_send)
+                        send_fps_cur = frame_count / max(cur_send, 0.001)
+                        print(f"  Frame {frame_count}/{num_frames} "
+                              f"({total_sent} sends, tx {send_fps_cur:.1f} fps)")
+
+                    elapsed = time.monotonic() - t0
+                    if frame_interval > elapsed:
+                        time.sleep(frame_interval - elapsed)
+
+                send_time_accum += time.monotonic() - t_chunk_send
+                del loaded
+
+            if not loop:
+                break
+            print(f"  Looping... ({total_sent} total sends so far)")
+
+        elapsed_total = time.monotonic() - t_start
+        send_fps = frame_count / max(send_time_accum, 0.001)
+        print(f"\nDone! Sent {frame_count} mask frames "
+              f"in {elapsed_total:.1f}s "
               f"(tx {send_fps:.1f} fps, "
               f"overall {frame_count / max(elapsed_total, 0.001):.1f} fps)")
     finally:
@@ -664,11 +922,15 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=480,
                         help="Synthetic frame height (default: 480)")
 
-    mode = parser.add_mutually_exclusive_group(required=True)
+    mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--synthetic", action="store_true",
                       help="Send synthetic color-bar test frames")
-    mode.add_argument("--capture-dir", metavar="DIR",
-                      help="Replay captured EXR+JSON frames from CameraCapture")
+
+    parser.add_argument("--capture-dir", metavar="DIR",
+                        help="Replay captured EXR+JSON frames from CameraCapture")
+    parser.add_argument("--mask-dir", metavar="DIR",
+                        help="Replay mask EXRs (single-channel Y) as float32 on a "
+                             "dedicated channel (can combine with --capture-dir)")
 
     # Capture replay options
     parser.add_argument("--send-depth", action="store_true",
@@ -683,6 +945,10 @@ def main() -> None:
                         help=f"Frame-sets to buffer ahead of sending "
                              f"(default: {_DEFAULT_PREFETCH}). "
                              f"Use 0 to preload ALL frames into memory.")
+
+    # Mask replay options
+    parser.add_argument("--mask-channel", type=int, default=200,
+                        help="Channel ID for mask data (default: 200 → stream/200 in UE)")
 
     args = parser.parse_args()
 
@@ -712,9 +978,20 @@ def main() -> None:
         sys.exit(0)
 
     if args.synthetic:
+        if args.capture_dir or args.mask_dir:
+            print("ERROR: --synthetic cannot be combined with --capture-dir or --mask-dir")
+            sys.exit(1)
         run_synthetic(args)
+    elif args.capture_dir or args.mask_dir:
+        if args.capture_dir and not args.mask_dir:
+            run_capture_replay(args)
+        elif args.mask_dir and not args.capture_dir:
+            run_mask_replay(args)
+        else:
+            run_capture_replay(args)
     else:
-        run_capture_replay(args)
+        parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
