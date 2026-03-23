@@ -156,6 +156,29 @@ class StreamSender:
         h, w = array.shape[:2]
         self.send_depth(channel, array.tobytes(), w, h, metadata=metadata)
 
+    def send_motion(self, channel: int, motion_bytes: bytes,
+                    width: int, height: int,
+                    metadata: Optional[dict] = None) -> None:
+        """Send raw motion-vector data (float32 XY per pixel)."""
+        msg = StreamMessage()
+        msg.header.message_type = MessageType.FRAME_MOTION
+        msg.header.channel_id = channel
+        msg.header.sequence_num = self._next_seq(channel)
+        msg.header.timestamp = StreamHeader.now_timestamp()
+
+        meta = metadata or {}
+        meta.setdefault("w", width)
+        meta.setdefault("h", height)
+        meta.setdefault("fmt", "rg32f")
+        msg.set_metadata_string(json.dumps(meta))
+        msg.payload = motion_bytes if isinstance(motion_bytes, bytes) else bytes(motion_bytes)
+        self._send_msg(msg)
+
+    def send_numpy_motion(self, channel: int, array, metadata: Optional[dict] = None) -> None:
+        """Send a numpy float32 motion-vector array. Expects shape (H, W, 2)."""
+        h, w = array.shape[:2]
+        self.send_motion(channel, array.tobytes(), w, h, metadata=metadata)
+
     # ── Capture directory replay ──────────────────────────────────────
 
     def send_capture_dir(self, capture_dir: Union[str, Path],
