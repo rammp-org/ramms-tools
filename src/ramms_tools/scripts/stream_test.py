@@ -239,13 +239,14 @@ def load_mask_exr(exr_path: Path) -> tuple[np.ndarray, int, int] | None:
     y_buf = exr_file.channel("Y", pt_uint)
     raw = np.frombuffer(y_buf, dtype=np.uint32).reshape((h, w))
 
-    unique, counts = np.unique(raw, return_counts=True)
-    logger.info(
-        "Mask EXR %s: shape=%s min=%s max=%s unique_values(%d)=%s counts=%s",
-        exr_path.name, raw.shape,
-        raw.min(), raw.max(), len(unique),
-        unique[:20], counts[:20],
-    )
+    logger.info("Mask EXR %s: shape=%s min=%s max=%s", exr_path.name, raw.shape, raw.min(), raw.max())
+    if logger.isEnabledFor(logging.DEBUG):
+        unique, counts = np.unique(raw, return_counts=True)
+        logger.debug(
+            "Mask EXR %s: unique_values(%d)=%s counts=%s",
+            exr_path.name, len(unique),
+            unique[:20], counts[:20],
+        )
 
     return raw.astype(np.float32), w, h
 
@@ -634,6 +635,11 @@ def run_capture_replay(args: argparse.Namespace) -> None:
         if not mask_paths:
             print(f"WARNING: No frame_*.exr files in {mask_dir}, masks disabled")
         else:
+            if len(mask_paths) < num_frames_per_cam:
+                print(f"WARNING: Mask directory has {len(mask_paths)} frames "
+                      f"but cameras have {num_frames_per_cam}; "
+                      f"clamping to {len(mask_paths)}")
+                num_frames_per_cam = len(mask_paths)
             mask_paths = mask_paths[:num_frames_per_cam]
             print(f"  Masks: {len(mask_paths)} frames from {mask_dir} "
                   f"→ stream/{mask_channel}")
@@ -651,10 +657,19 @@ def run_capture_replay(args: argparse.Namespace) -> None:
         if not motion_paths:
             print(f"WARNING: No frame_*.exr files in {motion_dir}, motion disabled")
         else:
+            if len(motion_paths) < num_frames_per_cam:
+                print(f"WARNING: Motion directory has {len(motion_paths)} frames "
+                      f"but expected {num_frames_per_cam}; "
+                      f"clamping to {len(motion_paths)}")
+                num_frames_per_cam = len(motion_paths)
             motion_paths = motion_paths[:num_frames_per_cam]
             print(f"  Motion: {len(motion_paths)} frames from {motion_dir} "
                   f"→ stream/{motion_channel}")
     send_motion = len(motion_paths) > 0
+
+    # If frame count was clamped by mask/motion, re-slice mask_paths too
+    if send_masks and len(mask_paths) > num_frames_per_cam:
+        mask_paths = mask_paths[:num_frames_per_cam]
 
     # ── Connect ─────────────────────────────────────────────────────
     sender = StreamSender(args.host, args.port)
@@ -779,6 +794,7 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                             mask_meta = {
                                 "w": mf["w"], "h": mf["h"],
                                 "fmt": "float32",
+                                "unit": "id",
                                 "source": "mask_replay",
                             }
                             sender.send_depth(
@@ -974,6 +990,7 @@ def run_mask_replay(args: argparse.Namespace) -> None:
                             "w": frame["w"],
                             "h": frame["h"],
                             "fmt": "float32",
+                            "unit": "id",
                             "source": "mask_replay",
                         }
                         sender.send_depth(
