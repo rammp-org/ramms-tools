@@ -175,21 +175,26 @@ def load_exr_frame(
     g_buf = exr_file.channel("G", pt)
     r_buf = exr_file.channel("R", pt)
 
-    # Detect value range from the first channel to decide scaling.
+    # Detect value range from ALL channels to decide scaling.
     # Linear HDR data lives in [0,1] (with some headroom) → needs ×255.
     # Pre-quantized data is already [0,255] → no scaling needed.
     first = np.frombuffer(b_buf, dtype=np.float32).reshape((h, w))
-    needs_scale = float(first.max()) <= 2.0
+    g_arr = np.frombuffer(g_buf, dtype=np.float32).reshape((h, w))
+    r_arr = np.frombuffer(r_buf, dtype=np.float32).reshape((h, w))
+    rgb_max = max(float(first.max()), float(g_arr.max()), float(r_arr.max()))
+    needs_scale = rgb_max <= 2.0
     scale = np.float32(255.0) if needs_scale else np.float32(1.0)
-    logger.debug(
-        "%s: max=%.3f → %s",
-        exr_path.name, float(first.max()),
-        "scaling ×255 (linear)" if needs_scale else "no scale (already 0-255)",
-    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "%s: rgb_max=%.3f → %s",
+            exr_path.name, rgb_max,
+            "scaling ×255 (linear)" if needs_scale else "no scale (already 0-255)",
+        )
 
     for buf, ch in ((b_buf, 0), (g_buf, 1), (r_buf, 2)):
         raw = np.frombuffer(buf, dtype=np.float32).reshape((h, w))
         np.multiply(raw, scale, out=scratch)
+        np.clip(scratch, 0, 255, out=scratch)
         np.copyto(bgra[:, :, ch], scratch, casting="unsafe")
 
     depth = None
@@ -239,8 +244,8 @@ def load_mask_exr(exr_path: Path) -> tuple[np.ndarray, int, int] | None:
     y_buf = exr_file.channel("Y", pt_uint)
     raw = np.frombuffer(y_buf, dtype=np.uint32).reshape((h, w))
 
-    logger.info("Mask EXR %s: shape=%s min=%s max=%s", exr_path.name, raw.shape, raw.min(), raw.max())
     if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("Mask EXR %s: shape=%s min=%s max=%s", exr_path.name, raw.shape, raw.min(), raw.max())
         unique, counts = np.unique(raw, return_counts=True)
         logger.debug(
             "Mask EXR %s: unique_values(%d)=%s counts=%s",
