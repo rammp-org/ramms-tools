@@ -6,8 +6,8 @@ Modes:
   --capture-dir   Replay captured EXR+JSON data from CameraCapture plugin
                   (requires: pip install ramms-tools[exr]).
   --mask-dir      Replay single-channel mask EXRs as float32 on a dedicated
-                  channel (requires: pip install ramms-tools[exr]).
-  --motion-dir    Replay motion-vector EXRs (XY float) on a dedicated channel
+                  stream (requires: pip install ramms-tools[exr]).
+  --motion-dir    Replay motion-vector EXRs (XY float) on a dedicated stream
                   (requires: pip install ramms-tools[exr]).
 
   --capture-dir, --mask-dir and --motion-dir may be combined to stream all
@@ -34,6 +34,19 @@ import numpy as np
 from ramms_tools.streaming.sender import StreamSender
 
 logger = logging.getLogger(__name__)
+
+# Default stream ID templates — {name} is the camera/source label, {index}
+# is the 0-based camera index.  Users can override via CLI args.
+DEFAULT_COLOR_ID = "camera/{name}/color"
+DEFAULT_DEPTH_ID = "camera/{name}/depth"
+DEFAULT_MASK_ID = "mask/{name}"
+DEFAULT_MOTION_ID = "motion/{name}"
+
+
+def _resolve_stream_id(template: str, *, name: str = "default",
+                       index: int = 0) -> str:
+    """Format a stream-ID template, substituting ``{name}`` and ``{index}``."""
+    return template.format(name=name, index=index)
 
 
 # ---------------------------------------------------------------------------
@@ -85,10 +98,12 @@ def run_synthetic(args: argparse.Namespace) -> None:
     fps = args.fps
     frame_interval = 1.0 / fps if fps > 0 else 0
     width, height = args.width, args.height
-    channel = args.channel
+
+    name = args.name or "synthetic"
+    stream_id = _resolve_stream_id(args.color_id, name=name)
 
     print(f"Sending {args.num_frames} synthetic frames ({width}x{height}) "
-          f"on channel {channel} at {fps} fps")
+          f"as '{stream_id}' at {fps} fps")
 
     try:
         for i in range(args.num_frames):
@@ -101,11 +116,13 @@ def run_synthetic(args: argparse.Namespace) -> None:
             }
 
             sender.send_image(
-                channel=channel,
+                channel=0,
                 image_bytes=frame.tobytes(),
                 width=width, height=height,
                 fmt="bgra8",
                 metadata=meta,
+                stream_id=stream_id,
+                name=f"{name} Color",
             )
 
             if (i + 1) % 30 == 0 or i == 0:
@@ -565,10 +582,16 @@ def run_capture_replay(args: argparse.Namespace) -> None:
     the transition point).
 
     Supports single-camera (flat folder) and multi-camera (actor or full
-    capture tree).  Each camera gets its own channel pair:
-      camera 0 → RGB on base_channel+0,   depth on depth_base+0
-      camera 1 → RGB on base_channel+1,   depth on depth_base+1
-      ...
+    capture tree).  Each camera gets its own channel pair and meaningful
+    stream IDs::
+
+      camera 0 ("FL_Capture") → camera/FL_Capture/color, camera/FL_Capture/depth
+      camera 1 ("Gripper")    → camera/Gripper/color,    camera/Gripper/depth
+
+    Streams with the same camera label share a group ID; UE uses this group
+    ID to auto-link color↔depth. The traditional ``channel`` / ``channel+100``
+    pattern is retained only as the default channel assignment for backward
+    compatibility, not as a requirement for auto-linking.
 
     When ``--mask-dir`` and/or ``--motion-dir`` are also provided, those
     EXRs are loaded and sent in lockstep on their dedicated channels.
@@ -591,9 +614,9 @@ def run_capture_replay(args: argparse.Namespace) -> None:
         print("  Or nested:       .../ActorName/CameraName/frame_NNNNNNN.{json,exr}")
         sys.exit(1)
 
-    # Build per-camera frame lists and channel assignments
-    base_channel = args.channel
-    depth_base = args.depth_channel
+    # Build per-camera frame lists and stream ID assignments
+    color_tpl = args.color_id
+    depth_tpl = args.depth_id
 
     camera_info: list[dict] = []
     for i, (label, cam_dir) in enumerate(cameras):
@@ -607,8 +630,11 @@ def run_capture_replay(args: argparse.Namespace) -> None:
         camera_info.append({
             "label": label,
             "frames": frames,
-            "rgb_channel": base_channel + i,
-            "depth_channel": depth_base + i,
+            "rgb_channel": i,
+            "depth_channel": 100 + i,
+            "group": label,
+            "color_stream_id": _resolve_stream_id(color_tpl, name=label, index=i),
+            "depth_stream_id": _resolve_stream_id(depth_tpl, name=label, index=i),
         })
 
     if not camera_info:
@@ -625,13 +651,14 @@ def run_capture_replay(args: argparse.Namespace) -> None:
     for ci in camera_info:
         n = len(ci["frames"])
         print(f"  {ci['label']:40s}  {n:>4d} frames  "
-              f"RGB→stream/{ci['rgb_channel']}  "
-              f"depth→stream/{ci['depth_channel']}")
+              f"color→{ci['color_stream_id']}  "
+              f"depth→{ci['depth_stream_id']}")
 
     # ── Mask setup (optional) ──────────────────────────────────────
     mask_dir = Path(args.mask_dir) if getattr(args, "mask_dir", None) else None
     mask_paths: list[Path] = []
-    mask_channel = getattr(args, "mask_channel", 200)
+    mask_name = args.name or "default"
+    mask_stream_id = _resolve_stream_id(args.mask_id, name=mask_name)
     if mask_dir is not None:
         if not mask_dir.is_dir():
             print(f"ERROR: Mask directory not found: {mask_dir}")
@@ -647,13 +674,13 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                 num_frames_per_cam = len(mask_paths)
             mask_paths = mask_paths[:num_frames_per_cam]
             print(f"  Masks: {len(mask_paths)} frames from {mask_dir} "
-                  f"→ stream/{mask_channel}")
+                  f"→ {mask_stream_id}")
     send_masks = len(mask_paths) > 0
 
     # ── Motion setup (optional) ────────────────────────────────────
     motion_dir = Path(args.motion_dir) if getattr(args, "motion_dir", None) else None
     motion_paths: list[Path] = []
-    motion_channel = getattr(args, "motion_channel", 300)
+    motion_stream_id = _resolve_stream_id(args.motion_id, name=mask_name)
     if motion_dir is not None:
         if not motion_dir.is_dir():
             print(f"ERROR: Motion directory not found: {motion_dir}")
@@ -669,7 +696,7 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                 num_frames_per_cam = len(motion_paths)
             motion_paths = motion_paths[:num_frames_per_cam]
             print(f"  Motion: {len(motion_paths)} frames from {motion_dir} "
-                  f"→ stream/{motion_channel}")
+                  f"→ {motion_stream_id}")
     send_motion = len(motion_paths) > 0
 
     # If frame count was clamped by mask/motion, re-slice mask_paths too
@@ -779,6 +806,10 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                             width=frame["w"], height=frame["h"],
                             fmt="bgra8",
                             metadata=frame["meta"],
+                            group=ci["group"],
+                            role="color",
+                            stream_id=ci["color_stream_id"],
+                            name=f"{ci['label']} Color",
                         )
 
                         if want_depth and frame["depth"] is not None:
@@ -790,6 +821,10 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                                 depth_bytes=frame["depth"],
                                 width=frame["w"], height=frame["h"],
                                 metadata=depth_meta,
+                                group=ci["group"],
+                                role="depth",
+                                stream_id=ci["depth_stream_id"],
+                                name=f"{ci['label']} Depth",
                             )
 
                     # Send mask frame (if available for this index)
@@ -803,10 +838,12 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                                 "source": "mask_replay",
                             }
                             sender.send_depth(
-                                channel=mask_channel,
+                                channel=200,
                                 depth_bytes=mf["mask"],
                                 width=mf["w"], height=mf["h"],
                                 metadata=mask_meta,
+                                stream_id=mask_stream_id,
+                                name=f"{mask_name} Mask",
                             )
 
                     # Send motion-vector frame (if available for this index)
@@ -819,10 +856,12 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                                 "source": "motion_replay",
                             }
                             sender.send_motion(
-                                channel=motion_channel,
+                                channel=300,
                                 motion_bytes=mv["motion"],
                                 width=mv["w"], height=mv["h"],
                                 metadata=motion_meta,
+                                stream_id=motion_stream_id,
+                                name=f"{mask_name} Motion",
                             )
 
                     total_sent += num_cameras + (1 if send_masks else 0) + (1 if send_motion else 0)
@@ -896,9 +935,9 @@ def _load_mask_chunk(
 
 
 def run_mask_replay(args: argparse.Namespace) -> None:
-    """Replay mask EXRs from a masks directory as float32 depth-channel data.
+    """Replay mask EXRs from a masks directory as float32 depth data.
 
-    Sends each mask frame on a dedicated channel using ``send_depth`` so
+    Sends each mask frame on a dedicated stream using ``send_depth`` so
     that UE receives raw float32 mask IDs (0.0, 1.0, 2.0, …) without
     uint8 normalization.
     """
@@ -921,9 +960,10 @@ def run_mask_replay(args: argparse.Namespace) -> None:
         num_frames = min(num_frames, max_frames)
         exr_paths = exr_paths[:num_frames]
 
-    channel = args.mask_channel
+    name = args.name or "default"
+    stream_id = _resolve_stream_id(args.mask_id, name=name)
     print(f"Found {num_frames} mask frames in {mask_dir}")
-    print(f"  Sending on channel {channel} as float32")
+    print(f"  Sending as '{stream_id}' (float32)")
 
     # ── Connect ─────────────────────────────────────────────────────
     sender = StreamSender(args.host, args.port)
@@ -999,10 +1039,12 @@ def run_mask_replay(args: argparse.Namespace) -> None:
                             "source": "mask_replay",
                         }
                         sender.send_depth(
-                            channel=channel,
+                            channel=200,
                             depth_bytes=frame["mask"],
                             width=frame["w"], height=frame["h"],
                             metadata=meta,
+                            stream_id=stream_id,
+                            name=f"{name} Mask",
                         )
 
                     total_sent += 1
@@ -1068,7 +1110,7 @@ def _load_motion_chunk(
 
 
 def run_motion_replay(args: argparse.Namespace) -> None:
-    """Replay motion-vector EXRs as float32 XY data on a dedicated channel.
+    """Replay motion-vector EXRs as float32 XY data on a dedicated stream.
 
     Sends each frame using ``send_motion`` (FRAME_MOTION message type) so
     that UE receives raw float32 velocity vectors.
@@ -1092,9 +1134,10 @@ def run_motion_replay(args: argparse.Namespace) -> None:
         num_frames = min(num_frames, max_frames)
         exr_paths = exr_paths[:num_frames]
 
-    channel = args.motion_channel
+    name = args.name or "default"
+    stream_id = _resolve_stream_id(args.motion_id, name=name)
     print(f"Found {num_frames} motion-vector frames in {motion_dir}")
-    print(f"  Sending on channel {channel} as rg32f")
+    print(f"  Sending as '{stream_id}' (rg32f)")
 
     # ── Connect ─────────────────────────────────────────────────────
     sender = StreamSender(args.host, args.port)
@@ -1167,10 +1210,12 @@ def run_motion_replay(args: argparse.Namespace) -> None:
                             "source": "motion_replay",
                         }
                         sender.send_motion(
-                            channel=channel,
+                            channel=300,
                             motion_bytes=frame["motion"],
                             width=frame["w"], height=frame["h"],
                             metadata=meta,
+                            stream_id=stream_id,
+                            name=f"{name} Motion",
                         )
 
                     total_sent += 1
@@ -1214,10 +1259,27 @@ def main() -> None:
                         help="RMSS server host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=30030,
                         help="RMSS server port (default: 30030)")
-    parser.add_argument("--channel", type=int, default=0,
-                        help="RGB channel ID (default: 0 → stream/0 in UE)")
-    parser.add_argument("--depth-channel", type=int, default=None,
-                        help="Depth channel ID (default: channel+100 → stream/100 in UE)")
+    parser.add_argument("--color-id", default=DEFAULT_COLOR_ID,
+                        metavar="TEMPLATE",
+                        help="Stream ID template for color streams "
+                             f"(default: {DEFAULT_COLOR_ID}). "
+                             "Supports {name} (camera label) and {index} placeholders.")
+    parser.add_argument("--depth-id", default=DEFAULT_DEPTH_ID,
+                        metavar="TEMPLATE",
+                        help="Stream ID template for depth streams "
+                             f"(default: {DEFAULT_DEPTH_ID}).")
+    parser.add_argument("--mask-id", default=DEFAULT_MASK_ID,
+                        metavar="TEMPLATE",
+                        help="Stream ID template for mask streams "
+                             f"(default: {DEFAULT_MASK_ID}).")
+    parser.add_argument("--motion-id", default=DEFAULT_MOTION_ID,
+                        metavar="TEMPLATE",
+                        help="Stream ID template for motion streams "
+                             f"(default: {DEFAULT_MOTION_ID}).")
+    parser.add_argument("--name", default=None, metavar="NAME",
+                        help="Default name for the {name} placeholder when no "
+                             "camera label is available (e.g. synthetic mode). "
+                             "Defaults to 'synthetic' or 'default' depending on mode.")
     parser.add_argument("--fps", type=float, default=30.0,
                         help="Target frame rate (default: 30)")
     parser.add_argument("-n", "--num-frames", type=int, default=300,
@@ -1239,14 +1301,14 @@ def main() -> None:
                         help="Replay captured EXR+JSON frames from CameraCapture")
     parser.add_argument("--mask-dir", metavar="DIR",
                         help="Replay mask EXRs (single-channel Y) as float32 on a "
-                             "dedicated channel (can combine with --capture-dir)")
+                             "dedicated stream (can combine with --capture-dir)")
     parser.add_argument("--motion-dir", metavar="DIR",
                         help="Replay motion-vector EXRs (XY float) on a dedicated "
-                             "channel (can combine with --capture-dir)")
+                             "stream (can combine with --capture-dir)")
 
     # Capture replay options
     parser.add_argument("--send-depth", action="store_true",
-                        help="Also send depth from EXR alpha channel (on channel+100)")
+                        help="Also send depth from EXR alpha channel.")
     parser.add_argument("--loop", action="store_true",
                         help="Loop capture replay continuously")
     parser.add_argument("--camera", metavar="FILTER",
@@ -1258,19 +1320,7 @@ def main() -> None:
                              f"(default: {_DEFAULT_PREFETCH}). "
                              f"Use 0 to preload ALL frames into memory.")
 
-    # Mask replay options
-    parser.add_argument("--mask-channel", type=int, default=200,
-                        help="Channel ID for mask data (default: 200 → stream/200 in UE)")
-
-    # Motion replay options
-    parser.add_argument("--motion-channel", type=int, default=300,
-                        help="Channel ID for motion vectors (default: 300 → stream/300 in UE)")
-
     args = parser.parse_args()
-
-    # Resolve depth channel default
-    if args.depth_channel is None:
-        args.depth_channel = args.channel + 100
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
