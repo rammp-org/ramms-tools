@@ -588,8 +588,10 @@ def run_capture_replay(args: argparse.Namespace) -> None:
       camera 0 ("FL_Capture") → camera/FL_Capture/color, camera/FL_Capture/depth
       camera 1 ("Gripper")    → camera/Gripper/color,    camera/Gripper/depth
 
-    Streams with the same camera label share a group ID so UE auto-links
-    color↔depth without relying on the deprecated channel+100 convention.
+    Streams with the same camera label share a group ID; UE uses this group
+    ID to auto-link color↔depth. The traditional ``channel`` / ``channel+100``
+    pattern is retained only as the default channel assignment for backward
+    compatibility, not as a requirement for auto-linking.
 
     When ``--mask-dir`` and/or ``--motion-dir`` are also provided, those
     EXRs are loaded and sent in lockstep on their dedicated channels.
