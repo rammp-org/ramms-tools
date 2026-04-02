@@ -180,7 +180,7 @@ class StreamSender:
 
         Args:
             group:     Stream association group (e.g. "wrist").
-            role:      Defaults to "depth" on the UE side.
+            role:      Stream role hint (default: "depth"). Callers may override.
             stream_id: Override auto-generated stream ID. E.g. "camera/wrist/depth".
             name:      Human-readable display name shown in UE UI.
         """
@@ -195,6 +195,7 @@ class StreamSender:
         meta.setdefault("h", height)
         meta.setdefault("fmt", "float32")
         meta.setdefault("unit", "cm")
+        meta.setdefault("role", "depth")
         if group is not None:
             meta["group"] = group
         if role is not None:
@@ -208,19 +209,20 @@ class StreamSender:
         self._send_msg(msg)
 
     def send_numpy_depth(self, channel: int, array, metadata: Optional[dict] = None,
-                         group: Optional[str] = None,
+                         group: Optional[str] = None, role: Optional[str] = None,
                          stream_id: Optional[str] = None,
                          name: Optional[str] = None) -> None:
         """Send a numpy float32 depth array. Expects shape (H, W), values in cm."""
         h, w = array.shape[:2]
         self.send_depth(channel, array.tobytes(), w, h,
-                        metadata=metadata, group=group,
+                        metadata=metadata, group=group, role=role,
                         stream_id=stream_id, name=name)
 
     def send_depth_uint16(self, channel: int, depth_bytes: bytes,
                           width: int, height: int,
                           metadata: Optional[dict] = None,
                           group: Optional[str] = None,
+                          role: Optional[str] = None,
                           stream_id: Optional[str] = None,
                           name: Optional[str] = None) -> None:
         """Send raw uint16 depth data (values in millimeters).
@@ -231,6 +233,7 @@ class StreamSender:
 
         Args:
             group:     Stream association group (e.g. "wrist").
+            role:      Stream role hint (default: "depth"). Callers may override.
             stream_id: Override auto-generated stream ID. E.g. "camera/wrist/depth".
             name:      Human-readable display name shown in UE UI.
         """
@@ -245,9 +248,11 @@ class StreamSender:
         meta.setdefault("h", height)
         meta.setdefault("fmt", "16uc1")
         meta.setdefault("unit", "mm")
+        meta.setdefault("role", "depth")
         if group is not None:
             meta["group"] = group
-        meta["role"] = "depth"
+        if role is not None:
+            meta["role"] = role
         if stream_id is not None:
             meta["stream_id"] = stream_id
         if name is not None:
@@ -259,24 +264,37 @@ class StreamSender:
     def send_numpy_depth_uint16(self, channel: int, array,
                                 metadata: Optional[dict] = None,
                                 group: Optional[str] = None,
+                                role: Optional[str] = None,
                                 stream_id: Optional[str] = None,
                                 name: Optional[str] = None) -> None:
-        """Send a numpy uint16 depth array. Expects shape (H, W), values in mm."""
+        """Send a numpy uint16 depth array. Expects shape (H, W), values in mm.
+
+        If the array is already ``np.uint16`` and C-contiguous, no copy is made.
+        Otherwise the array is cast to uint16 (which may involve a copy).
+        """
+        import numpy as np
+
+        if array.dtype != np.uint16:
+            array = array.astype(np.uint16)
+        elif not array.flags["C_CONTIGUOUS"]:
+            array = np.ascontiguousarray(array)
         h, w = array.shape[:2]
-        self.send_depth_uint16(channel, array.astype("uint16").tobytes(), w, h,
-                               metadata=metadata, group=group,
+        self.send_depth_uint16(channel, array.tobytes(), w, h,
+                               metadata=metadata, group=group, role=role,
                                stream_id=stream_id, name=name)
 
     def send_motion(self, channel: int, motion_bytes: bytes,
                     width: int, height: int,
                     metadata: Optional[dict] = None,
                     group: Optional[str] = None,
+                    role: Optional[str] = None,
                     stream_id: Optional[str] = None,
                     name: Optional[str] = None) -> None:
         """Send raw motion-vector data (float32 XY per pixel).
 
         Args:
             group:     Stream association group (e.g. "wrist").
+            role:      Stream role hint (default: "motion"). Callers may override.
             stream_id: Override auto-generated stream ID.
             name:      Human-readable display name shown in UE UI.
         """
@@ -290,8 +308,11 @@ class StreamSender:
         meta.setdefault("w", width)
         meta.setdefault("h", height)
         meta.setdefault("fmt", "rg32f")
+        meta.setdefault("role", "motion")
         if group is not None:
             meta["group"] = group
+        if role is not None:
+            meta["role"] = role
         if stream_id is not None:
             meta["stream_id"] = stream_id
         if name is not None:
@@ -301,13 +322,13 @@ class StreamSender:
         self._send_msg(msg)
 
     def send_numpy_motion(self, channel: int, array, metadata: Optional[dict] = None,
-                          group: Optional[str] = None,
+                          group: Optional[str] = None, role: Optional[str] = None,
                           stream_id: Optional[str] = None,
                           name: Optional[str] = None) -> None:
         """Send a numpy float32 motion-vector array. Expects shape (H, W, 2)."""
         h, w = array.shape[:2]
         self.send_motion(channel, array.tobytes(), w, h,
-                         metadata=metadata, group=group,
+                         metadata=metadata, group=group, role=role,
                          stream_id=stream_id, name=name)
 
     # ── Capture directory replay ──────────────────────────────────────
