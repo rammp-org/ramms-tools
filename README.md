@@ -292,26 +292,101 @@ with StreamClient("127.0.0.1", 30030) as client:
 with StreamSender("127.0.0.1", 30030) as sender:
     import numpy as np
     img = np.zeros((720, 1280, 4), dtype=np.uint8)
-    sender.send_numpy_image(channel=0, array=img)
+    sender.send_numpy_image(channel=0, array=img,
+                            stream_id="camera/front/color",
+                            name="Front Color",
+                            group="front")
 ```
+
+#### Stream Associations & Metadata
+
+Streams can carry association metadata so that UE automatically links related
+data (e.g. color ↔ depth from the same camera):
+
+| Metadata Key | Purpose | Example |
+|--------------|---------|---------|
+| `stream_id` | Unique identifier used by UE instead of numeric channel | `"camera/wrist/color"` |
+| `group` | Shared label linking related streams (color ↔ depth) | `"wrist"` |
+| `role` | Stream purpose: `color`, `depth`, `mask`, `infrared` | `"depth"` |
+| `name` | Human-readable display name for UE UI | `"Wrist Depth"` |
+
+All send methods (`send_image`, `send_depth`, `send_depth_uint16`, `send_motion`)
+accept these as keyword arguments. When provided, they **override** any
+matching keys already present in the `metadata` dict, so callers can safely
+pass a base metadata dict and override specific fields:
+
+```python
+base_meta = {"intrinsics": {...}, "transform": {...}}
+sender.send_depth(channel=100, depth_bytes=data, width=w, height=h,
+                  metadata=dict(base_meta),  # copy to avoid mutation
+                  stream_id="camera/wrist/depth",
+                  group="wrist", role="depth",
+                  name="Wrist Depth")
+```
+
+#### Depth Formats
+
+The sender supports two depth encodings:
+
+| Method | Format | Units | UE Texture | Use Case |
+|--------|--------|-------|------------|----------|
+| `send_depth()` | float32 | cm | PF_R32_FLOAT | UE captures, high precision |
+| `send_depth_uint16()` | uint16 | mm | PF_G16 | ROS depth, bandwidth-efficient |
+
+The UE sink auto-detects the format from the `fmt` metadata field (`"float32"`
+vs `"16uc1"` / `"uint16"` / `"mono16"`) and creates the appropriate texture.
+Downstream consumers (PGM shader, camera widget materials) automatically apply
+the correct unnormalization and unit conversion.
+
+```python
+# Float32 depth in centimeters (from UE captures)
+sender.send_depth(channel=100, depth_bytes=depth_f32.tobytes(),
+                  width=w, height=h)
+
+# Uint16 depth in millimeters (from ROS / external sensors)
+sender.send_depth_uint16(channel=100, depth_bytes=depth_u16.tobytes(),
+                         width=w, height=h,
+                         stream_id="camera/wrist/depth",
+                         group="wrist")
+```
+
+#### Color Formats
+
+The sink accepts three color formats, auto-detected from the `fmt` metadata:
+
+| Format | Bytes/Pixel | Notes |
+|--------|-------------|-------|
+| `bgra8` | 4 | Native UE format (no conversion) |
+| `rgba8` | 4 | Swizzled to BGRA on receipt |
+| `rgb8` | 3 | Expanded to BGRA (R↔B swap + alpha=255) |
+
+`send_numpy_image()` auto-detects `rgb8` vs `bgra8` from the array shape
+(3 vs 4 channels).
 
 ### `ramms-stream-test` — Stream Test & Capture Replay
 
 Sends test frames or replays captured camera data to UE via the RMSS streaming
 server. Useful for testing the streaming pipeline without a live camera source.
 
+Each stream is identified by a **stream ID** rather than a raw numeric channel.
+Stream IDs are generated from configurable templates that support `{name}`
+(camera label) and `{index}` (0-based camera index) placeholders:
+
 ```bash
 # Send synthetic color-bar test frames
 ramms-stream-test --synthetic -n 100
 
-# Replay a single camera's captured data
-ramms-stream-test --capture-dir ./Saved/CameraCaptures/Robot/HeadCam
-
-# Replay all cameras from an actor (auto-discovers camera subdirectories)
+# Replay all cameras (auto-discovers subdirectories, generates stream IDs)
 ramms-stream-test --capture-dir ./Saved/CameraCaptures/BP_Mebot_Ramms_C_0
 
-# Include depth data and filter to specific camera
+# Include depth data and filter to a specific camera
 ramms-stream-test --send-depth --capture-dir ./Saved/CameraCaptures/BP_Mebot_Ramms_C_0 --camera FR_GeminiCamera
+
+# Custom stream ID templates
+ramms-stream-test --capture-dir ./captures --color-id "robot/{name}/rgb" --depth-id "robot/{name}/depth"
+
+# Override name placeholder for synthetic mode
+ramms-stream-test --synthetic --name front_cam --color-id "test/{name}/color"
 
 # Control chunk size and frame rate
 ramms-stream-test --capture-dir ./captures --prefetch 30 --fps 30 -n 0
@@ -321,13 +396,21 @@ ramms-stream-test --capture-dir ./captures --prefetch 30 --fps 30 -n 0
 |------|-------------|
 | `--synthetic` | Send animated color-bar test frames |
 | `--capture-dir` | Replay EXR+JSON data from CameraCapture plugin output |
-| `--send-depth` | Include depth channel when replaying captures |
+| `--send-depth` | Include depth data when replaying captures |
 | `--camera` | Filter to a specific camera name |
+| `--color-id` | Stream ID template for color (default: `camera/{name}/color`) |
+| `--depth-id` | Stream ID template for depth (default: `camera/{name}/depth`) |
+| `--mask-id` | Stream ID template for masks (default: `mask/{name}`) |
+| `--motion-id` | Stream ID template for motion (default: `motion/{name}`) |
+| `--name` | Default `{name}` value when no camera label exists |
 | `--prefetch` | Chunk size for double-buffered loading (default: 30, 0=all) |
-| `--channel` | Base RGB channel ID (default: 0) |
-| `--depth-channel` | Base depth channel ID (default: channel+100) |
 | `-n` / `--num-frames` | Max frames to send (default: 300, 0=all) |
 | `--loop` | Loop playback continuously |
+
+In capture replay mode, each discovered camera generates a pair of stream IDs
+(e.g. `camera/FL_Capture/color` and `camera/FL_Capture/depth`) sharing the
+same group for automatic association in UE. Numeric channel IDs are assigned
+internally and are not exposed to the user.
 
 Requires the `exr` optional dependency for capture replay:
 ```bash
