@@ -10,7 +10,7 @@ Python tools for interacting with RAMMS-based Unreal Engine projects via the
 pip install -e .
 
 # Or install directly from GitHub
-pip install git+https://github.com/ATDev-Inc/ramms-tools.git
+pip install git+https://github.com/rammp-org/ramms-tools.git
 
 # With EXR support (for camera capture replay)
 pip install -e '.[exr]'
