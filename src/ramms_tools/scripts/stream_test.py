@@ -1261,8 +1261,12 @@ def _parse_material_params(raw: list[str]) -> dict[str, float] | None:
             print(f"ERROR: invalid material param '{item}' — expected KEY=VALUE")
             sys.exit(1)
         key, _, val = item.partition("=")
+        key = key.strip()
+        if not key:
+            print(f"ERROR: material param '{item}' has an empty key")
+            sys.exit(1)
         try:
-            result[key.strip()] = float(val.strip())
+            result[key] = float(val.strip())
         except ValueError:
             print(f"ERROR: material param value '{val}' is not a number")
             sys.exit(1)

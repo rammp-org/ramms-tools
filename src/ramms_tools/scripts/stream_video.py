@@ -85,7 +85,8 @@ def _run_receive(args: argparse.Namespace) -> None:
             # Save to disk
             if save_dir and mt in (
                 MessageType.FRAME_RGB, MessageType.FRAME_DEPTH,
-                MessageType.FRAME_RGBD, MessageType.IMAGE_DATA
+                MessageType.FRAME_RGBD, MessageType.FRAME_DATA,
+                MessageType.IMAGE_DATA
             ):
                 _save_frame(save_dir, ch, msg, frame_counts[ch])
 

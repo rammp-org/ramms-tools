@@ -179,14 +179,16 @@ class StreamSender:
     def send_numpy_image(self, channel: int, array, metadata: Optional[dict] = None,
                          group: Optional[str] = None, role: Optional[str] = None,
                          stream_id: Optional[str] = None,
-                         name: Optional[str] = None) -> None:
+                         name: Optional[str] = None,
+                         material_params: Optional[dict[str, float]] = None) -> None:
         """Send a numpy array as an image.  Expects shape (H, W, 4) uint8 BGRA."""
         h, w = array.shape[:2]
         channels = array.shape[2] if array.ndim == 3 else 1
         fmt = "rgb8" if channels == 3 else "bgra8"
         self.send_image(channel, array.tobytes(), w, h, fmt=fmt,
                         metadata=metadata, group=group, role=role,
-                        stream_id=stream_id, name=name)
+                        stream_id=stream_id, name=name,
+                        material_params=material_params)
 
     def send_depth(self, channel: int, depth_bytes: bytes,
                    width: int, height: int,
@@ -393,30 +395,38 @@ class StreamSender:
 
     def send_numpy_mask(self, channel: int, array,
                         metadata: Optional[dict] = None,
+                        fmt: Optional[str] = None,
+                        compression: Compression = Compression.NONE,
                         group: Optional[str] = None,
                         stream_id: Optional[str] = None,
-                        name: Optional[str] = None) -> None:
+                        name: Optional[str] = None,
+                        material_params: Optional[dict[str, float]] = None) -> None:
         """Send a numpy mask array.
 
         If the array dtype is ``uint8``, sends as ``mono8`` (1 byte/pixel).
         If ``float32``, sends as ``float32`` (4 bytes/pixel).
         Otherwise, casts to ``uint8``.
+
+        The *fmt* parameter overrides automatic format detection when set.
         """
         import numpy as np
 
         h, w = array.shape[:2]
-        if array.dtype == np.float32:
-            fmt = "float32"
+        if fmt is not None:
+            resolved_fmt = fmt
+        elif array.dtype == np.float32:
+            resolved_fmt = "float32"
         elif array.dtype == np.uint8:
-            fmt = "mono8"
+            resolved_fmt = "mono8"
         else:
             array = array.astype(np.uint8)
-            fmt = "mono8"
+            resolved_fmt = "mono8"
         if not array.flags["C_CONTIGUOUS"]:
             array = np.ascontiguousarray(array)
-        self.send_mask(channel, array.tobytes(), w, h, fmt=fmt,
-                       metadata=metadata, group=group,
-                       stream_id=stream_id, name=name)
+        self.send_mask(channel, array.tobytes(), w, h, fmt=resolved_fmt,
+                       compression=compression, metadata=metadata, group=group,
+                       stream_id=stream_id, name=name,
+                       material_params=material_params)
 
     def send_motion(self, channel: int, motion_bytes: bytes,
                     width: int, height: int,
