@@ -123,6 +123,7 @@ def run_synthetic(args: argparse.Namespace) -> None:
                 metadata=meta,
                 stream_id=stream_id,
                 name=f"{name} Color",
+                material_params=args.material_params,
             )
 
             if (i + 1) % 30 == 0 or i == 0:
@@ -810,6 +811,7 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                             role="color",
                             stream_id=ci["color_stream_id"],
                             name=f"{ci['label']} Color",
+                            material_params=args.material_params,
                         )
 
                         if want_depth and frame["depth"] is not None:
@@ -833,17 +835,16 @@ def run_capture_replay(args: argparse.Namespace) -> None:
                         if mf is not None:
                             mask_meta = {
                                 "w": mf["w"], "h": mf["h"],
-                                "fmt": "float32",
-                                "unit": "id",
                                 "source": "mask_replay",
                             }
-                            sender.send_depth(
+                            sender.send_mask(
                                 channel=200,
-                                depth_bytes=mf["mask"],
+                                mask_bytes=mf["mask"],
                                 width=mf["w"], height=mf["h"],
                                 metadata=mask_meta,
                                 stream_id=mask_stream_id,
                                 name=f"{mask_name} Mask",
+                                material_params=args.mask_material_params,
                             )
 
                     # Send motion-vector frame (if available for this index)
@@ -917,9 +918,12 @@ def _load_single_mask(exr_path: Path) -> dict | None:
     result = load_mask_exr(exr_path)
     if result is None:
         return None
-    mask, w, h = result
+    mask_f32, w, h = result
+    # Convert float32 mask IDs (0.0, 1.0, 2.0, …) to uint8 for mono8 transport.
+    # Values >255 are clamped — typical mask sets have far fewer classes.
+    mask_u8 = np.clip(mask_f32, 0, 255).astype(np.uint8)
     return {
-        "mask": mask.tobytes(),
+        "mask": mask_u8.tobytes(),
         "w": w,
         "h": h,
     }
@@ -935,11 +939,10 @@ def _load_mask_chunk(
 
 
 def run_mask_replay(args: argparse.Namespace) -> None:
-    """Replay mask EXRs from a masks directory as float32 depth data.
+    """Replay mask EXRs from a masks directory as mono8 mask data.
 
-    Sends each mask frame on a dedicated stream using ``send_depth`` so
-    that UE receives raw float32 mask IDs (0.0, 1.0, 2.0, …) without
-    uint8 normalization.
+    Sends each mask frame on a dedicated stream using ``send_mask`` so
+    that UE receives uint8 mask IDs (0, 1, 2, …) as mono8 via FRAME_DATA.
     """
     from concurrent.futures import ProcessPoolExecutor
     import multiprocessing
@@ -963,7 +966,7 @@ def run_mask_replay(args: argparse.Namespace) -> None:
     name = args.name or "default"
     stream_id = _resolve_stream_id(args.mask_id, name=name)
     print(f"Found {num_frames} mask frames in {mask_dir}")
-    print(f"  Sending as '{stream_id}' (float32)")
+    print(f"  Sending as '{stream_id}' (mono8)")
 
     # ── Connect ─────────────────────────────────────────────────────
     sender = StreamSender(args.host, args.port)
@@ -1034,17 +1037,16 @@ def run_mask_replay(args: argparse.Namespace) -> None:
                         meta = {
                             "w": frame["w"],
                             "h": frame["h"],
-                            "fmt": "float32",
-                            "unit": "id",
                             "source": "mask_replay",
                         }
-                        sender.send_depth(
+                        sender.send_mask(
                             channel=200,
-                            depth_bytes=frame["mask"],
+                            mask_bytes=frame["mask"],
                             width=frame["w"], height=frame["h"],
                             metadata=meta,
                             stream_id=stream_id,
                             name=f"{name} Mask",
+                            material_params=args.mask_material_params,
                         )
 
                     total_sent += 1
@@ -1248,6 +1250,29 @@ def run_motion_replay(args: argparse.Namespace) -> None:
         sender.disconnect()
         pool.shutdown(wait=False)
 
+
+def _parse_material_params(raw: list[str]) -> dict[str, float] | None:
+    """Parse ``['Key=1.0', 'Foo=2']`` into ``{'Key': 1.0, 'Foo': 2.0}``."""
+    if not raw:
+        return None
+    result: dict[str, float] = {}
+    for item in raw:
+        if "=" not in item:
+            print(f"ERROR: invalid material param '{item}' — expected KEY=VALUE")
+            sys.exit(1)
+        key, _, val = item.partition("=")
+        key = key.strip()
+        if not key:
+            print(f"ERROR: material param '{item}' has an empty key")
+            sys.exit(1)
+        try:
+            result[key] = float(val.strip())
+        except ValueError:
+            print(f"ERROR: material param value '{val}' is not a number")
+            sys.exit(1)
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ramms-stream-test",
@@ -1320,7 +1345,23 @@ def main() -> None:
                              f"(default: {_DEFAULT_PREFETCH}). "
                              f"Use 0 to preload ALL frames into memory.")
 
+    # Material scalar parameters forwarded to UE MIDs
+    parser.add_argument("--material-param", action="append", default=[],
+                        metavar="KEY=VALUE",
+                        help="Material scalar parameter sent with color/depth "
+                             "streams (repeatable, e.g. --material-param "
+                             "NumSegmentIDs=5)")
+    parser.add_argument("--mask-material-param", action="append", default=[],
+                        metavar="KEY=VALUE",
+                        help="Material scalar parameter sent with mask streams "
+                             "(repeatable, e.g. --mask-material-param "
+                             "NumSegmentIDs=5)")
+
     args = parser.parse_args()
+
+    # Parse KEY=VALUE material param args into dicts (or None if empty)
+    args.material_params = _parse_material_params(args.material_param)
+    args.mask_material_params = _parse_material_params(args.mask_material_param)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

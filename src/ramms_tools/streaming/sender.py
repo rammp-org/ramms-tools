@@ -20,6 +20,17 @@ Usage::
     depth_mm = np.zeros((720, 1280), dtype=np.uint16)
     sender.send_numpy_depth_uint16(channel=100, array=depth_mm, group="wrist")
 
+    # Send a mono8 mask (uint8, 1 byte/pixel)
+    mask = np.zeros((720, 1280), dtype=np.uint8)
+    sender.send_mask(channel=200, mask_bytes=mask.tobytes(),
+                     width=1280, height=720, group="wrist")
+    # or from numpy:
+    sender.send_numpy_mask(channel=200, array=mask, group="wrist")
+
+    # Send generic frame data with any format (uses FRAME_DATA message type)
+    sender.send_data(channel=0, data=raw_bytes, width=1280, height=720,
+                     fmt="mono8", role="mask")
+
     # Send raw bytes with explicit format
     sender.send_image(channel=0, image_bytes=img.tobytes(),
                       width=1280, height=720, fmt="bgra8",
@@ -117,7 +128,8 @@ class StreamSender:
                    group: Optional[str] = None,
                    role: Optional[str] = None,
                    stream_id: Optional[str] = None,
-                   name: Optional[str] = None) -> None:
+                   name: Optional[str] = None,
+                   material_params: Optional[dict[str, float]] = None) -> None:
         """Send a raw image to UE as an IMAGE_DATA message.
 
         If *compression* is not NONE, the caller must have already
@@ -135,6 +147,8 @@ class StreamSender:
             stream_id: Override the auto-generated stream ID in UE (default:
                        ``{StreamPrefix}/{channel}``).  E.g. "camera/wrist/color".
             name:      Human-readable display name shown in UE UI.
+            material_params: Optional dict of scalar material parameters to forward
+                       to UE MIDs (e.g. ``{"NumSegmentIDs": 5.0}``).
         """
         msg = StreamMessage()
         msg.header.message_type = MessageType.IMAGE_DATA
@@ -156,6 +170,8 @@ class StreamSender:
             meta["stream_id"] = stream_id
         if name is not None:
             meta["name"] = name
+        if material_params is not None:
+            meta["MaterialScalarParameters"] = material_params
         msg.set_metadata_string(json.dumps(meta))
         msg.payload = image_bytes if isinstance(image_bytes, bytes) else bytes(image_bytes)
         self._send_msg(msg)
@@ -163,14 +179,16 @@ class StreamSender:
     def send_numpy_image(self, channel: int, array, metadata: Optional[dict] = None,
                          group: Optional[str] = None, role: Optional[str] = None,
                          stream_id: Optional[str] = None,
-                         name: Optional[str] = None) -> None:
+                         name: Optional[str] = None,
+                         material_params: Optional[dict[str, float]] = None) -> None:
         """Send a numpy array as an image.  Expects shape (H, W, 4) uint8 BGRA."""
         h, w = array.shape[:2]
         channels = array.shape[2] if array.ndim == 3 else 1
         fmt = "rgb8" if channels == 3 else "bgra8"
         self.send_image(channel, array.tobytes(), w, h, fmt=fmt,
                         metadata=metadata, group=group, role=role,
-                        stream_id=stream_id, name=name)
+                        stream_id=stream_id, name=name,
+                        material_params=material_params)
 
     def send_depth(self, channel: int, depth_bytes: bytes,
                    width: int, height: int,
@@ -285,6 +303,130 @@ class StreamSender:
         self.send_depth_uint16(channel, array.tobytes(), w, h,
                                metadata=metadata, group=group, role=role,
                                stream_id=stream_id, name=name)
+
+    def send_data(self, channel: int, data: bytes,
+                  width: int, height: int,
+                  fmt: str,
+                  compression: Compression = Compression.NONE,
+                  metadata: Optional[dict] = None,
+                  group: Optional[str] = None,
+                  role: Optional[str] = None,
+                  stream_id: Optional[str] = None,
+                  name: Optional[str] = None,
+                  material_params: Optional[dict[str, float]] = None) -> None:
+        """Send arbitrary frame data using the generic FRAME_DATA message type.
+
+        Unlike ``send_image`` (which uses IMAGE_DATA), this uses FRAME_DATA
+        (0x11) and works with any pixel format supported by UE's
+        ``ResolvePixelFormat`` — e.g. ``mono8``, ``r8``, ``gray8``,
+        ``bgra8``, ``16uc1``, ``float32``, ``rg32f``.
+
+        Args:
+            fmt:       Pixel format string (e.g. "mono8", "float32", "bgra8").
+            group:     Stream association group (e.g. "wrist").
+            role:      Stream role hint — "color", "depth", "mask", "motion".
+            stream_id: Override auto-generated stream ID.
+            name:      Human-readable display name shown in UE UI.
+            material_params: Optional dict of scalar material parameters to forward
+                       to UE MIDs (e.g. ``{"NumSegmentIDs": 5.0}``).
+        """
+        msg = StreamMessage()
+        msg.header.message_type = MessageType.FRAME_DATA
+        msg.header.channel_id = channel
+        msg.header.sequence_num = self._next_seq(channel)
+        msg.header.timestamp = StreamHeader.now_timestamp()
+        if compression != Compression.NONE:
+            msg.header.set_compression(compression)
+
+        meta = metadata or {}
+        meta.setdefault("w", width)
+        meta.setdefault("h", height)
+        meta.setdefault("fmt", fmt)
+        if group is not None:
+            meta["group"] = group
+        if role is not None:
+            meta["role"] = role
+        if stream_id is not None:
+            meta["stream_id"] = stream_id
+        if name is not None:
+            meta["name"] = name
+        if material_params is not None:
+            meta["MaterialScalarParameters"] = material_params
+        msg.set_metadata_string(json.dumps(meta))
+        msg.payload = data if isinstance(data, bytes) else bytes(data)
+        self._send_msg(msg)
+
+    def send_mask(self, channel: int, mask_bytes: bytes,
+                  width: int, height: int,
+                  fmt: str = "mono8",
+                  compression: Compression = Compression.NONE,
+                  metadata: Optional[dict] = None,
+                  group: Optional[str] = None,
+                  stream_id: Optional[str] = None,
+                  name: Optional[str] = None,
+                  material_params: Optional[dict[str, float]] = None) -> None:
+        """Send single-channel mask data (uint8 per pixel by default).
+
+        Convenience wrapper around ``send_data`` that defaults to
+        ``fmt="mono8"`` and ``role="mask"``.
+
+        Args:
+            fmt:       Pixel format (default "mono8").  Also accepts "float32"
+                       for float mask IDs.
+            group:     Stream association group (e.g. "wrist").
+            stream_id: Override auto-generated stream ID.
+            name:      Human-readable display name shown in UE UI.
+            material_params: Optional dict of scalar material parameters to forward
+                       to UE MIDs (e.g. ``{"NumSegmentIDs": 5.0}``).
+        """
+        self.send_data(
+            channel=channel,
+            data=mask_bytes,
+            width=width, height=height,
+            fmt=fmt,
+            compression=compression,
+            metadata=metadata,
+            group=group,
+            role="mask",
+            stream_id=stream_id,
+            name=name,
+            material_params=material_params,
+        )
+
+    def send_numpy_mask(self, channel: int, array,
+                        metadata: Optional[dict] = None,
+                        fmt: Optional[str] = None,
+                        compression: Compression = Compression.NONE,
+                        group: Optional[str] = None,
+                        stream_id: Optional[str] = None,
+                        name: Optional[str] = None,
+                        material_params: Optional[dict[str, float]] = None) -> None:
+        """Send a numpy mask array.
+
+        If the array dtype is ``uint8``, sends as ``mono8`` (1 byte/pixel).
+        If ``float32``, sends as ``float32`` (4 bytes/pixel).
+        Otherwise, casts to ``uint8``.
+
+        The *fmt* parameter overrides automatic format detection when set.
+        """
+        import numpy as np
+
+        h, w = array.shape[:2]
+        if fmt is not None:
+            resolved_fmt = fmt
+        elif array.dtype == np.float32:
+            resolved_fmt = "float32"
+        elif array.dtype == np.uint8:
+            resolved_fmt = "mono8"
+        else:
+            array = array.astype(np.uint8)
+            resolved_fmt = "mono8"
+        if not array.flags["C_CONTIGUOUS"]:
+            array = np.ascontiguousarray(array)
+        self.send_mask(channel, array.tobytes(), w, h, fmt=resolved_fmt,
+                       compression=compression, metadata=metadata, group=group,
+                       stream_id=stream_id, name=name,
+                       material_params=material_params)
 
     def send_motion(self, channel: int, motion_bytes: bytes,
                     width: int, height: int,

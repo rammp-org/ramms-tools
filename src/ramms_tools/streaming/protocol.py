@@ -48,6 +48,7 @@ class MessageType(IntEnum):
     POINT_CLOUD   = 0x05
     OCTO_MAP      = 0x06
     IMAGE_DATA    = 0x10
+    FRAME_DATA    = 0x11
     METADATA_ONLY = 0xF0
     SUBSCRIBE     = 0xF1
     UNSUBSCRIBE   = 0xF2

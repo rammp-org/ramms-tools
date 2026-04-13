@@ -53,6 +53,7 @@ _FRAME_TYPES = frozenset({
     MessageType.FRAME_DEPTH,
     MessageType.FRAME_RGBD,
     MessageType.FRAME_MOTION,
+    MessageType.FRAME_DATA,
     MessageType.POINT_CLOUD,
     MessageType.OCTO_MAP,
     MessageType.IMAGE_DATA,
