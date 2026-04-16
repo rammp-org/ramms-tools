@@ -116,6 +116,7 @@ class StreamSender:
         self._send_queue: Optional[queue.Queue] = None
         self._workers: list[threading.Thread] = []
         self._shutdown_event = threading.Event()
+        self._closing = False  # prevents new enqueues during flush/disconnect
         self._send_lock = threading.Lock()  # guards _sock.sendall in sync mode
 
         # Stats — guarded by _drop_lock for thread safety
@@ -127,6 +128,7 @@ class StreamSender:
     def connect(self, timeout: float = 5.0) -> None:
         if self._sock is not None:
             raise RuntimeError("Already connected")
+        self._closing = False
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         sock.connect((self.host, self.port))
@@ -172,20 +174,22 @@ class StreamSender:
             Use ``flush=True`` if you need to guarantee delivery of enqueued
             frames before disconnecting.
         """
+        # Prevent new enqueues immediately so the queue can actually drain.
+        self._closing = True
+
         q = self._send_queue
 
         if flush and q is not None:
-            # Block until every enqueued item has been dequeued AND task_done()
-            # has been called — this means the worker has finished sendall()
-            # for each item, not just dequeued it.
+            # Block until every enqueued item has been sent (task_done called).
+            # We use a helper thread because Queue.join() has no timeout arg.
             done = threading.Event()
 
             def _join_waiter():
                 q.join()
                 done.set()
 
-            t = threading.Thread(target=_join_waiter, daemon=True)
-            t.start()
+            jt = threading.Thread(target=_join_waiter, daemon=True)
+            jt.start()
             if not done.wait(timeout=flush_timeout):
                 logger.warning(
                     "StreamSender flush timed out — %d task(s) remaining",
@@ -258,13 +262,23 @@ class StreamSender:
                         sock.close()
                     except OSError:
                         pass
+                # Mark the failed item done, then drain any remaining items
+                # so unfinished_tasks reaches 0 and q.join() can complete.
                 q.task_done()
-                break
+                while True:
+                    try:
+                        q.get_nowait()
+                        q.task_done()
+                    except queue.Empty:
+                        break
+                return
             else:
                 q.task_done()
 
     def _send_msg(self, msg: StreamMessage) -> None:
         """Enqueue a message (non-blocking) or send synchronously if queue_size=0."""
+        if self._closing:
+            raise RuntimeError("Sender is closing")
         if self._sock is None:
             raise RuntimeError("Not connected")
 
