@@ -46,18 +46,34 @@ Usage::
                       compression=Compression.JPEG)
 
     sender.disconnect()
+
+Non-blocking mode (default)::
+
+    # Queue size and worker threads are configurable
+    sender = StreamSender("127.0.0.1", 30030, queue_size=4, num_workers=1)
+    sender.connect()
+
+    # send_image / send_depth etc. are non-blocking.
+    # If the queue is full the oldest message on the same channel is dropped,
+    # keeping the latest frame per channel.
+    sender.send_numpy_image(channel=0, array=img, group="wrist", role="color")
+
+    # Synchronous mode (legacy behaviour) — blocks on each send:
+    sender = StreamSender("127.0.0.1", 30030, queue_size=0)
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import queue
 import socket
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Union
 
-from ramms_tools.streaming.protocol import (
+from .protocol import (
     Compression,
     MessageType,
     StreamHeader,
@@ -68,13 +84,38 @@ logger = logging.getLogger(__name__)
 
 
 class StreamSender:
-    """TCP client that sends data TO the RMSS streaming server (external → UE)."""
+    """TCP client that sends data TO the RMSS streaming server (external → UE).
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 30030):
+    Args:
+        host:        Server IP address.
+        port:        Server TCP port.
+        queue_size:  Max queued messages. 0 = synchronous (blocking) mode.
+                     When the queue is full, the oldest message on the same
+                     channel is evicted so the newest frame always wins.
+        num_workers: Number of background send threads (only when queue_size > 0).
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 30030,
+        queue_size: int = 4,
+        num_workers: int = 1,
+    ):
         self.host = host
         self.port = port
         self._sock: Optional[socket.socket] = None
         self._seq: dict[int, int] = {}  # per-channel sequence counter
+
+        # Queue / worker config
+        self._queue_size = max(queue_size, 0)
+        self._num_workers = max(num_workers, 1) if self._queue_size > 0 else 0
+        self._send_queue: Optional[queue.Queue] = None
+        self._workers: list[threading.Thread] = []
+        self._shutdown_event = threading.Event()
+
+        # Stats (read-only from caller, updated atomically)
+        self.dropped_frames: int = 0
 
     # ── Connection ────────────────────────────────────────────────────
 
@@ -89,10 +130,46 @@ class StreamSender:
         self._sock = sock
         logger.info("StreamSender connected to %s:%d", self.host, self.port)
 
+        # Start worker threads
+        if self._queue_size > 0:
+            self._shutdown_event.clear()
+            self._send_queue = queue.Queue(maxsize=self._queue_size)
+            self._workers = []
+            for i in range(self._num_workers):
+                t = threading.Thread(
+                    target=self._send_worker,
+                    name=f"StreamSender-worker-{i}",
+                    daemon=True,
+                )
+                t.start()
+                self._workers.append(t)
+            logger.info(
+                "StreamSender: %d worker(s), queue_size=%d",
+                self._num_workers,
+                self._queue_size,
+            )
+
     def is_connected(self) -> bool:
         return self._sock is not None
-    
+
     def disconnect(self) -> None:
+        # Signal workers to stop
+        self._shutdown_event.set()
+
+        # Drain the queue so workers don't block on put
+        if self._send_queue is not None:
+            while not self._send_queue.empty():
+                try:
+                    self._send_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+        # Wait for workers to finish current send
+        for t in self._workers:
+            t.join(timeout=5.0)
+        self._workers.clear()
+        self._send_queue = None
+
         if self._sock:
             try:
                 self._sock.shutdown(socket.SHUT_RDWR)
@@ -115,21 +192,62 @@ class StreamSender:
         self._seq[channel] = seq + 1
         return seq
 
+    def _send_worker(self) -> None:
+        """Background thread: drains the queue and does blocking socket sends."""
+        while not self._shutdown_event.is_set():
+            try:
+                msg = self._send_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if self._sock is not None:
+                    self._sock.sendall(msg.serialize())
+            except OSError as exc:
+                logger.warning("StreamSender send error: %s", exc)
+                self._shutdown_event.set()
+                break
+
     def _send_msg(self, msg: StreamMessage) -> None:
+        """Enqueue a message (non-blocking) or send synchronously if queue_size=0."""
         if self._sock is None:
             raise RuntimeError("Not connected")
-        self._sock.sendall(msg.serialize())
 
-    def send_image(self, channel: int, image_bytes: bytes,
-                   width: int, height: int,
-                   fmt: str = "bgra8",
-                   compression: Compression = Compression.NONE,
-                   metadata: Optional[dict] = None,
-                   group: Optional[str] = None,
-                   role: Optional[str] = None,
-                   stream_id: Optional[str] = None,
-                   name: Optional[str] = None,
-                   material_params: Optional[dict[str, float]] = None) -> None:
+        # Synchronous mode — direct blocking send (legacy behaviour)
+        if self._send_queue is None:
+            self._sock.sendall(msg.serialize())
+            return
+
+        # Non-blocking mode — try to enqueue, evict oldest on same channel if full
+        try:
+            self._send_queue.put_nowait(msg)
+        except queue.Full:
+            # Evict the oldest item and retry
+            try:
+                self._send_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.dropped_frames += 1
+            try:
+                self._send_queue.put_nowait(msg)
+            except queue.Full:
+                # Queue still full (shouldn't happen after eviction), drop silently
+                self.dropped_frames += 1
+
+    def send_image(
+        self,
+        channel: int,
+        image_bytes: bytes,
+        width: int,
+        height: int,
+        fmt: str = "bgra8",
+        compression: Compression = Compression.NONE,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+        material_params: Optional[dict[str, float]] = None,
+    ) -> None:
         """Send a raw image to UE as an IMAGE_DATA message.
 
         If *compression* is not NONE, the caller must have already
@@ -173,30 +291,50 @@ class StreamSender:
         if material_params is not None:
             meta["MaterialScalarParameters"] = material_params
         msg.set_metadata_string(json.dumps(meta))
-        msg.payload = image_bytes if isinstance(image_bytes, bytes) else bytes(image_bytes)
+        msg.payload = (
+            image_bytes if isinstance(image_bytes, bytes) else bytes(image_bytes)
+        )
         self._send_msg(msg)
 
-    def send_numpy_image(self, channel: int, array, metadata: Optional[dict] = None,
-                         group: Optional[str] = None, role: Optional[str] = None,
-                         stream_id: Optional[str] = None,
-                         name: Optional[str] = None,
-                         material_params: Optional[dict[str, float]] = None) -> None:
+    def send_numpy_image(
+        self,
+        channel: int,
+        array,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         """Send a numpy array as an image.  Expects shape (H, W, 4) uint8 BGRA."""
         h, w = array.shape[:2]
         channels = array.shape[2] if array.ndim == 3 else 1
         fmt = "rgb8" if channels == 3 else "bgra8"
-        self.send_image(channel, array.tobytes(), w, h, fmt=fmt,
-                        metadata=metadata, group=group, role=role,
-                        stream_id=stream_id, name=name,
-                        material_params=material_params)
+        self.send_image(
+            channel,
+            array.tobytes(),
+            w,
+            h,
+            fmt=fmt,
+            metadata=metadata,
+            group=group,
+            role=role,
+            stream_id=stream_id,
+            name=name,
+        )
 
-    def send_depth(self, channel: int, depth_bytes: bytes,
-                   width: int, height: int,
-                   metadata: Optional[dict] = None,
-                   group: Optional[str] = None,
-                   role: Optional[str] = None,
-                   stream_id: Optional[str] = None,
-                   name: Optional[str] = None) -> None:
+    def send_depth(
+        self,
+        channel: int,
+        depth_bytes: bytes,
+        width: int,
+        height: int,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         """Send raw depth data (float32 per pixel, values in centimeters).
 
         Args:
@@ -226,26 +364,47 @@ class StreamSender:
         if name is not None:
             meta["name"] = name
         msg.set_metadata_string(json.dumps(meta))
-        msg.payload = depth_bytes if isinstance(depth_bytes, bytes) else bytes(depth_bytes)
+        msg.payload = (
+            depth_bytes if isinstance(depth_bytes, bytes) else bytes(depth_bytes)
+        )
         self._send_msg(msg)
 
-    def send_numpy_depth(self, channel: int, array, metadata: Optional[dict] = None,
-                         group: Optional[str] = None, role: Optional[str] = None,
-                         stream_id: Optional[str] = None,
-                         name: Optional[str] = None) -> None:
+    def send_numpy_depth(
+        self,
+        channel: int,
+        array,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         """Send a numpy float32 depth array. Expects shape (H, W), values in cm."""
         h, w = array.shape[:2]
-        self.send_depth(channel, array.tobytes(), w, h,
-                        metadata=metadata, group=group, role=role,
-                        stream_id=stream_id, name=name)
+        self.send_depth(
+            channel,
+            array.tobytes(),
+            w,
+            h,
+            metadata=metadata,
+            group=group,
+            role=role,
+            stream_id=stream_id,
+            name=name,
+        )
 
-    def send_depth_uint16(self, channel: int, depth_bytes: bytes,
-                          width: int, height: int,
-                          metadata: Optional[dict] = None,
-                          group: Optional[str] = None,
-                          role: Optional[str] = None,
-                          stream_id: Optional[str] = None,
-                          name: Optional[str] = None) -> None:
+    def send_depth_uint16(
+        self,
+        channel: int,
+        depth_bytes: bytes,
+        width: int,
+        height: int,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         """Send raw uint16 depth data (values in millimeters).
 
         The UE sink creates a native PF_G16 texture — no CPU conversion.
@@ -279,15 +438,21 @@ class StreamSender:
         if name is not None:
             meta["name"] = name
         msg.set_metadata_string(json.dumps(meta))
-        msg.payload = depth_bytes if isinstance(depth_bytes, bytes) else bytes(depth_bytes)
+        msg.payload = (
+            depth_bytes if isinstance(depth_bytes, bytes) else bytes(depth_bytes)
+        )
         self._send_msg(msg)
 
-    def send_numpy_depth_uint16(self, channel: int, array,
-                                metadata: Optional[dict] = None,
-                                group: Optional[str] = None,
-                                role: Optional[str] = None,
-                                stream_id: Optional[str] = None,
-                                name: Optional[str] = None) -> None:
+    def send_numpy_depth_uint16(
+        self,
+        channel: int,
+        array,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         """Send a numpy uint16 depth array. Expects shape (H, W), values in mm.
 
         If the array is already ``np.uint16`` and C-contiguous, no copy is made.
@@ -300,20 +465,33 @@ class StreamSender:
         elif not array.flags["C_CONTIGUOUS"]:
             array = np.ascontiguousarray(array)
         h, w = array.shape[:2]
-        self.send_depth_uint16(channel, array.tobytes(), w, h,
-                               metadata=metadata, group=group, role=role,
-                               stream_id=stream_id, name=name)
+        self.send_depth_uint16(
+            channel,
+            array.tobytes(),
+            w,
+            h,
+            metadata=metadata,
+            group=group,
+            role=role,
+            stream_id=stream_id,
+            name=name,
+        )
 
-    def send_data(self, channel: int, data: bytes,
-                  width: int, height: int,
-                  fmt: str,
-                  compression: Compression = Compression.NONE,
-                  metadata: Optional[dict] = None,
-                  group: Optional[str] = None,
-                  role: Optional[str] = None,
-                  stream_id: Optional[str] = None,
-                  name: Optional[str] = None,
-                  material_params: Optional[dict[str, float]] = None) -> None:
+    def send_data(
+        self,
+        channel: int,
+        data: bytes,
+        width: int,
+        height: int,
+        fmt: str,
+        compression: Compression = Compression.NONE,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+        material_params: Optional[dict[str, float]] = None,
+    ) -> None:
         """Send arbitrary frame data using the generic FRAME_DATA message type.
 
         Unlike ``send_image`` (which uses IMAGE_DATA), this uses FRAME_DATA
@@ -356,15 +534,20 @@ class StreamSender:
         msg.payload = data if isinstance(data, bytes) else bytes(data)
         self._send_msg(msg)
 
-    def send_mask(self, channel: int, mask_bytes: bytes,
-                  width: int, height: int,
-                  fmt: str = "mono8",
-                  compression: Compression = Compression.NONE,
-                  metadata: Optional[dict] = None,
-                  group: Optional[str] = None,
-                  stream_id: Optional[str] = None,
-                  name: Optional[str] = None,
-                  material_params: Optional[dict[str, float]] = None) -> None:
+    def send_mask(
+        self,
+        channel: int,
+        mask_bytes: bytes,
+        width: int,
+        height: int,
+        fmt: str = "mono8",
+        compression: Compression = Compression.NONE,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+        material_params: Optional[dict[str, float]] = None,
+    ) -> None:
         """Send single-channel mask data (uint8 per pixel by default).
 
         Convenience wrapper around ``send_data`` that defaults to
@@ -382,7 +565,8 @@ class StreamSender:
         self.send_data(
             channel=channel,
             data=mask_bytes,
-            width=width, height=height,
+            width=width,
+            height=height,
             fmt=fmt,
             compression=compression,
             metadata=metadata,
@@ -393,48 +577,57 @@ class StreamSender:
             material_params=material_params,
         )
 
-    def send_numpy_mask(self, channel: int, array,
-                        metadata: Optional[dict] = None,
-                        fmt: Optional[str] = None,
-                        compression: Compression = Compression.NONE,
-                        group: Optional[str] = None,
-                        stream_id: Optional[str] = None,
-                        name: Optional[str] = None,
-                        material_params: Optional[dict[str, float]] = None) -> None:
+    def send_numpy_mask(
+        self,
+        channel: int,
+        array,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         """Send a numpy mask array.
 
         If the array dtype is ``uint8``, sends as ``mono8`` (1 byte/pixel).
         If ``float32``, sends as ``float32`` (4 bytes/pixel).
         Otherwise, casts to ``uint8``.
-
-        The *fmt* parameter overrides automatic format detection when set.
         """
         import numpy as np
 
         h, w = array.shape[:2]
-        if fmt is not None:
-            resolved_fmt = fmt
-        elif array.dtype == np.float32:
-            resolved_fmt = "float32"
+        if array.dtype == np.float32:
+            fmt = "float32"
         elif array.dtype == np.uint8:
-            resolved_fmt = "mono8"
+            fmt = "mono8"
         else:
             array = array.astype(np.uint8)
-            resolved_fmt = "mono8"
+            fmt = "mono8"
         if not array.flags["C_CONTIGUOUS"]:
             array = np.ascontiguousarray(array)
-        self.send_mask(channel, array.tobytes(), w, h, fmt=resolved_fmt,
-                       compression=compression, metadata=metadata, group=group,
-                       stream_id=stream_id, name=name,
-                       material_params=material_params)
+        self.send_mask(
+            channel,
+            array.tobytes(),
+            w,
+            h,
+            fmt=fmt,
+            metadata=metadata,
+            group=group,
+            stream_id=stream_id,
+            name=name,
+        )
 
-    def send_motion(self, channel: int, motion_bytes: bytes,
-                    width: int, height: int,
-                    metadata: Optional[dict] = None,
-                    group: Optional[str] = None,
-                    role: Optional[str] = None,
-                    stream_id: Optional[str] = None,
-                    name: Optional[str] = None) -> None:
+    def send_motion(
+        self,
+        channel: int,
+        motion_bytes: bytes,
+        width: int,
+        height: int,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         """Send raw motion-vector data (float32 XY per pixel).
 
         Args:
@@ -463,25 +656,44 @@ class StreamSender:
         if name is not None:
             meta["name"] = name
         msg.set_metadata_string(json.dumps(meta))
-        msg.payload = motion_bytes if isinstance(motion_bytes, bytes) else bytes(motion_bytes)
+        msg.payload = (
+            motion_bytes if isinstance(motion_bytes, bytes) else bytes(motion_bytes)
+        )
         self._send_msg(msg)
 
-    def send_numpy_motion(self, channel: int, array, metadata: Optional[dict] = None,
-                          group: Optional[str] = None, role: Optional[str] = None,
-                          stream_id: Optional[str] = None,
-                          name: Optional[str] = None) -> None:
+    def send_numpy_motion(
+        self,
+        channel: int,
+        array,
+        metadata: Optional[dict] = None,
+        group: Optional[str] = None,
+        role: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
         """Send a numpy float32 motion-vector array. Expects shape (H, W, 2)."""
         h, w = array.shape[:2]
-        self.send_motion(channel, array.tobytes(), w, h,
-                         metadata=metadata, group=group, role=role,
-                         stream_id=stream_id, name=name)
+        self.send_motion(
+            channel,
+            array.tobytes(),
+            w,
+            h,
+            metadata=metadata,
+            group=group,
+            role=role,
+            stream_id=stream_id,
+            name=name,
+        )
 
     # ── Capture directory replay ──────────────────────────────────────
 
-    def send_capture_dir(self, capture_dir: Union[str, Path],
-                         channel: int = 0,
-                         fps: float = 0,
-                         max_frames: int = 0) -> int:
+    def send_capture_dir(
+        self,
+        capture_dir: Union[str, Path],
+        channel: int = 0,
+        fps: float = 0,
+        max_frames: int = 0,
+    ) -> int:
         """
         Send frames from a CameraCapture serialized directory to UE.
 
