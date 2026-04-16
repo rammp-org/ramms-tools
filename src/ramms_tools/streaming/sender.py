@@ -54,8 +54,8 @@ Non-blocking mode (default)::
     sender.connect()
 
     # send_image / send_depth etc. are non-blocking.
-    # If the queue is full the oldest message on the same channel is dropped,
-    # keeping the latest frame per channel.
+    # If the queue is full the oldest queued message is dropped (FIFO eviction),
+    # keeping the most recently enqueued frame.
     sender.send_numpy_image(channel=0, array=img, group="wrist", role="color")
 
     # Synchronous mode (legacy behaviour) — blocks on each send:
@@ -90,9 +90,11 @@ class StreamSender:
         host:        Server IP address.
         port:        Server TCP port.
         queue_size:  Max queued messages. 0 = synchronous (blocking) mode.
-                     When the queue is full, the oldest message on the same
-                     channel is evicted so the newest frame always wins.
-        num_workers: Number of background send threads (only when queue_size > 0).
+                     When the queue is full the oldest queued message is evicted
+                     (regardless of channel) so the newest frame always wins.
+        num_workers: Reserved for future use — currently clamped to 1.
+                     A single worker thread sends from the queue to avoid
+                     interleaved writes on the TCP socket.
     """
 
     def __init__(
@@ -107,14 +109,22 @@ class StreamSender:
         self._sock: Optional[socket.socket] = None
         self._seq: dict[int, int] = {}  # per-channel sequence counter
 
-        # Queue / worker config
+        # Queue / worker config — enforce single worker to avoid interleaved
+        # sendall() calls on the same TCP socket (would corrupt framing).
         self._queue_size = max(queue_size, 0)
-        self._num_workers = max(num_workers, 1) if self._queue_size > 0 else 0
+        self._num_workers = 1 if self._queue_size > 0 else 0
+        if num_workers > 1:
+            logger.warning(
+                "StreamSender: num_workers clamped to 1 (multiple workers "
+                "would interleave writes on the TCP socket)"
+            )
         self._send_queue: Optional[queue.Queue] = None
         self._workers: list[threading.Thread] = []
         self._shutdown_event = threading.Event()
+        self._send_lock = threading.Lock()  # guards _sock.sendall in sync mode
 
-        # Stats (read-only from caller, updated atomically)
+        # Stats — guarded by _drop_lock for thread safety
+        self._drop_lock = threading.Lock()
         self.dropped_frames: int = 0
 
     # ── Connection ────────────────────────────────────────────────────
@@ -200,11 +210,21 @@ class StreamSender:
             except queue.Empty:
                 continue
             try:
-                if self._sock is not None:
-                    self._sock.sendall(msg.serialize())
+                sock = self._sock
+                if sock is not None:
+                    sock.sendall(msg.serialize())
             except OSError as exc:
                 logger.warning("StreamSender send error: %s", exc)
                 self._shutdown_event.set()
+                # Transition to disconnected so is_connected() returns False
+                # and callers get a clear signal instead of silently enqueuing.
+                sock = self._sock
+                self._sock = None
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
                 break
 
     def _send_msg(self, msg: StreamMessage) -> None:
@@ -214,10 +234,11 @@ class StreamSender:
 
         # Synchronous mode — direct blocking send (legacy behaviour)
         if self._send_queue is None:
-            self._sock.sendall(msg.serialize())
+            with self._send_lock:
+                self._sock.sendall(msg.serialize())
             return
 
-        # Non-blocking mode — try to enqueue, evict oldest on same channel if full
+        # Non-blocking mode — try to enqueue, evict oldest if full
         try:
             self._send_queue.put_nowait(msg)
         except queue.Full:
@@ -226,12 +247,14 @@ class StreamSender:
                 self._send_queue.get_nowait()
             except queue.Empty:
                 pass
-            self.dropped_frames += 1
+            with self._drop_lock:
+                self.dropped_frames += 1
             try:
                 self._send_queue.put_nowait(msg)
             except queue.Full:
                 # Queue still full (shouldn't happen after eviction), drop silently
-                self.dropped_frames += 1
+                with self._drop_lock:
+                    self.dropped_frames += 1
 
     def send_image(
         self,
@@ -305,8 +328,14 @@ class StreamSender:
         role: Optional[str] = None,
         stream_id: Optional[str] = None,
         name: Optional[str] = None,
+        material_params: Optional[dict[str, float]] = None,
     ) -> None:
-        """Send a numpy array as an image.  Expects shape (H, W, 4) uint8 BGRA."""
+        """Send a numpy array as an image.
+
+        Supported shapes:
+          - ``(H, W, 4)`` uint8 BGRA → fmt ``"bgra8"``
+          - ``(H, W, 3)`` uint8 RGB  → fmt ``"rgb8"``
+        """
         h, w = array.shape[:2]
         channels = array.shape[2] if array.ndim == 3 else 1
         fmt = "rgb8" if channels == 3 else "bgra8"
@@ -321,6 +350,7 @@ class StreamSender:
             role=role,
             stream_id=stream_id,
             name=name,
+            material_params=material_params,
         )
 
     def send_depth(
@@ -581,27 +611,35 @@ class StreamSender:
         self,
         channel: int,
         array,
+        fmt: Optional[str] = None,
+        compression: Compression = Compression.NONE,
         metadata: Optional[dict] = None,
         group: Optional[str] = None,
         stream_id: Optional[str] = None,
         name: Optional[str] = None,
+        material_params: Optional[dict[str, float]] = None,
     ) -> None:
         """Send a numpy mask array.
 
-        If the array dtype is ``uint8``, sends as ``mono8`` (1 byte/pixel).
-        If ``float32``, sends as ``float32`` (4 bytes/pixel).
-        Otherwise, casts to ``uint8``.
+        If *fmt* is not provided, it is inferred from the array dtype:
+          - ``uint8``   → ``"mono8"`` (1 byte/pixel)
+          - ``float32`` → ``"float32"`` (4 bytes/pixel)
+          - Other       → cast to ``uint8``, sent as ``"mono8"``
+
+        All other parameters (compression, material_params, etc.) are
+        forwarded to ``send_mask()`` for full parity with the raw API.
         """
         import numpy as np
 
         h, w = array.shape[:2]
-        if array.dtype == np.float32:
-            fmt = "float32"
-        elif array.dtype == np.uint8:
-            fmt = "mono8"
-        else:
-            array = array.astype(np.uint8)
-            fmt = "mono8"
+        if fmt is None:
+            if array.dtype == np.float32:
+                fmt = "float32"
+            elif array.dtype == np.uint8:
+                fmt = "mono8"
+            else:
+                array = array.astype(np.uint8)
+                fmt = "mono8"
         if not array.flags["C_CONTIGUOUS"]:
             array = np.ascontiguousarray(array)
         self.send_mask(
@@ -610,10 +648,12 @@ class StreamSender:
             w,
             h,
             fmt=fmt,
+            compression=compression,
             metadata=metadata,
             group=group,
             stream_id=stream_id,
             name=name,
+            material_params=material_params,
         )
 
     def send_motion(
