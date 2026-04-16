@@ -49,8 +49,8 @@ Usage::
 
 Non-blocking mode (default)::
 
-    # Queue size and worker threads are configurable
-    sender = StreamSender("127.0.0.1", 30030, queue_size=4, num_workers=1)
+    # Queue size is configurable
+    sender = StreamSender("127.0.0.1", 30030, queue_size=4)
     sender.connect()
 
     # send_image / send_depth etc. are non-blocking.
@@ -92,9 +92,11 @@ class StreamSender:
         queue_size:  Max queued messages. 0 = synchronous (blocking) mode.
                      When the queue is full the oldest queued message is evicted
                      (regardless of channel) so the newest frame always wins.
-        num_workers: Reserved for future use — currently clamped to 1.
-                     A single worker thread sends from the queue to avoid
-                     interleaved writes on the TCP socket.
+
+    Note:
+        A single background worker thread is used for non-blocking mode.
+        Multiple workers are not supported (would interleave ``sendall()``
+        on the same TCP socket, corrupting message framing).
     """
 
     def __init__(
@@ -102,22 +104,15 @@ class StreamSender:
         host: str = "127.0.0.1",
         port: int = 30030,
         queue_size: int = 4,
-        num_workers: int = 1,
     ):
         self.host = host
         self.port = port
         self._sock: Optional[socket.socket] = None
         self._seq: dict[int, int] = {}  # per-channel sequence counter
 
-        # Queue / worker config — enforce single worker to avoid interleaved
-        # sendall() calls on the same TCP socket (would corrupt framing).
+        # Queue / worker config — single worker to avoid interleaved writes.
         self._queue_size = max(queue_size, 0)
         self._num_workers = 1 if self._queue_size > 0 else 0
-        if num_workers > 1:
-            logger.warning(
-                "StreamSender: num_workers clamped to 1 (multiple workers "
-                "would interleave writes on the TCP socket)"
-            )
         self._send_queue: Optional[queue.Queue] = None
         self._workers: list[threading.Thread] = []
         self._shutdown_event = threading.Event()
@@ -162,31 +157,59 @@ class StreamSender:
     def is_connected(self) -> bool:
         return self._sock is not None
 
-    def disconnect(self) -> None:
+    def disconnect(self, flush: bool = False, flush_timeout: float = 10.0) -> None:
+        """Disconnect and stop the worker thread.
+
+        Args:
+            flush:         If True, wait for the worker to drain all queued
+                           messages before shutting down. If False (default),
+                           queued messages are discarded.
+            flush_timeout: Max seconds to wait for the flush to complete.
+                           Ignored when *flush* is False.
+
+        Note:
+            When *flush* is False, any messages still in the queue are dropped.
+            Use ``flush=True`` if you need to guarantee delivery of enqueued
+            frames before disconnecting.
+        """
+        if flush and self._send_queue is not None:
+            # Wait until the queue is empty (worker drains it)
+            deadline = time.monotonic() + flush_timeout
+            while not self._send_queue.empty():
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "StreamSender flush timed out — %d message(s) remaining",
+                        self._send_queue.qsize(),
+                    )
+                    break
+                time.sleep(0.05)
+
         # Signal workers to stop
         self._shutdown_event.set()
 
-        # Drain the queue so workers don't block on put
-        if self._send_queue is not None:
-            while not self._send_queue.empty():
-                try:
-                    self._send_queue.get_nowait()
-                except queue.Empty:
-                    break
-
-        # Wait for workers to finish current send
-        for t in self._workers:
-            t.join(timeout=5.0)
-        self._workers.clear()
-        self._send_queue = None
-
-        if self._sock:
+        # Close/shutdown the socket FIRST so a worker blocked in sendall()
+        # gets an OSError and unblocks, rather than hanging until join timeout.
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
             try:
-                self._sock.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            self._sock.close()
-            self._sock = None
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        # Wait for workers to exit (they should be unblocked now)
+        for t in self._workers:
+            t.join(timeout=5.0)
+            if t.is_alive():
+                logger.warning("StreamSender worker %s did not stop", t.name)
+        self._workers.clear()
+
+        # Safe to clear the queue now — no workers are running
+        self._send_queue = None
 
     def __enter__(self) -> "StreamSender":
         self.connect()
@@ -205,8 +228,11 @@ class StreamSender:
     def _send_worker(self) -> None:
         """Background thread: drains the queue and does blocking socket sends."""
         while not self._shutdown_event.is_set():
+            q = self._send_queue
+            if q is None:
+                break
             try:
-                msg = self._send_queue.get(timeout=0.5)
+                msg = q.get(timeout=0.5)
             except queue.Empty:
                 continue
             try:
@@ -216,8 +242,7 @@ class StreamSender:
             except OSError as exc:
                 logger.warning("StreamSender send error: %s", exc)
                 self._shutdown_event.set()
-                # Transition to disconnected so is_connected() returns False
-                # and callers get a clear signal instead of silently enqueuing.
+                # Transition to disconnected so is_connected() returns False.
                 sock = self._sock
                 self._sock = None
                 if sock is not None:
@@ -225,7 +250,10 @@ class StreamSender:
                         sock.close()
                     except OSError:
                         pass
+                q.task_done()
                 break
+            else:
+                q.task_done()
 
     def _send_msg(self, msg: StreamMessage) -> None:
         """Enqueue a message (non-blocking) or send synchronously if queue_size=0."""
