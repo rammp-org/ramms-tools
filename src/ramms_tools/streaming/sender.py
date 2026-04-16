@@ -161,7 +161,7 @@ class StreamSender:
         """Disconnect and stop the worker thread.
 
         Args:
-            flush:         If True, wait for the worker to drain all queued
+            flush:         If True, wait for the worker to send all queued
                            messages before shutting down. If False (default),
                            queued messages are discarded.
             flush_timeout: Max seconds to wait for the flush to complete.
@@ -172,22 +172,30 @@ class StreamSender:
             Use ``flush=True`` if you need to guarantee delivery of enqueued
             frames before disconnecting.
         """
-        if flush and self._send_queue is not None:
-            # Wait until the queue is empty (worker drains it)
-            deadline = time.monotonic() + flush_timeout
-            while not self._send_queue.empty():
-                if time.monotonic() >= deadline:
-                    logger.warning(
-                        "StreamSender flush timed out — %d message(s) remaining",
-                        self._send_queue.qsize(),
-                    )
-                    break
-                time.sleep(0.05)
+        q = self._send_queue
+
+        if flush and q is not None:
+            # Block until every enqueued item has been dequeued AND task_done()
+            # has been called — this means the worker has finished sendall()
+            # for each item, not just dequeued it.
+            done = threading.Event()
+
+            def _join_waiter():
+                q.join()
+                done.set()
+
+            t = threading.Thread(target=_join_waiter, daemon=True)
+            t.start()
+            if not done.wait(timeout=flush_timeout):
+                logger.warning(
+                    "StreamSender flush timed out — %d task(s) remaining",
+                    q.unfinished_tasks,
+                )
 
         # Signal workers to stop
         self._shutdown_event.set()
 
-        # Close/shutdown the socket FIRST so a worker blocked in sendall()
+        # Close/shutdown the socket so a worker blocked in sendall()
         # gets an OSError and unblocks, rather than hanging until join timeout.
         sock = self._sock
         self._sock = None
@@ -263,16 +271,22 @@ class StreamSender:
         # Synchronous mode — direct blocking send (legacy behaviour)
         if self._send_queue is None:
             with self._send_lock:
-                self._sock.sendall(msg.serialize())
+                sock = self._sock
+                if sock is None:
+                    raise RuntimeError("Not connected")
+                sock.sendall(msg.serialize())
             return
 
         # Non-blocking mode — try to enqueue, evict oldest if full
         try:
             self._send_queue.put_nowait(msg)
         except queue.Full:
-            # Evict the oldest item and retry
+            # Evict the oldest item and retry.  Call task_done() for the
+            # evicted item so the unfinished_tasks counter stays consistent
+            # (required for Queue.join()-based flushing).
             try:
                 self._send_queue.get_nowait()
+                self._send_queue.task_done()
             except queue.Empty:
                 pass
             with self._drop_lock:
@@ -360,13 +374,29 @@ class StreamSender:
     ) -> None:
         """Send a numpy array as an image.
 
-        Supported shapes:
+        Supported inputs:
           - ``(H, W, 4)`` uint8 BGRA → fmt ``"bgra8"``
           - ``(H, W, 3)`` uint8 RGB  → fmt ``"rgb8"``
+
+        Raises:
+            ValueError: If *array* is not 3-dimensional with 3 or 4 channels,
+                        or if the dtype is not ``uint8``.
         """
+        import numpy as np
+
+        if array.ndim != 3 or array.shape[2] not in (3, 4):
+            raise ValueError(
+                f"send_numpy_image expects shape (H, W, 3) or (H, W, 4), "
+                f"got {array.shape!r}. For grayscale/mono data use "
+                f"send_numpy_mask() or send_data()."
+            )
+        if array.dtype != np.uint8:
+            raise ValueError(
+                f"send_numpy_image expects uint8 dtype, got {array.dtype}. "
+                f"Cast the array first or use send_data() with an explicit fmt."
+            )
         h, w = array.shape[:2]
-        channels = array.shape[2] if array.ndim == 3 else 1
-        fmt = "rgb8" if channels == 3 else "bgra8"
+        fmt = "rgb8" if array.shape[2] == 3 else "bgra8"
         self.send_image(
             channel,
             array.tobytes(),
