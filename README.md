@@ -20,10 +20,14 @@ pip install -e '.[exr]'
 
 - Python ≥ 3.10
 - Unreal Engine running with the **Remote Control API** plugin enabled (default port 30010)
+  - UE 5.6+ refuses remote function calls that are not allow-listed; the RAMMS project ships
+    `Config/DefaultRemoteControl.ini` listing the bridges, robot components and engine getters
+    these tools call. Add an entry there when you call something new.
 - For robot control: the **RammsCore** plugin with `URammsCoreBridge`
 - For skeletal pose control: the **RammsCore** plugin with `URammsSkeletalPoseComponent`
 - For UI features: the **RammsUI** plugin with `URammsRemoteBridge`
 - For binary streaming: the **RammsStreaming** plugin (TCP port 30030)
+- For world generation: the **RammsWorldGen** plugin with `URammsWorldGenBridge`
 - The **Textual** TUI library (`pip install 'ramms-tools[tui]'` or `pip install textual`)
 
 ## Library Usage
@@ -69,6 +73,44 @@ local_vel = world_to_local({"x": vx, "y": vy, "z": vz}, euler)
 # Shortest angular difference (handles ±180° wrapping)
 delta = angle_diff(170, -170)  # → -20
 ```
+
+### World Generation
+
+`ramms_tools.worldgen` drives the **RammsWorldGen** plugin — seed-driven
+pedestrian / wheelchair environments (street grids, curb ramps, entrances,
+hazards, parks, indoor layouts) that come with a ground-truth manifest of
+routes, clear widths and accessibility issues. It works in the editor and in
+a running game.
+
+```python
+from ramms_tools.worldgen import WorldGen
+
+wg = WorldGen()                              # localhost:30010
+print(wg.world())                            # {'map': 'Map_Gen_Downtown', 'play': False, 'generators': 1, ...}
+print([p["name"] for p in wg.describe_presets()])
+
+gen = wg.generator()                         # first ARammsWorldGenerator in the level (or wg.spawn("PRE_Downtown", 7))
+gen.set_params(HazardDensity=6.0, NonCompliance=0.5)   # overrides on top of the preset
+gen.generate(seed=42)                        # blocks until the manifest is published
+
+m = gen.manifest()                           # ramms_tools.worldgen.Manifest
+print(m.summary())
+for f in m.issues:                           # non-compliant features
+    print(f.kind, f.subtype, f.issue, f.measure, "/", f.threshold, f.location)
+route = m.routes[0]
+print(route.name, route.min_clear_width, route.waypoints(spacing=100))
+start, yaw = m.suggested_start, m.suggested_start_yaw   # where to put the wheelchair
+
+# A dataset: one manifest per seed, written locally
+for seed, path in wg.batch("PRE_Park", range(1, 51), out_dir="data/park"):
+    print(seed, path)
+```
+
+`Manifest` also loads exported files (`Manifest.load("x.json")`) and offers
+`features_of(kind)`, `features_near(point, radius)`, `features_on_route(route)`,
+`routes_narrower_than(width)` and `issues_by_kind()` — no engine needed.
+The parameter names accepted by `set_params` are listed in the plugin's
+README (`Plugins/RammsWorldGen/README.md` in the RAMMS project).
 
 ## CLI Tools
 
@@ -416,6 +458,37 @@ Requires the `exr` optional dependency for capture replay:
 ```bash
 pip install 'ramms-tools[exr]'   # OpenEXR + Imath
 ```
+
+### `ramms-worldgen` — World Generation
+
+Drive RammsWorldGen from the shell: list presets and example maps, open a map,
+spawn / regenerate / randomize a generator, tweak parameters, fetch or export
+the ground-truth manifest, and build datasets of many seeds.
+
+```bash
+ramms-worldgen world                               # current map, generator count
+ramms-worldgen presets                             # PRE_Downtown, PRE_Suburban, PRE_Park, PRE_Indoor_Home, PRE_Indoor_Office
+ramms-worldgen maps                                # /Game/Maps/Gen/Map_Gen_*
+ramms-worldgen open Map_Gen_Suburban               # editor: load the level; game: travel to it
+ramms-worldgen spawn --preset PRE_Downtown --seed 7 --generate
+ramms-worldgen generate --seed 42                  # regenerate, wait, print a summary
+ramms-worldgen generate --preset PRE_Park --set FoliageDensity=2 --player-start
+ramms-worldgen randomize
+ramms-worldgen status
+ramms-worldgen params                              # resolved parameter block
+ramms-worldgen params --set HazardDensity=6 --set NonCompliance=0.5
+ramms-worldgen params --clear                      # back to the preset's values
+ramms-worldgen manifest --issues --routes          # summary + non-compliant features + routes
+ramms-worldgen manifest --out downtown_42.json     # save locally
+ramms-worldgen manifest --export                   # the engine writes it under Saved/WorldGen too
+ramms-worldgen batch --preset PRE_Park --seeds 1-50 --out data/park
+ramms-worldgen inspect data/park/PRE_Park_3.json --issues   # offline
+ramms-worldgen cleanup
+```
+
+`--generator NAME` picks a generator by actor path, name or label when a level
+has several; `--json` switches `world`, `presets`, `status`, `params`,
+`manifest` and `inspect` to machine-readable output.
 
 ## Common Options
 
