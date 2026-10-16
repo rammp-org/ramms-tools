@@ -69,3 +69,16 @@ def test_summary_and_roundtrip(tmp_path):
     assert s["features"] == 3 and s["routes"] == 2 and s["issues"] == 1 and s["narrowest_route_cm"] == 60
     p = m.save(tmp_path / "m.json")
     assert Manifest.load(p).summary() == s
+
+
+def test_kind_casing_is_canonical():
+    # A cooked build can return FName strings in a different case than the editor.
+    from ramms_tools.worldgen.manifest import Manifest, canonical_name
+    m = Manifest.from_json({"features": [
+        {"kind": "door", "subtype": "standard", "location": {"x": 0, "y": 0, "z": 0}},
+        {"kind": "Door", "subtype": "Standard", "location": {"x": 1, "y": 0, "z": 0}},
+    ], "routes": []})
+    assert m.kinds() == {"Door": 2}
+    assert len(m.features_of("DOOR", "standard")) == 2
+    assert canonical_name("checkoutlane") == "CheckoutLane"
+    assert canonical_name("store.Shelf") == "Store.Shelf"

@@ -36,6 +36,24 @@ def _quat_yaw(q: dict) -> float:
     return math.degrees(math.atan2(siny_cosp, cosy_cosp))
 
 
+# Kinds the plugin writes. Unreal FNames compare case-insensitively and a cooked build can hand
+# back a different casing than the editor ("door" vs "Door"), so names are canonicalised here.
+KNOWN_KINDS = (
+    "Aisle", "Building", "CarPark", "CheckoutLane", "Crossing", "CurbRamp", "Decor", "Door", "Driveway",
+    "Entrance", "Furniture", "Hazard", "Path", "Pond", "Prop", "Ramp", "Room", "Shrub", "Stall", "Step",
+    "Surface", "Terrain", "Threshold", "Tree", "Vehicle", "Water",
+)
+_CANON = {k.lower(): k for k in KNOWN_KINDS}
+
+
+def canonical_name(name: str) -> str:
+    """Canonical casing for a kind / subtype name: a known kind as spelled above, else first letter upper."""
+    name = str(name or "")
+    if not name:
+        return name
+    return _CANON.get(name.lower()) or (name[0].upper() + name[1:])
+
+
 @dataclass
 class Feature:
     """One accessibility-relevant object in the world."""
@@ -68,8 +86,8 @@ class Feature:
                     yaw = _quat_yaw(rot) if ("w" in rot or "W" in rot) else float(rot.get("yaw", rot.get("Yaw", 0.0)))
         g = lambda *names, default=None: next((d[n] for n in names if n in d), default)
         return cls(
-            kind=str(g("kind", "Kind", default="")),
-            subtype=str(g("subtype", "Subtype", default="") or ""),
+            kind=canonical_name(g("kind", "Kind", default="")),
+            subtype=canonical_name(g("subtype", "Subtype", default="") or ""),
             location=loc, yaw=yaw,
             size=_vec(g("size", "Size", "extent", "Extent", default={}) or {}),
             compliant=bool(g("bCompliant", "compliant", "Compliant", default=True)),
@@ -192,7 +210,9 @@ class Manifest:
     # ── queries ─────────────────────────────────────────────────────
 
     def features_of(self, kind: str, subtype: Optional[str] = None) -> list[Feature]:
-        return [f for f in self.features if f.kind == kind and (subtype is None or f.subtype == subtype)]
+        """Features of a kind (and optionally subtype); matching ignores case, as Unreal names do."""
+        k, st = kind.lower(), None if subtype is None else subtype.lower()
+        return [f for f in self.features if f.kind.lower() == k and (st is None or f.subtype.lower() == st)]
 
     @property
     def issues(self) -> list[Feature]:

@@ -110,7 +110,33 @@ for seed, path in wg.batch("PRE_Park", range(1, 51), out_dir="data/park"):
 `features_of(kind)`, `features_near(point, radius)`, `features_on_route(route)`,
 `routes_narrower_than(width)` and `issues_by_kind()` — no engine needed.
 The parameter names accepted by `set_params` are listed in the plugin's
-README (`Plugins/RammsWorldGen/README.md` in the RAMMS project).
+README ([rammp-org/ramms-worldgen](https://github.com/rammp-org/ramms-worldgen),
+a submodule of ramms-sim at `Plugins/RammsWorldGen`).
+
+#### Editor, PIE and packaged builds
+
+The same calls work in all three; the bridge targets the PIE / game world when
+one is running, and the editor world otherwise.
+
+- **Editor / PIE**: Remote Control is on by default (port 30010).
+- **Packaged or `-game` builds**: Unreal turns the Remote Control web server
+  off outside the editor. Launch with `-RCWebControlEnable`, e.g.
+  `Ramms.exe Map_Gen_Downtown -RCWebControlEnable -windowed`.
+  Cook the maps you want to drive (`-map=Map_Gen_Downtown+...`); the presets,
+  graphs and palette ship in the plugin and are cooked with them.
+- **Headless** (cluster / CI): use `-RenderOffScreen`, not `-nullrhi` —
+  Remote Control does not start when the engine cannot render.
+- `open_map` loads the level in the editor and travels (`OpenLevel`) in PIE or
+  a game; actor paths change afterwards, so call `generators()` again.
+
+`examples/worldgen_smoke.py` runs discovery, generation, determinism,
+parameter overrides, manifest export, a small batch and a map travel against
+whatever is listening, and exits non-zero on the first failure:
+
+```bash
+python examples/worldgen_smoke.py                    # editor / PIE on localhost
+python examples/worldgen_smoke.py --host 10.0.0.5    # a packaged build elsewhere
+```
 
 ## CLI Tools
 
