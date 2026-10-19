@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ramms-tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python tools for interacting with RAMMS-based Unreal Engine projects via Remote Control API"
 readme = "README.md"
 license = {text = "MIT"}
@@ -30,6 +30,7 @@ tui = ["textual>=8.0.0"]
 compression = ["Pillow>=10.0.0", "lz4>=4.0.0"]
 exr = ["OpenEXR>=3.0.0", "imath>=0.0.1"]
 all = ["textual>=8.0.0", "Pillow>=10.0.0", "lz4>=4.0.0", "OpenEXR>=3.0.0", "imath>=0.0.1"]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 ramms-pose = "ramms_tools.scripts.control_pose:main"
@@ -42,6 +43,7 @@ ramms-status = "ramms_tools.scripts.set_status:main"
 ramms-imu = "ramms_tools.scripts.stream_imu:main"
 ramms-stream-test = "ramms_tools.scripts.stream_test:main"
 ramms-tui = "ramms_tools.scripts.tui:main"
+ramms-worldgen = "ramms_tools.scripts.worldgen_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
