@@ -98,6 +98,14 @@ class Feature:
             raw=d,
         )
 
+    def crossing_ends(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """For a Crosswalk: the two ends of its centre line at the curbs (size.x is curb to curb, yaw
+        points along the crossing)."""
+        h = self.size[0] * 0.5
+        dx, dy = math.cos(math.radians(self.yaw)) * h, math.sin(math.radians(self.yaw)) * h
+        x, y, z = self.location
+        return (x - dx, y - dy, z), (x + dx, y + dy, z)
+
     def distance_to(self, p: tuple[float, float, float]) -> float:
         return math.dist(self.location[:2], p[:2])
 
@@ -213,6 +221,15 @@ class Manifest:
         """Features of a kind (and optionally subtype); matching ignores case, as Unreal names do."""
         k, st = kind.lower(), None if subtype is None else subtype.lower()
         return [f for f in self.features if f.kind.lower() == k and (st is None or f.subtype.lower() == st)]
+
+    def crosswalks(self, step_free: Optional[bool] = None) -> list[Feature]:
+        """Street crossings that join two sidewalks. step_free=True: only those with a curb ramp at both
+        ends (subtype Ramped or SteepRamp - SteepRamp is too steep for some chairs); False: the rest
+        (OneRamp, NoRamps)."""
+        out = self.features_of("Crosswalk")
+        if step_free is None:
+            return out
+        return [f for f in out if (f.subtype.lower() in ("ramped", "steepramp")) == step_free]
 
     @property
     def issues(self) -> list[Feature]:

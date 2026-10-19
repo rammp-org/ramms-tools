@@ -81,6 +81,15 @@ def main() -> int:
     print(f"        {_brief(a)}")
     _check(len(a.features) > 0 and len(a.routes) > 0, f"seed {args.seed} generated ({len(a.features)} features, {len(a.routes)} routes)")
 
+    if a.features_of("Crosswalk") or str(a.scene_kind).lower() not in ("indoor", ""):
+        # Street scenes: every crossing that joins two sidewalks is recorded, and a step-free one has a
+        # curb ramp at each end (the ramp's top sits a ramp run, about 1.8 m, back from the curb).
+        cws = a.crosswalks()
+        free = a.crosswalks(step_free=True)
+        missing = [f for f in free if not all(any(r.kind == "CurbRamp" for r in a.features_near(e, 300.0)) for e in f.crossing_ends())]
+        print(f"        crosswalks: {len(cws)} ({len(free)} step-free), subtypes {sorted({f.subtype for f in cws})}")
+        _check(len(cws) > 0 and len(free) > 0 and not missing, f"{len(free)} step-free crosswalks, each with a curb ramp at both ends")
+
     gen.generate(seed=args.seed + 1, wait=True)
     b = gen.manifest()
     print(f"        {_brief(b)}")

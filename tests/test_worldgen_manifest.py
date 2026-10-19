@@ -82,3 +82,21 @@ def test_kind_casing_is_canonical():
     assert len(m.features_of("DOOR", "standard")) == 2
     assert canonical_name("checkoutlane") == "CheckoutLane"
     assert canonical_name("store.Shelf") == "Store.Shelf"
+
+
+def test_crosswalks():
+    # One Crosswalk per street crossing; size.x is curb to curb and yaw runs along the crossing.
+    cw = lambda sub, x, y, yaw: {"kind": "crosswalk", "subtype": sub, "location": {"x": x, "y": y, "z": -15},
+                                 "rotation": {"pitch": 0, "yaw": yaw, "roll": 0}, "size": {"x": 800, "y": 300, "z": 1},
+                                 "bCompliant": True, "issue": "None", "measure": 800, "threshold": 0}
+    m = Manifest.from_json({"features": [
+        cw("ramped", 0, 0, 90), cw("SteepRamp", 1000, 0, 0), cw("OneRamp", 2000, 0, 0), cw("NoRamps", 3000, 0, 0),
+        {"kind": "CurbRamp", "subtype": "Standard", "location": {"x": 0, "y": 580, "z": 0}},
+    ], "routes": []})
+    assert m.kinds()["Crosswalk"] == 4
+    assert len(m.crosswalks()) == 4
+    assert [f.subtype for f in m.crosswalks(step_free=True)] == ["Ramped", "SteepRamp"]
+    assert [f.subtype for f in m.crosswalks(step_free=False)] == ["OneRamp", "NoRamps"]
+    a, b = m.crosswalks()[0].crossing_ends()
+    assert math.dist(a, (0, -400, -15)) < 1e-6 and math.dist(b, (0, 400, -15)) < 1e-6
+    assert [f.kind for f in m.features_near(b, 200)] == ["CurbRamp"]
