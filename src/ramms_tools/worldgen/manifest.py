@@ -39,7 +39,7 @@ def _quat_yaw(q: dict) -> float:
 # Kinds the plugin writes. Unreal FNames compare case-insensitively and a cooked build can hand
 # back a different casing than the editor ("door" vs "Door"), so names are canonicalised here.
 KNOWN_KINDS = (
-    "Aisle", "Building", "CarPark", "CheckoutLane", "Crossing", "CurbRamp", "Decor", "Door", "Driveway",
+    "Aisle", "Building", "CarPark", "CheckoutLane", "Crossing", "Crosswalk", "CurbRamp", "Decor", "Door", "Driveway",
     "Entrance", "Furniture", "Hazard", "Path", "Pond", "Prop", "Ramp", "Room", "Shrub", "Stall", "Step",
     "Surface", "Terrain", "Threshold", "Tree", "Vehicle", "Water",
 )
