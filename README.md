@@ -101,15 +101,36 @@ route = m.routes[0]
 print(route.name, route.min_clear_width, route.waypoints(spacing=100))
 start, yaw = m.suggested_start, m.suggested_start_yaw   # where to put the wheelchair
 
-# A dataset: one manifest per seed, written locally
+# Street crossings: one Crosswalk feature per crossing; step-free ones have a curb ramp at both ends
+for cw in m.crosswalks(step_free=True):
+    a, b = cw.crossing_ends()                # centre line at the two curbs
+    print(cw.subtype, a, b)                  # Ramped / SteepRamp (OneRamp, NoRamps with step_free=False)
+
+# Another asset set: palettes swap the meshes, the layout stays the preset's
+print(wg.palettes())                         # ['/RammsWorldGen/Palettes/PAL_Default.PAL_Default', ...]
+gen.set_palette("PAL_UrbanVerse")            # "" = back to the preset's palette
+gen.generate(seed=42)
+m = gen.manifest()
+print(m.palette, m.sources())                # ... {'': 206, 'urbanverse': 209}
+for f in m.features_of("Prop"):
+    print(f.subtype, f.asset, f.source_uid)  # mesh placed, and its UrbanVerse uid when it came from there
+
+# A dataset: one manifest per seed, written locally (drops earlier overrides first)
 for seed, path in wg.batch("PRE_Park", range(1, 51), out_dir="data/park"):
     print(seed, path)
+for seed, path in wg.batch("PRE_Downtown", range(20), out_dir="data/dt_uv", palette="PAL_UrbanVerse"):
+    print(seed, path)                        # PRE_Downtown_PAL_UrbanVerse_<seed>.json
 ```
 
 `Manifest` also loads exported files (`Manifest.load("x.json")`) and offers
 `features_of(kind)`, `features_near(point, radius)`, `features_on_route(route)`,
-`routes_narrower_than(width)` and `issues_by_kind()` — no engine needed.
-The parameter names accepted by `set_params` are listed in the plugin's
+`routes_narrower_than(width)`, `crosswalks(step_free)`, `assets(kind)`,
+`sources()` and `issues_by_kind()` — no engine needed. For placed meshes,
+`location`/`size`/`yaw` describe the object's box (`location` is the centre of
+its base on the ground, not the mesh pivot; trees are located by their trunk); `asset` is the mesh placed and `source` where it came
+from (`urbanverse:<uid>|<category>`), both empty in manifests from before they were recorded.
+`set_params` takes numbers (bools as 0/1) and, for text parameters such as
+`Palette` and `FacadeStyles`, strings. The parameter names are listed in the plugin's
 README ([rammp-org/ramms-worldgen](https://github.com/rammp-org/ramms-worldgen),
 a submodule of ramms-sim at `Plugins/RammsWorldGen`).
 
@@ -122,15 +143,22 @@ one is running, and the editor world otherwise.
 - **Packaged or `-game` builds**: Unreal turns the Remote Control web server
   off outside the editor. Launch with `-RCWebControlEnable`, e.g.
   `Ramms.exe Map_Gen_Downtown -RCWebControlEnable -windowed`.
-  Cook the maps you want to drive (`-map=Map_Gen_Downtown+...`); the presets,
-  graphs and palette ship in the plugin and are cooked with them.
+  Cook the maps you want to drive (`-map=Map_Gen_Downtown+...`); the presets and
+  graphs ship in the plugin and are cooked with them. Palettes are only reached
+  through soft references, so ramms-sim cooks `/RammsWorldGen/Palettes` and
+  `/Game/UrbanVerse` explicitly (`DirectoriesToAlwaysCook` in
+  `Config/DefaultGame.ini`); `set_palette` in a packaged build only finds palettes cooked that way.
+- Generators spawned with `spawn(label=...)` are also tagged with the label, so
+  `generator("MyLabel")` works in packaged builds, which have no actor labels.
 - **Headless** (cluster / CI): use `-RenderOffScreen`, not `-nullrhi` —
   Remote Control does not start when the engine cannot render.
 - `open_map` loads the level in the editor and travels (`OpenLevel`) in PIE or
   a game; actor paths change afterwards, so call `generators()` again.
 
 `examples/worldgen_smoke.py` runs discovery, generation, determinism,
-parameter overrides, manifest export, a small batch and a map travel against
+parameter overrides, a palette switch and back (`--palette`, default
+`PAL_UrbanVerse`, skipped when it is not imported), the recorded assets,
+manifest export, a small batch and a map travel against
 whatever is listening, and exits non-zero on the first failure:
 
 ```bash
@@ -494,27 +522,34 @@ the ground-truth manifest, and build datasets of many seeds.
 ```bash
 ramms-worldgen world                               # current map, generator count
 ramms-worldgen presets                             # PRE_Downtown, PRE_Suburban, PRE_Park, PRE_Indoor_Home, PRE_Indoor_Office
+ramms-worldgen palettes                            # PAL_Default, PAL_UrbanVerse (once imported), ...
 ramms-worldgen maps                                # /Game/Maps/Gen/Map_Gen_*
 ramms-worldgen open Map_Gen_Suburban               # editor: load the level; game: travel to it
 ramms-worldgen spawn --preset PRE_Downtown --seed 7 --generate
 ramms-worldgen generate --seed 42                  # regenerate, wait, print a summary
 ramms-worldgen generate --preset PRE_Park --set FoliageDensity=2 --player-start
+ramms-worldgen generate --seed 42 --palette PAL_UrbanVerse   # UrbanVerse street furniture and cars
+ramms-worldgen generate --palette ""               # back to the preset's palette
 ramms-worldgen randomize
 ramms-worldgen status
 ramms-worldgen params                              # resolved parameter block
 ramms-worldgen params --set HazardDensity=6 --set NonCompliance=0.5
+ramms-worldgen params --set FacadeStyles=dt01,dt03  # text values are passed as strings
 ramms-worldgen params --clear                      # back to the preset's values
 ramms-worldgen manifest --issues --routes          # summary + non-compliant features + routes
 ramms-worldgen manifest --out downtown_42.json     # save locally
 ramms-worldgen manifest --export                   # the engine writes it under Saved/WorldGen too
 ramms-worldgen batch --preset PRE_Park --seeds 1-50 --out data/park
+ramms-worldgen batch --preset PRE_Downtown --seeds 1-20 --palette PAL_UrbanVerse --out data/dt_uv
 ramms-worldgen inspect data/park/PRE_Park_3.json --issues   # offline
 ramms-worldgen cleanup
 ```
 
 `--generator NAME` picks a generator by actor path, name or label when a level
-has several; `--json` switches `world`, `presets`, `status`, `params`,
-`manifest` and `inspect` to machine-readable output.
+has several; `--json` switches `world`, `presets`, `palettes`, `status`, `params`,
+`manifest` and `inspect` to machine-readable output. `batch` starts from the
+preset (earlier overrides are dropped unless `--keep-overrides`) and stops on an
+unknown `--set` name; `generate` and `params` warn and carry on.
 
 ## Common Options
 
