@@ -18,6 +18,12 @@ Remote Control with plain strings and numbers, and this module wraps that.
     for f in m.issues:
         print(f.kind, f.subtype, f.issue, f.location)
 
+    # another asset set (e.g. the UrbanVerse-100K palette, once imported in the editor)
+    print(wg.palettes())                             # ['/RammsWorldGen/Palettes/PAL_Default.PAL_Default', ...]
+    gen.set_palette("PAL_UrbanVerse")                # "" goes back to the preset's palette
+    gen.generate(seed=42)
+    print(gen.manifest().sources())                  # {'': 206, 'urbanverse': 209}
+
     # dataset: twenty downtown worlds, manifests on disk
     for seed, path in wg.batch("PRE_Downtown", range(20), out_dir="data/downtown"):
         print(seed, path)
@@ -32,7 +38,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional, Union
 
 from ramms_tools.unreal_remote import UnrealRemote, UnrealRemoteError
 from .manifest import Feature, Manifest, Route
@@ -40,6 +46,9 @@ from .manifest import Feature, Manifest, Route
 __all__ = ["WorldGen", "Generator", "Manifest", "Feature", "Route", "WorldGenError", "BRIDGE"]
 
 BRIDGE = "/Script/RammsWorldGen.Default__RammsWorldGenBridge"
+
+# A parameter value: numbers (bools as 0/1) for most, strings for Palette, FacadeStyles and other text parameters.
+ParamValue = Union[float, int, bool, str]
 
 
 class WorldGenError(UnrealRemoteError):
@@ -80,7 +89,8 @@ class Generator:
     def generate(self, seed: Optional[int] = None, wait: bool = True, timeout: float = 120.0) -> dict:
         """Regenerate (with a new seed when given). With wait=True, block until the manifest is published."""
         if not self.wg._call("Generate", GeneratorPath=self.path, Seed=-1 if seed is None else int(seed)):
-            raise WorldGenError(f"generator not found: {self.path}")
+            raise WorldGenError(f"could not generate with {self.path}: generator not found, or nothing to generate "
+                                "(no PCG graph on its preset?)")
         return self.wait(timeout) if wait else self.status()
 
     def randomize(self, wait: bool = True, timeout: float = 120.0) -> dict:
@@ -94,18 +104,24 @@ class Generator:
     def is_generating(self) -> bool:
         return bool(self.wg._call("IsGenerating", GeneratorPath=self.path))
 
-    def wait(self, timeout: float = 120.0, poll: float = 0.25) -> dict:
-        """Poll until generation finishes; returns the final status. Raises on timeout."""
+    def wait(self, timeout: float = 120.0, poll: float = 0.25, idle_grace: float = 3.0) -> dict:
+        """
+        Poll until generation finishes; returns the final status. Raises WorldGenError on timeout, and when the
+        generator sits idle for idle_grace seconds without a manifest for its current seed (the generation was
+        cancelled or failed, or never started) instead of returning a stale or empty world.
+        """
         t0 = time.monotonic()
         # Generation is scheduled on the next tick, so give it a moment to start before trusting "not generating".
         time.sleep(min(poll, 0.2))
         while True:
             st = self.status()
-            if not st.get("generating") and st.get("has_manifest") and st.get("manifest_seed") == st.get("seed"):
+            fresh = st.get("has_manifest") and st.get("manifest_seed") == st.get("seed")
+            if not st.get("generating") and fresh:
                 return st
-            if not st.get("generating") and time.monotonic() - t0 > 2.0 and not st.get("has_manifest"):
-                # Nothing running and nothing produced: the generator is idle (no preset / graph?).
-                return st
+            if not st.get("generating") and time.monotonic() - t0 > idle_grace:
+                why = "no manifest" if not st.get("has_manifest") else \
+                    f"the manifest is for seed {st.get('manifest_seed')}, not {st.get('seed')}"
+                raise WorldGenError(f"{self.path} is idle with {why} (generation cancelled or failed?)")
             if time.monotonic() - t0 > timeout:
                 raise WorldGenError(f"generation did not finish within {timeout:.0f}s: {st}")
             time.sleep(poll)
@@ -152,32 +168,66 @@ class Generator:
     def seed(self) -> int:
         return int(self.status().get("seed", 0))
 
-    def params(self) -> dict[str, float]:
-        """The resolved parameter block (preset + profile + overrides)."""
+    @property
+    def palette(self) -> str:
+        """Object path of the palette the next generation uses (the preset's unless set_palette() was called)."""
+        return self.status().get("palette", "")
+
+    def set_palette(self, palette: str) -> None:
+        """
+        Generate with another palette: a short name ("PAL_UrbanVerse") or an asset path; "" goes back to the
+        preset's. Takes effect on the next generate(); the manifest records it (Manifest.palette).
+        """
+        if not self.wg._call("SetPalette", GeneratorPath=self.path, Palette=palette):
+            raise WorldGenError(f"palette not found or generator missing: {palette!r} (see WorldGen.palettes())")
+
+    def params(self) -> dict[str, ParamValue]:
+        """The resolved parameter block (preset + profile + overrides): numbers, plus strings for text parameters."""
         return _as_json(self.wg._call("GetParamsJson", GeneratorPath=self.path)) or {}
 
-    def set_params(self, values: Optional[dict[str, float]] = None, **kwargs: float) -> dict:
+    def set_params(self, values: Optional[dict[str, ParamValue]] = None, strict: bool = False, **kwargs: ParamValue) -> dict:
         """
-        Override parameters by name (see the plugin README for the list). Takes effect on the next generate().
-        Returns {"applied": [...], "unknown": [...]}.
+        Override parameters by name (see the plugin README for the list): numbers, bools, or strings for the
+        text parameters (Palette, FacadeStyles). Takes effect on the next generate().
+        Returns {"applied": [...], "unknown": [...]}; with strict=True an unknown name raises KeyError.
         """
         merged = dict(values or {})
         merged.update(kwargs)
         res = _as_json(self.wg._call("SetParamsJson", GeneratorPath=self.path, Json=json.dumps(merged))) or {}
         if not res.get("ok", False):
             raise WorldGenError(res.get("error", "set_params failed"))
+        if strict and res.get("unknown"):
+            raise KeyError(", ".join(res["unknown"]))
         return res
 
     def clear_overrides(self) -> None:
         self.wg._call("ClearOverrides", GeneratorPath=self.path)
 
-    def __getitem__(self, name: str) -> float:
+    def vary_glass(self) -> int:
+        """
+        Re-roll the per-placement glass look (frost / blur, tint, ripple, opacity) of the current world from
+        the Glass* parameters (GlassVariation, GlassFrostChance, GlassTintChance, GlassBumpChance) without
+        regenerating it; every generation already does this. The look is drawn from the seed and each
+        placement's position, so it is the same for the same seed and parameters. Returns the number of
+        glass instances written: 0 with GlassVariation 0 (every copy back to its asset's own look) or when
+        the palette has no RammsWorldGen glass (PAL_Default's glass does not vary; PAL_UrbanVerse's does).
+        Cosmetic only: the layout and the manifest do not change.
+        """
+        out = self.wg.ue._call_function(self.path, "ApplyGlassVariation", None)
+        if isinstance(out, dict):
+            out = out.get("ReturnValue", 0)
+        try:
+            return int(out or 0)
+        except (TypeError, ValueError):
+            raise WorldGenError(f"ApplyGlassVariation failed on {self.path}: {out!r}") from None
+
+    def __getitem__(self, name: str) -> ParamValue:
         p = self.params()
         if name not in p:
             raise KeyError(name)
         return p[name]
 
-    def __setitem__(self, name: str, value: float) -> None:
+    def __setitem__(self, name: str, value: ParamValue) -> None:
         res = self.set_params({name: value})
         if name in res.get("unknown", []):
             raise KeyError(name)
@@ -215,6 +265,10 @@ class WorldGen:
         """[{"name", "path", "scene_kind", "description", "site_size_x", "site_size_y", "palette", "graph"}]"""
         return _as_json(self._call("DescribePresets")) or []
 
+    def palettes(self) -> list[str]:
+        """Object paths of every world palette the engine knows (PAL_Default, PAL_UrbanVerse once imported, ...)."""
+        return [str(p) for p in _as_list(self._call("ListPalettes"))]
+
     def maps(self) -> list[str]:
         """Package paths of the generated example maps (/Game/Maps/Gen/Map_Gen_*)."""
         return [str(p) for p in _as_list(self._call("ListGeneratedMaps"))]
@@ -236,15 +290,21 @@ class WorldGen:
     # ── lifecycle ───────────────────────────────────────────────────
 
     def spawn(self, preset: str, seed: int = 1, location: tuple[float, float, float] = (0.0, 0.0, 0.0),
-              label: str = "WorldGenerator") -> Generator:
-        """Spawn a generator in the current world pointed at a preset (asset path or short name). Does not generate."""
+              label: str = "WorldGenerator", palette: str = "") -> Generator:
+        """
+        Spawn a generator in the current world pointed at a preset (asset path or short name), optionally with
+        another palette. Does not generate. The label also works as its name in packaged builds (it is a tag).
+        """
         x, y, z = location
         path = self._call("SpawnGenerator", Preset=preset, Seed=int(seed), Location={"X": x, "Y": y, "Z": z}, Label=label)
         if isinstance(path, dict) and "ReturnValue" in path:
             path = path["ReturnValue"]
         if not path:
             raise WorldGenError(f"could not spawn a generator for preset {preset!r}")
-        return Generator(self, str(path))
+        gen = Generator(self, str(path))
+        if palette:
+            gen.set_palette(palette)
+        return gen
 
     def open_map(self, map_name: str, settle: float = 0.0) -> bool:
         """
@@ -259,22 +319,32 @@ class WorldGen:
     # ── dataset helpers ─────────────────────────────────────────────
 
     def batch(self, preset: str, seeds: Iterable[int], out_dir: str | Path, generator: Optional[Generator] = None,
-              params: Optional[dict[str, float]] = None, timeout: float = 180.0,
-              export_on_engine: bool = False) -> Iterator[tuple[int, Path]]:
+              params: Optional[dict[str, ParamValue]] = None, timeout: float = 180.0,
+              export_on_engine: bool = False, palette: str = "", keep_overrides: bool = False) -> Iterator[tuple[int, Path]]:
         """
-        Generate one world per seed and save each manifest under out_dir as <preset>_<seed>.json.
+        Generate one world per seed and save each manifest under out_dir as <preset>_<seed>.json
+        (<preset>_<palette>_<seed>.json with a palette).
 
+        The generator's earlier overrides are dropped first (keep_overrides=True keeps them), so a batch is the
+        preset plus `params` and `palette` only; an unknown parameter name raises KeyError before anything runs.
         The manifests are fetched over the API and written locally (so this works against a remote
         engine); with export_on_engine=True the engine writes them too (its Saved/WorldGen).
         Yields (seed, local_path) as each world finishes; the last world stays in the level.
         """
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
-        gen = generator or (self.generators()[0] if self.generators() else self.spawn(preset, 0))
+        gens = [] if generator else self.generators()
+        gen = generator or (gens[0] if gens else self.spawn(preset, 0))
         gen.set_preset(preset)
+        if not keep_overrides:
+            gen.clear_overrides()
+        if palette:
+            gen.set_palette(palette)
         if params:
-            gen.set_params(params)
+            gen.set_params(params, strict=True)
         short = preset.rsplit("/", 1)[-1].split(".")[-1]
+        if palette:
+            short += "_" + palette.rsplit("/", 1)[-1].split(".")[-1]
         for seed in seeds:
             gen.generate(seed=int(seed), wait=True, timeout=timeout)
             m = gen.manifest()

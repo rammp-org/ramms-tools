@@ -100,3 +100,36 @@ def test_crosswalks():
     a, b = m.crosswalks()[0].crossing_ends()
     assert math.dist(a, (0, -400, -15)) < 1e-6 and math.dist(b, (0, 400, -15)) < 1e-6
     assert [f.kind for f in m.features_near(b, 200)] == ["CurbRamp"]
+
+
+def test_palette_and_assets():
+    # Manifests record the palette and, for palette meshes, the asset placed and where it came from.
+    m = Manifest.from_json({"seed": 7, "preset": "PRE_Downtown", "palette": "/RammsWorldGen/Palettes/PAL_UrbanVerse.PAL_UrbanVerse",
+                            "features": [
+        {"kind": "Prop", "subtype": "Bench", "location": {"x": 0, "y": 0, "z": 0},
+         "asset": "/Game/UrbanVerse/Bench/SM_UV_bench_1c009275.SM_UV_bench_1c009275",
+         "source": "urbanverse:1c0092759dfe4182b952080ffd404071|bench", "route": "Block0_Side1"},
+        {"kind": "Prop", "subtype": "Bench", "location": {"x": 300, "y": 0, "z": 0},
+         "asset": "/Game/UrbanVerse/Bench/SM_UV_bench_1c009275.SM_UV_bench_1c009275",
+         "source": "urbanverse:1c0092759dfe4182b952080ffd404071|bench", "route": "None"},
+        {"kind": "Tree", "location": {"x": 0, "y": 900, "z": 0}, "asset": "/Game/Fab/Trees/SM_Tree_01.SM_Tree_01", "source": ""},
+        {"kind": "CurbRamp", "location": {"x": 0, "y": 500, "z": 0}},
+    ], "routes": []})
+    assert m.palette.endswith("PAL_UrbanVerse")
+    b = m.features_of("Prop")[0]
+    assert b.source_dataset == "urbanverse" and b.source_uid == "1c0092759dfe4182b952080ffd404071"
+    assert b.route == "Block0_Side1" and m.features_of("Prop")[1].route == ""   # FName None -> ""
+    assert m.assets("Prop") == {"/Game/UrbanVerse/Bench/SM_UV_bench_1c009275.SM_UV_bench_1c009275": 2}
+    assert m.sources() == {"": 1, "urbanverse": 2}
+    s = m.summary()
+    assert s["palette"] == m.palette and s["asset_sources"] == {"": 1, "urbanverse": 2}
+    # Older manifests have none of it.
+    old = _m()
+    assert old.palette == "" and all(f.asset == "" and f.source_uid == "" for f in old.features)
+
+
+def test_cli_set_values():
+    from ramms_tools.scripts.worldgen_cli import _overrides, _seeds
+    assert _overrides(["HazardDensity=6", "bParkedCars=false", "FacadeStyles=dt01,dt03", "Palette=PAL_UrbanVerse", "Palette2="]) == {
+        "HazardDensity": 6.0, "bParkedCars": 0.0, "FacadeStyles": "dt01,dt03", "Palette": "PAL_UrbanVerse", "Palette2": ""}
+    assert _seeds("1-3,7") == [1, 2, 3, 7]

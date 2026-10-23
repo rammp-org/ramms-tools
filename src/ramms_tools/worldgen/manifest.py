@@ -28,6 +28,12 @@ def _vec(d: Any) -> tuple[float, float, float]:
     return (0.0, 0.0, 0.0)
 
 
+def _name(v: Any) -> str:
+    """An FName from the manifest: "None" (Unreal's empty name) becomes ""."""
+    s = str(v or "")
+    return "" if s == "None" else s
+
+
 def _quat_yaw(q: dict) -> float:
     """Yaw (degrees) of a UE quaternion {x,y,z,w}."""
     x, y, z, w = (float(q.get(k, q.get(k.upper(), 0.0))) for k in ("x", "y", "z", "w"))
@@ -67,7 +73,19 @@ class Feature:
     measure: float = 0.0            # the quantity that was checked (slope, rise, width, ...)
     threshold: float = 0.0          # what it was compared against
     route: str = ""                 # route this feature sits on, if any
+    asset: str = ""                 # mesh asset placed for it (palette meshes), e.g. /Game/UrbanVerse/Bench/SM_UV_...
+    source: str = ""                # where that asset came from, when known: "urbanverse:<uid>|<category>"
     raw: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def source_dataset(self) -> str:
+        """The dataset part of `source` ("urbanverse"), or ""."""
+        return self.source.split(":", 1)[0] if ":" in self.source else ""
+
+    @property
+    def source_uid(self) -> str:
+        """The asset id within that dataset (an UrbanVerse / Sketchfab uid), or ""."""
+        return self.source.split(":", 1)[1].split("|", 1)[0] if ":" in self.source else ""
 
     @classmethod
     def from_json(cls, d: dict) -> "Feature":
@@ -94,7 +112,9 @@ class Feature:
             issue=str(g("issue", "Issue", default="None")),
             measure=float(g("measure", "Measure", default=0.0) or 0.0),
             threshold=float(g("threshold", "Threshold", default=0.0) or 0.0),
-            route=str(g("route", "Route", default="") or ""),
+            route=_name(g("route", "Route", default="")),
+            asset=str(g("asset", "Asset", default="") or ""),
+            source=str(g("source", "Source", default="") or ""),
             raw=d,
         )
 
@@ -169,6 +189,7 @@ class Route:
 class Manifest:
     seed: int = 0
     preset: str = ""
+    palette: str = ""               # object path of the palette it was generated with ("" in older manifests)
     scene_kind: str = ""
     bounds_min: tuple[float, float, float] = (0.0, 0.0, 0.0)
     bounds_max: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -196,6 +217,7 @@ class Manifest:
         return cls(
             seed=int(g("seed", "Seed", default=0) or 0),
             preset=str(g("preset", "Preset", default="") or ""),
+            palette=str(g("palette", "Palette", default="") or ""),
             scene_kind=str(kind or ""),
             bounds_min=_vec(bounds.get("min") or bounds.get("Min") or {}),
             bounds_max=_vec(bounds.get("max") or bounds.get("Max") or {}),
@@ -242,6 +264,22 @@ class Manifest:
             out[f.issue] = out.get(f.issue, 0) + 1
         return dict(sorted(out.items()))
 
+    def assets(self, kind: Optional[str] = None) -> dict[str, int]:
+        """How often each mesh asset was placed (optionally for one kind); features without an asset are left out."""
+        out: dict[str, int] = {}
+        for f in self.features:
+            if f.asset and (kind is None or f.kind.lower() == kind.lower()):
+                out[f.asset] = out.get(f.asset, 0) + 1
+        return dict(sorted(out.items()))
+
+    def sources(self) -> dict[str, int]:
+        """Placed-asset counts per source dataset ("urbanverse", ...; "" for the palette's own meshes)."""
+        out: dict[str, int] = {}
+        for f in self.features:
+            if f.asset:
+                out[f.source_dataset] = out.get(f.source_dataset, 0) + 1
+        return dict(sorted(out.items()))
+
     def kinds(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for f in self.features:
@@ -273,9 +311,9 @@ class Manifest:
 
     def summary(self) -> dict:
         return {
-            "preset": self.preset, "seed": self.seed, "scene_kind": self.scene_kind,
+            "preset": self.preset, "seed": self.seed, "scene_kind": self.scene_kind, "palette": self.palette,
             "features": len(self.features), "routes": len(self.routes), "issues": len(self.issues),
-            "kinds": self.kinds(), "issues_by_kind": self.issues_by_kind(),
+            "kinds": self.kinds(), "issues_by_kind": self.issues_by_kind(), "asset_sources": self.sources(),
             "route_length_m": round(sum(r.length for r in self.routes) / 100.0, 1),
             "narrowest_route_cm": round(min((r.min_clear_width for r in self.routes), default=0.0), 1),
             "suggested_start": self.suggested_start, "suggested_start_yaw": self.suggested_start_yaw,

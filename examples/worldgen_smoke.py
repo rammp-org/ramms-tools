@@ -7,8 +7,9 @@ or a packaged / -game build with Remote Control enabled.
     python examples/worldgen_smoke.py --host 10.0.0.5 --map Map_Gen_Store
 
 Checks discovery, generation, determinism (same seed -> same manifest), parameter
-overrides, manifest export / reload, a small batch, and map travel. Exits non-zero
-on the first failure.
+overrides (numbers and text), palettes (switching to another one and back, e.g. the
+UrbanVerse-100K palette when it is imported), per-placement glass variation, the assets recorded in the manifest,
+manifest export / reload, a small batch, and map travel. Exits non-zero on the first failure.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ramms_tools.worldgen import WorldGen
+from ramms_tools.worldgen import WorldGen, WorldGenError
 from ramms_tools.worldgen.manifest import Manifest
 
 
@@ -53,6 +54,7 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=30010)
     ap.add_argument("--map", default="Map_Gen_Store", help="map to travel to at the end ('' to skip)")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--palette", default="PAL_UrbanVerse", help="second palette to switch to ('' to skip; skipped if not imported)")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -111,6 +113,64 @@ def main() -> int:
         gen.clear_overrides()
         gen.generate(seed=args.seed, wait=True)
         _check(_key(gen.manifest()) == _key(a), "overrides cleared")
+
+    # Text parameters go through set_params as strings.
+    if "FacadeStyles" in params:
+        res = gen.set_params(FacadeStyles="dt01")
+        _check("FacadeStyles" in res.get("applied", []) and gen.params().get("FacadeStyles") == "dt01", "text parameter override (FacadeStyles)")
+        gen.clear_overrides()
+        _check(gen.params().get("FacadeStyles") == params["FacadeStyles"], "text override cleared")
+
+    # Assets: palette meshes are recorded with their asset path; nothing points at engine placeholder meshes.
+    with_asset = [f for f in a.features if f.asset]
+    _check(len(with_asset) > 0 and not any(f.asset.startswith("/Engine/") for f in with_asset),
+           f"{len(with_asset)} features record their mesh asset ({len(a.assets())} distinct)")
+    _check(bool(a.palette), f"manifest records its palette ({a.palette.rsplit('/', 1)[-1]})")
+
+    # Palettes: switch to another one and back.
+    pals = wg.palettes()
+    short = lambda p: p.rsplit("/", 1)[-1].split(".")[-1]
+    print(f"        palettes: {[short(p) for p in pals]}")
+    _check(any(short(p) == "PAL_Default" for p in pals), f"{len(pals)} palettes listed")
+    try:
+        gen.set_palette("PAL_DoesNotExist")
+        _fail("unknown palette rejected")
+    except WorldGenError:
+        _ok("unknown palette rejected")
+    if args.palette and any(short(p) == args.palette for p in pals):
+        before = gen.palette
+        gen.set_palette(args.palette)
+        _check(short(gen.palette) == args.palette, f"set_palette({args.palette})")
+        gen.generate(seed=args.seed, wait=True)
+        u = gen.manifest()
+        srcs = u.sources()
+        print(f"        {args.palette}: {_brief(u)}, asset sources {srcs}")
+        ds = {f.source_dataset for f in u.features if f.source}
+        _check(short(u.palette) == args.palette and sum(v for k, v in srcs.items() if k) > 0,
+               f"world generated with {args.palette} ({sum(v for k, v in srcs.items() if k)} assets from {sorted(ds)})")
+        if "urbanverse" in ds:
+            uv = [f for f in u.features if f.source_dataset == "urbanverse"]
+            _check(all(f.asset.startswith("/Game/UrbanVerse/") and len(f.source_uid) == 32 for f in uv),
+                   f"{len(uv)} UrbanVerse features carry their asset and uid")
+        # Glass: each placement gets its own look (cosmetic; the layout and manifest must not change).
+        glass = {k: v for k, v in gen.params().items() if k.startswith("Glass")}
+        if glass:
+            _check(set(glass) >= {"GlassVariation", "GlassFrostChance", "GlassTintChance", "GlassBumpChance"},
+                   f"glass parameters readable {glass}")
+            n = gen.vary_glass()
+            _check(n > 0 or "urbanverse" not in ds, f"vary_glass(): {n} glass instances varied")
+            gen.set_params(GlassVariation=0.0, GlassFrostChance=1.0)
+            gen.generate(seed=args.seed, wait=True)
+            _check(_key(gen.manifest()) == _key(u), "glass parameters leave the layout unchanged")
+            _check(gen.vary_glass() == 0, "GlassVariation 0: no instance varied")
+            gen.clear_overrides()
+            _check(gen.vary_glass() == n, f"overrides cleared: {n} instances varied again")
+        gen.set_palette("")
+        _check(gen.palette == before, "palette back to the preset's")
+        gen.generate(seed=args.seed, wait=True)
+        _check(_key(gen.manifest()) == _key(a), "same world again with the preset's palette")
+    elif args.palette:
+        print(f"        ({args.palette} not imported; palette switch skipped)")
 
     with tempfile.TemporaryDirectory() as tmp:
         local = gen.manifest().save(Path(tmp) / "smoke.json")

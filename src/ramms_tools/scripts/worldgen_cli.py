@@ -5,19 +5,24 @@ in a running editor or game over the Remote Control API.
 
     ramms-worldgen world                              # which map is open, how many generators
     ramms-worldgen presets                            # list presets (name, kind, site size)
+    ramms-worldgen palettes                           # list palettes (PAL_Default, PAL_UrbanVerse, ...)
     ramms-worldgen maps                               # list the generated example maps
     ramms-worldgen open Map_Gen_Suburban              # load / travel to a map
     ramms-worldgen spawn --preset PRE_Downtown --seed 7
     ramms-worldgen generate --seed 42                 # regenerate the (first) generator, wait, print summary
+    ramms-worldgen generate --seed 42 --palette PAL_UrbanVerse   # same world, UrbanVerse props and cars
+    ramms-worldgen generate --palette ""              # back to the preset's palette
     ramms-worldgen randomize
     ramms-worldgen status
     ramms-worldgen params                             # resolved parameter block
-    ramms-worldgen params --set HazardDensity=6 --set NonCompliance=0.5
+    ramms-worldgen params --set HazardDensity=6 --set NonCompliance=0.5 --set FacadeStyles=dt01,dt03
     ramms-worldgen params --clear
+    ramms-worldgen glass --set GlassVariation=0.5 --set GlassFrostChance=0.6   # re-roll the glass looks only
     ramms-worldgen manifest --out downtown_42.json    # fetch the manifest
     ramms-worldgen manifest --issues                  # list non-compliant features
     ramms-worldgen manifest --routes                  # list routes with clear widths
     ramms-worldgen batch --preset PRE_Park --seeds 1-50 --out data/park
+    ramms-worldgen batch --preset PRE_Downtown --seeds 1-20 --palette PAL_UrbanVerse --out data/dt_uv
     ramms-worldgen inspect data/park/PRE_Park_3.json  # summarize a saved manifest (no engine needed)
 
 Requires Unreal Engine running with the Remote Control API plugin (port 30010)
@@ -37,6 +42,27 @@ from ramms_tools.worldgen import WorldGen, WorldGenError
 from ramms_tools.worldgen.manifest import Manifest
 
 
+def _value(v: str) -> float | str:
+    """--set NAME=VALUE: a number (true/false as 1/0) when it parses as one, else the text (Palette, FacadeStyles)."""
+    t = v.strip()
+    if t.lower() in ("true", "false"):
+        return 1.0 if t.lower() == "true" else 0.0
+    try:
+        return float(t)
+    except ValueError:
+        return t
+
+
+def _overrides(items: list[str]) -> dict[str, float | str]:
+    out: dict[str, float | str] = {}
+    for it in items:
+        if "=" not in it:
+            raise ValueError(f"--set expects NAME=VALUE, got {it!r}")
+        k, v = it.split("=", 1)
+        out[k.strip()] = _value(v)
+    return out
+
+
 def _seeds(spec: str) -> list[int]:
     """'1-20' | '1,2,5' | '7' | '1-5,9'"""
     out: list[int] = []
@@ -54,10 +80,13 @@ def _seeds(spec: str) -> list[int]:
 
 def _print_summary(m: Manifest) -> None:
     s = m.summary()
-    print(f"{s['preset']}  seed {s['seed']}  ({s['scene_kind']})")
+    pal = s.get("palette", "").rsplit("/", 1)[-1].split(".")[-1]
+    print(f"{s['preset']}  seed {s['seed']}  ({s['scene_kind']})" + (f"  palette {pal}" if pal else ""))
     print(f"  features {s['features']}  routes {s['routes']}  issues {s['issues']}  "
           f"route length {s['route_length_m']} m  narrowest route {s['narrowest_route_cm']} cm")
     print("  kinds:  " + ", ".join(f"{k} {v}" for k, v in s["kinds"].items()))
+    if any(s.get("asset_sources", {})):
+        print("  assets: " + ", ".join(f"{k or 'palette'} {v}" for k, v in s["asset_sources"].items()))
     if s["issues_by_kind"]:
         print("  issues: " + ", ".join(f"{k} {v}" for k, v in s["issues_by_kind"].items()))
     x, y, z = s["suggested_start"]
@@ -96,12 +125,15 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("world", help="current map and generator count")
     sub.add_parser("presets", help="list world presets")
+    sub.add_parser("palettes", help="list world palettes")
     sub.add_parser("maps", help="list generated example maps")
     s = sub.add_parser("open", help="open a map (editor load or game travel)"); s.add_argument("map")
     s = sub.add_parser("spawn", help="spawn a generator"); s.add_argument("--preset", required=True); s.add_argument("--seed", type=int, default=1)
     s.add_argument("--at", default="0,0,0", help="x,y,z"); s.add_argument("--label", default="WorldGenerator")
+    s.add_argument("--palette", default=None, help="palette name or path (default: the preset's)")
     s.add_argument("--generate", action="store_true", help="generate right after spawning")
     s = sub.add_parser("generate", help="regenerate"); s.add_argument("--seed", type=int, default=None); s.add_argument("--preset", default="")
+    s.add_argument("--palette", default=None, help='palette name or path; "" = the preset\'s')
     s.add_argument("--no-wait", action="store_true"); s.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
     s.add_argument("--player-start", action="store_true", help="move the PlayerStart to the suggested start afterwards")
     s = sub.add_parser("randomize", help="new random seed and regenerate"); s.add_argument("--no-wait", action="store_true")
@@ -109,12 +141,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="generator status")
     s = sub.add_parser("params", help="show / override parameters"); s.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
     s.add_argument("--clear", action="store_true", help="drop all per-instance overrides")
+    s = sub.add_parser("glass", help="re-roll the per-placement glass look (frost, tint, ripple) without regenerating")
+    s.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="Glass* parameters to override first")
     s = sub.add_parser("manifest", help="fetch the ground-truth manifest"); s.add_argument("--out", default="")
     s.add_argument("--issues", action="store_true"); s.add_argument("--routes", action="store_true")
     s.add_argument("--export", action="store_true", help="also have the engine write it under Saved/WorldGen")
     s = sub.add_parser("batch", help="generate many seeds, saving each manifest"); s.add_argument("--preset", required=True)
     s.add_argument("--seeds", required=True, help="e.g. 1-20 or 3,5,8"); s.add_argument("--out", required=True)
     s.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
+    s.add_argument("--palette", default="", help="palette name or path (default: the preset's)")
+    s.add_argument("--keep-overrides", action="store_true", help="keep the generator's existing overrides")
     s = sub.add_parser("inspect", help="summarize a saved manifest file (offline)"); s.add_argument("file")
     s.add_argument("--issues", action="store_true"); s.add_argument("--routes", action="store_true")
 
@@ -123,14 +159,11 @@ def main(argv: list[str] | None = None) -> int:
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
-    def overrides(items: list[str]) -> dict[str, float]:
-        out: dict[str, float] = {}
-        for it in items:
-            if "=" not in it:
-                p.error(f"--set expects NAME=VALUE, got {it!r}")
-            k, v = it.split("=", 1)
-            out[k.strip()] = float(v)
-        return out
+    def overrides(items: list[str]) -> dict[str, float | str]:
+        try:
+            return _overrides(items)
+        except ValueError as e:
+            p.error(str(e))
 
     if a.cmd == "inspect":
         m = Manifest.load(a.file)
@@ -166,6 +199,15 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"      {d['description']}")
             return 0
 
+        if a.cmd == "palettes":
+            pals = wg.palettes()
+            if a.json:
+                print(json.dumps(pals, indent=1))
+            else:
+                for pp in pals:
+                    print(f"  {pp.rsplit('/', 1)[-1].split('.')[-1]:22s} {pp}")
+            return 0
+
         if a.cmd == "maps":
             for m in wg.maps():
                 print("  " + m)
@@ -178,18 +220,47 @@ def main(argv: list[str] | None = None) -> int:
 
         if a.cmd == "spawn":
             x, y, z = (float(v) for v in a.at.split(","))
-            g = wg.spawn(a.preset, a.seed, (x, y, z), a.label)
+            g = wg.spawn(a.preset, a.seed, (x, y, z), a.label, palette=a.palette or "")
             print(g.path)
             if a.generate:
                 g.generate(wait=True, timeout=a.timeout)
                 _print_summary(g.manifest())
             return 0
 
+        if a.cmd == "batch":
+            seeds = _seeds(a.seeds)
+            # No generator in the world is fine for a batch: it spawns one.
+            g = wg.generator(a.generator) if (a.generator or wg.generators()) else None
+            n = 0
+            try:
+                for seed, path in wg.batch(a.preset, seeds, a.out, generator=g, params=overrides(a.set) or None, timeout=a.timeout,
+                                           palette=a.palette, keep_overrides=a.keep_overrides):
+                    n += 1
+                    print(f"  [{n}/{len(seeds)}] seed {seed} -> {path}")
+            except KeyError as e:
+                print(f"error: unknown parameters: {e.args[0]}", file=sys.stderr)
+                return 1
+            print(f"done: {n} manifests in {a.out}")
+            return 0
+
         g = wg.generator(a.generator)
+
+        if a.cmd == "glass":
+            if a.set:
+                res = g.set_params(overrides(a.set))
+                if res.get("unknown"):
+                    print(f"warning: unknown parameters ignored: {', '.join(res['unknown'])}", file=sys.stderr)
+            n = g.vary_glass()
+            glass = {k: v for k, v in g.params().items() if k.startswith("Glass")}
+            print(json.dumps({"instances": n, **glass}, indent=1) if a.json else
+                  f"{n} glass instances varied  (" + ", ".join(f"{k} {v}" for k, v in glass.items()) + ")")
+            return 0
 
         if a.cmd == "generate":
             if a.preset:
                 g.set_preset(a.preset)
+            if a.palette is not None:
+                g.set_palette(a.palette)
             if a.set:
                 res = g.set_params(overrides(a.set))
                 if res.get("unknown"):
@@ -224,7 +295,8 @@ def main(argv: list[str] | None = None) -> int:
             if a.json:
                 print(json.dumps(st, indent=1))
             else:
-                print(f"{st.get('label') or st.get('name')}  preset {st.get('preset', '').rsplit('/', 1)[-1]}  seed {st.get('seed')}"
+                pal = st.get("palette", "").rsplit("/", 1)[-1].split(".")[-1]
+                print(f"{st.get('label') or st.get('name')}  preset {st.get('preset', '').rsplit('/', 1)[-1]}  palette {pal or '-'}  seed {st.get('seed')}"
                       f"  {'GENERATING' if st.get('generating') else 'idle'}  features {st.get('features')}  routes {st.get('routes')}  issues {st.get('issues')}")
                 if st.get("override_keys"):
                     print("  overrides: " + ", ".join(st["override_keys"]))
@@ -259,15 +331,6 @@ def main(argv: list[str] | None = None) -> int:
                 _print_issues(m)
             if a.routes:
                 _print_routes(m)
-            return 0
-
-        if a.cmd == "batch":
-            seeds = _seeds(a.seeds)
-            n = 0
-            for seed, path in wg.batch(a.preset, seeds, a.out, generator=g, params=overrides(a.set) or None, timeout=a.timeout):
-                n += 1
-                print(f"  [{n}/{len(seeds)}] seed {seed} -> {path}")
-            print(f"done: {n} manifests in {a.out}")
             return 0
 
     except (WorldGenError, UnrealRemoteError) as e:
