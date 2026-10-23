@@ -115,6 +115,11 @@ print(m.palette, m.sources())                # ... {'': 206, 'urbanverse': 209}
 for f in m.features_of("Prop"):
     print(f.subtype, f.asset, f.source_uid)  # mesh placed, and its UrbanVerse uid when it came from there
 
+# Glass (PAL_UrbanVerse): every placement gets its own frost / blur, tint, ripple and opacity, drawn
+# from the seed and its position. Cosmetic only: the layout and manifest stay the same.
+gen.set_params(GlassVariation=1.0, GlassFrostChance=0.6)  # 0 = every copy looks like its asset
+print(gen.vary_glass())                      # re-roll now without regenerating; returns instances written
+
 # A dataset: one manifest per seed, written locally (drops earlier overrides first)
 for seed, path in wg.batch("PRE_Park", range(1, 51), out_dir="data/park"):
     print(seed, path)
@@ -157,7 +162,8 @@ one is running, and the editor world otherwise.
 
 `examples/worldgen_smoke.py` runs discovery, generation, determinism,
 parameter overrides, a palette switch and back (`--palette`, default
-`PAL_UrbanVerse`, skipped when it is not imported), the recorded assets,
+`PAL_UrbanVerse`, skipped when it is not imported) with its glass variation
+(which must leave the layout unchanged), the recorded assets,
 manifest export, a small batch and a map travel against
 whatever is listening, and exits non-zero on the first failure:
 
@@ -536,6 +542,7 @@ ramms-worldgen params                              # resolved parameter block
 ramms-worldgen params --set HazardDensity=6 --set NonCompliance=0.5
 ramms-worldgen params --set FacadeStyles=dt01,dt03  # text values are passed as strings
 ramms-worldgen params --clear                      # back to the preset's values
+ramms-worldgen glass --set GlassFrostChance=0.6    # re-roll the per-placement glass looks only
 ramms-worldgen manifest --issues --routes          # summary + non-compliant features + routes
 ramms-worldgen manifest --out downtown_42.json     # save locally
 ramms-worldgen manifest --export                   # the engine writes it under Saved/WorldGen too
@@ -546,7 +553,7 @@ ramms-worldgen cleanup
 ```
 
 `--generator NAME` picks a generator by actor path, name or label when a level
-has several; `--json` switches `world`, `presets`, `palettes`, `status`, `params`,
+has several; `--json` switches `world`, `presets`, `palettes`, `status`, `params`, `glass`,
 `manifest` and `inspect` to machine-readable output. `batch` starts from the
 preset (earlier overrides are dropped unless `--keep-overrides`) and stops on an
 unknown `--set` name; `generate` and `params` warn and carry on.

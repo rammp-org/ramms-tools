@@ -203,6 +203,24 @@ class Generator:
     def clear_overrides(self) -> None:
         self.wg._call("ClearOverrides", GeneratorPath=self.path)
 
+    def vary_glass(self) -> int:
+        """
+        Re-roll the per-placement glass look (frost / blur, tint, ripple, opacity) of the current world from
+        the Glass* parameters (GlassVariation, GlassFrostChance, GlassTintChance, GlassBumpChance) without
+        regenerating it; every generation already does this. The look is drawn from the seed and each
+        placement's position, so it is the same for the same seed and parameters. Returns the number of
+        glass instances written: 0 with GlassVariation 0 (every copy back to its asset's own look) or when
+        the palette has no RammsWorldGen glass (PAL_Default's glass does not vary; PAL_UrbanVerse's does).
+        Cosmetic only: the layout and the manifest do not change.
+        """
+        out = self.wg.ue._call_function(self.path, "ApplyGlassVariation", None)
+        if isinstance(out, dict):
+            out = out.get("ReturnValue", 0)
+        try:
+            return int(out or 0)
+        except (TypeError, ValueError):
+            raise WorldGenError(f"ApplyGlassVariation failed on {self.path}: {out!r}") from None
+
     def __getitem__(self, name: str) -> ParamValue:
         p = self.params()
         if name not in p:

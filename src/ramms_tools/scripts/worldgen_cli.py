@@ -17,6 +17,7 @@ in a running editor or game over the Remote Control API.
     ramms-worldgen params                             # resolved parameter block
     ramms-worldgen params --set HazardDensity=6 --set NonCompliance=0.5 --set FacadeStyles=dt01,dt03
     ramms-worldgen params --clear
+    ramms-worldgen glass --set GlassVariation=0.5 --set GlassFrostChance=0.6   # re-roll the glass looks only
     ramms-worldgen manifest --out downtown_42.json    # fetch the manifest
     ramms-worldgen manifest --issues                  # list non-compliant features
     ramms-worldgen manifest --routes                  # list routes with clear widths
@@ -140,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="generator status")
     s = sub.add_parser("params", help="show / override parameters"); s.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
     s.add_argument("--clear", action="store_true", help="drop all per-instance overrides")
+    s = sub.add_parser("glass", help="re-roll the per-placement glass look (frost, tint, ripple) without regenerating")
+    s.add_argument("--set", action="append", default=[], metavar="NAME=VALUE", help="Glass* parameters to override first")
     s = sub.add_parser("manifest", help="fetch the ground-truth manifest"); s.add_argument("--out", default="")
     s.add_argument("--issues", action="store_true"); s.add_argument("--routes", action="store_true")
     s.add_argument("--export", action="store_true", help="also have the engine write it under Saved/WorldGen")
@@ -241,6 +244,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         g = wg.generator(a.generator)
+
+        if a.cmd == "glass":
+            if a.set:
+                res = g.set_params(overrides(a.set))
+                if res.get("unknown"):
+                    print(f"warning: unknown parameters ignored: {', '.join(res['unknown'])}", file=sys.stderr)
+            n = g.vary_glass()
+            glass = {k: v for k, v in g.params().items() if k.startswith("Glass")}
+            print(json.dumps({"instances": n, **glass}, indent=1) if a.json else
+                  f"{n} glass instances varied  (" + ", ".join(f"{k} {v}" for k, v in glass.items()) + ")")
+            return 0
 
         if a.cmd == "generate":
             if a.preset:

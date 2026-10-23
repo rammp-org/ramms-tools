@@ -8,7 +8,7 @@ or a packaged / -game build with Remote Control enabled.
 
 Checks discovery, generation, determinism (same seed -> same manifest), parameter
 overrides (numbers and text), palettes (switching to another one and back, e.g. the
-UrbanVerse-100K palette when it is imported), the assets recorded in the manifest,
+UrbanVerse-100K palette when it is imported), per-placement glass variation, the assets recorded in the manifest,
 manifest export / reload, a small batch, and map travel. Exits non-zero on the first failure.
 """
 
@@ -152,6 +152,19 @@ def main() -> int:
             uv = [f for f in u.features if f.source_dataset == "urbanverse"]
             _check(all(f.asset.startswith("/Game/UrbanVerse/") and len(f.source_uid) == 32 for f in uv),
                    f"{len(uv)} UrbanVerse features carry their asset and uid")
+        # Glass: each placement gets its own look (cosmetic; the layout and manifest must not change).
+        glass = {k: v for k, v in gen.params().items() if k.startswith("Glass")}
+        if glass:
+            _check(set(glass) >= {"GlassVariation", "GlassFrostChance", "GlassTintChance", "GlassBumpChance"},
+                   f"glass parameters readable {glass}")
+            n = gen.vary_glass()
+            _check(n > 0 or "urbanverse" not in ds, f"vary_glass(): {n} glass instances varied")
+            gen.set_params(GlassVariation=0.0, GlassFrostChance=1.0)
+            gen.generate(seed=args.seed, wait=True)
+            _check(_key(gen.manifest()) == _key(u), "glass parameters leave the layout unchanged")
+            _check(gen.vary_glass() == 0, "GlassVariation 0: no instance varied")
+            gen.clear_overrides()
+            _check(gen.vary_glass() == n, f"overrides cleared: {n} instances varied again")
         gen.set_palette("")
         _check(gen.palette == before, "palette back to the preset's")
         gen.generate(seed=args.seed, wait=True)
