@@ -179,7 +179,7 @@ All tools are installed as console scripts when you `pip install` the package.
 ### `ramms-tui` — Interactive Dashboard
 
 A rich terminal UI (built with [Textual](https://textual.textualize.io/)) for
-monitoring and controlling the Mebot, Kinova arm, gripper, and IMU data in
+monitoring and controlling the RAMMP Gen1, Kinova arm, gripper, and IMU data in
 real-time.
 
 ```bash
@@ -191,9 +191,9 @@ ramms-tui --host 192.168.1.10      # Connect to a remote UE instance
 
 | Tab | Description |
 |-----|-------------|
-| Dashboard | Overview cards for arm, gripper, mebot, system status, and IMU |
+| Dashboard | Overview cards for arm, gripper, RAMMP Gen1, system status, and IMU |
 | Arm | 7 joint controls with ±buttons, input fields, Home/Refresh; gripper state, Open/Close/Toggle, finger angle controls |
-| Mebot | Dynamic motor controls (angular & linear) |
+| RAMMP Gen1 | Dynamic motor controls (angular & linear) |
 | IMU | Real-time streaming with target selection and coordinate frame toggle |
 | Stream | RMSS stream monitor — connect to streaming server, subscribe to channels, view per-channel FPS/bandwidth/dropped frames |
 
@@ -257,26 +257,26 @@ ramms-gripper --speed 2.0                        # Set motor speed multiplier
 ramms-gripper --interactive                      # REPL mode
 ```
 
-### `ramms-mebot` — Mebot Motor Control
+### `ramms-rammp-gen1` — RAMMP Gen1 Motor Control
 
 ```bash
-ramms-mebot --describe                           # Show motors and positions
-ramms-mebot --set-angular YawMotor 45.0          # Set angular motor target
-ramms-mebot --set-linear LiftMotor 50.0          # Set linear motor target (cm)
-ramms-mebot --home                               # All motors to 0
-ramms-mebot --interactive                        # REPL mode
+ramms-rammp-gen1 --describe                           # Show motors and positions
+ramms-rammp-gen1 --set-angular YawMotor 45.0          # Set angular motor target
+ramms-rammp-gen1 --set-linear LiftMotor 50.0          # Set linear motor target (cm)
+ramms-rammp-gen1 --home                               # All motors to 0
+ramms-rammp-gen1 --interactive                        # REPL mode
 ```
 
 ### `ramms-imu` — IMU Data Streaming
 
 ```bash
-ramms-imu --actor BP_Mebot_Ramms_C_0                             # Stream from actor
-ramms-imu --actor BP_Mebot_Ramms_C_0 --component ArmSkMesh       # From a named component
-ramms-imu --actor BP_Mebot_Ramms_C_0 --component ArmSkMesh --bone end_effector  # From a bone/socket
-ramms-imu --actor BP_Mebot_Ramms_C_0 --rate 30 --format csv      # 30 Hz CSV output
-ramms-imu --actor BP_Mebot_Ramms_C_0 --format json --duration 10 # 10s of JSON lines
-ramms-imu --actor BP_Mebot_Ramms_C_0 --frame local               # Body-frame output
-ramms-imu --actor BP_Mebot_Ramms_C_0 --frame both                # World + local frames
+ramms-imu --actor BP_RammpGen1_Ramms_C_0                             # Stream from actor
+ramms-imu --actor BP_RammpGen1_Ramms_C_0 --component ArmSkMesh       # From a named component
+ramms-imu --actor BP_RammpGen1_Ramms_C_0 --component ArmSkMesh --bone end_effector  # From a bone/socket
+ramms-imu --actor BP_RammpGen1_Ramms_C_0 --rate 30 --format csv      # 30 Hz CSV output
+ramms-imu --actor BP_RammpGen1_Ramms_C_0 --format json --duration 10 # 10s of JSON lines
+ramms-imu --actor BP_RammpGen1_Ramms_C_0 --frame local               # Body-frame output
+ramms-imu --actor BP_RammpGen1_Ramms_C_0 --frame both                # World + local frames
 ```
 
 The `--component` flag matches against both the component **class name** and the
@@ -479,10 +479,10 @@ Stream IDs are generated from configurable templates that support `{name}`
 ramms-stream-test --synthetic -n 100
 
 # Replay all cameras (auto-discovers subdirectories, generates stream IDs)
-ramms-stream-test --capture-dir ./Saved/CameraCaptures/BP_Mebot_Ramms_C_0
+ramms-stream-test --capture-dir ./Saved/CameraCaptures/BP_RammpGen1_Ramms_C_0
 
 # Include depth data and filter to a specific camera
-ramms-stream-test --send-depth --capture-dir ./Saved/CameraCaptures/BP_Mebot_Ramms_C_0 --camera FR_GeminiCamera
+ramms-stream-test --send-depth --capture-dir ./Saved/CameraCaptures/BP_RammpGen1_Ramms_C_0 --camera FR_GeminiCamera
 
 # Custom stream ID templates
 ramms-stream-test --capture-dir ./captures --color-id "robot/{name}/rgb" --depth-id "robot/{name}/depth"

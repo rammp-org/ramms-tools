@@ -10,7 +10,7 @@ from textual.widgets import Footer, Header, TabbedContent, TabPane
 
 from ramms_tools.unreal_remote import UnrealRemote
 from ramms_tools.tui.widgets import ConnectionBar
-from ramms_tools.tui.pages import ArmPage, DashboardPage, IMUPage, MebotPage, StreamPage
+from ramms_tools.tui.pages import ArmPage, DashboardPage, IMUPage, RammpGen1Page, StreamPage
 
 
 class RammsTUI(App):
@@ -37,7 +37,7 @@ class RammsTUI(App):
         Binding("h", "home_all", "Home All"),
         Binding("1", "tab('dashboard')", "Dashboard", show=False),
         Binding("2", "tab('arm')", "Arm", show=False),
-        Binding("3", "tab('mebot')", "Mebot", show=False),
+        Binding("3", "tab('rammp-gen1')", "RAMMP Gen1", show=False),
         Binding("4", "tab('imu')", "IMU", show=False),
         Binding("5", "tab('stream')", "Stream", show=False),
     ]
@@ -45,7 +45,7 @@ class RammsTUI(App):
     connected: reactive[bool] = reactive(False)
     ue: UnrealRemote | None = None
     arm_comp = None  # RemoteObjectProxy | None
-    mebot_comp = None  # RemoteObjectProxy | None
+    rammp_gen1_comp = None  # RemoteObjectProxy | None
     gripper_comp = None  # RemoteObjectProxy | None
 
     def __init__(self, host: str = "127.0.0.1", port: int = 30010,
@@ -62,8 +62,8 @@ class RammsTUI(App):
                 yield DashboardPage(id="page-dashboard")
             with TabPane("🦾 Arm", id="tab-arm"):
                 yield ArmPage(id="page-arm")
-            with TabPane("🤖 Mebot", id="tab-mebot"):
-                yield MebotPage(id="page-mebot")
+            with TabPane("🤖 RAMMP Gen1", id="tab-rammp-gen1"):
+                yield RammpGen1Page(id="page-rammp-gen1")
             with TabPane("🧭 IMU", id="tab-imu"):
                 yield IMUPage(id="page-imu")
             with TabPane("📡 Stream", id="tab-stream"):
@@ -102,7 +102,7 @@ class RammsTUI(App):
 
     @work(thread=True)
     def _discover_components(self) -> None:
-        """Find Kinova and Mebot components in the level."""
+        """Find Kinova and RAMMP Gen1 components in the level."""
         if not self.ue:
             return
 
@@ -114,11 +114,11 @@ class RammsTUI(App):
         except Exception:
             pass
 
-        # Mebot controller
+        # RAMMP Gen1 controller
         try:
-            results = self.ue.find_actors_by_component("MebotController")
+            results = self.ue.find_actors_by_component("RammpGen1Controller")
             if results:
-                self.mebot_comp = self.ue.actor(results[0]["component_path"])
+                self.rammp_gen1_comp = self.ue.actor(results[0]["component_path"])
         except Exception:
             pass
 
@@ -139,7 +139,7 @@ class RammsTUI(App):
         pages = {
             "tab-dashboard": "page-dashboard",
             "tab-arm": "page-arm",
-            "tab-mebot": "page-mebot",
+            "tab-rammp-gen1": "page-rammp-gen1",
             "tab-imu": "page-imu",
             "tab-stream": "page-stream",
         }
@@ -158,7 +158,7 @@ class RammsTUI(App):
         self._check_connection()
         self._discover_components()
         # Force refresh the active page
-        for page_id in ("page-dashboard", "page-arm", "page-mebot"):
+        for page_id in ("page-dashboard", "page-arm", "page-rammp-gen1"):
             try:
                 page = self.query_one(f"#{page_id}")
                 if hasattr(page, "_active") and page._active:
@@ -180,9 +180,9 @@ class RammsTUI(App):
         except Exception:
             pass
         try:
-            mebot = self.query_one("#page-mebot", MebotPage)
-            if mebot:
-                mebot._home_all()
+            page = self.query_one("#page-rammp-gen1", RammpGen1Page)
+            if page:
+                page._home_all()
         except Exception:
             pass
 

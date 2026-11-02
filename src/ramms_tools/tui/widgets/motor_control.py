@@ -1,4 +1,4 @@
-"""Motor control widget — for Mebot angular/linear motors."""
+"""Motor control widget — for RAMMP Gen1 angular/linear motors."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def _slugify(name: str) -> str:
 
 
 class MotorControl(Widget):
-    """Control widget for a single Mebot motor (angular or linear).
+    """Control widget for a single RAMMP Gen1 motor (angular or linear).
 
     Provides current value display, +/- nudge buttons, precise input, and Send.
     """

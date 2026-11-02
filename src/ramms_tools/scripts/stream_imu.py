@@ -8,20 +8,20 @@ transform and physics state at a configurable rate.
 
 Usage:
     # Stream from an actor (by path or auto-discovered by name/class)
-    ramms-imu --actor BP_Mebot_Ramms_C_0
-    ramms-imu --actor BP_Mebot_Ramms_C_0 --rate 30
+    ramms-imu --actor BP_RammpGen1_Ramms_C_0
+    ramms-imu --actor BP_RammpGen1_Ramms_C_0 --rate 30
 
     # Stream from a specific component on an actor
-    ramms-imu --actor BP_Mebot_Ramms_C_0 --component ArmSkMesh
+    ramms-imu --actor BP_RammpGen1_Ramms_C_0 --component ArmSkMesh
 
     # Stream from a skeletal mesh bone
-    ramms-imu --actor BP_Mebot_Ramms_C_0 --component ArmSkMesh --bone end_effector
+    ramms-imu --actor BP_RammpGen1_Ramms_C_0 --component ArmSkMesh --bone end_effector
 
     # Output as CSV (one row per sample)
-    ramms-imu --actor BP_Mebot_Ramms_C_0 --format csv
+    ramms-imu --actor BP_RammpGen1_Ramms_C_0 --format csv
 
     # Output as JSON lines
-    ramms-imu --actor BP_Mebot_Ramms_C_0 --format json
+    ramms-imu --actor BP_RammpGen1_Ramms_C_0 --format json
 
 Requires Unreal Engine running with Remote Control API plugin enabled (port 30010).
 """
