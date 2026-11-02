@@ -45,6 +45,18 @@ def has_lz4() -> bool:
     return _has_lz4
 
 
+def can_decompress(compression: Compression) -> bool:
+    """Return True if :func:`decompress_payload` can really decode *compression*
+    here, rather than fall back to handing the compressed bytes back."""
+    if compression == Compression.NONE:
+        return True
+    if compression in (Compression.JPEG, Compression.PNG):
+        return _has_pillow
+    if compression == Compression.LZ4:
+        return _has_lz4
+    return False
+
+
 # ── JPEG ─────────────────────────────────────────────────────────────────
 
 

@@ -120,3 +120,43 @@ def test_sender_context_sends_what_it_queued():
         widths.append(m["w"])
         off += h.total_message_size
     assert widths == [1, 2, 3, 4]   # all four sent, each with its own size
+
+
+def test_frame_without_its_codec_is_delivered_as_sent(monkeypatch):
+    from ramms_tools.streaming import compression
+    monkeypatch.setattr(compression, "_has_lz4", False)
+    monkeypatch.setattr(compression, "_has_pillow", False)
+    sent = []
+    for mtype, comp, meta in (
+        (MessageType.FRAME_DEPTH, Compression.LZ4, b'{"w": 2, "h": 1}'),
+        (MessageType.FRAME_RGBD, Compression.JPEG,
+         b'{"w": 2, "h": 1, "rgb_size": 3, "rgb_comp": "jpeg", "depth_comp": "lz4"}'),
+    ):
+        m = StreamMessage()
+        m.header.message_type = mtype
+        m.header.set_compression(comp)
+        m.metadata = meta
+        m.payload = b"\x01\x02\x03compressed"
+        sent.append(m)
+    got = receive([m.serialize() for m in sent], 2)
+    assert [(m.header.get_compression(), m.payload, m.metadata) for m in got] == \
+        [(m.header.get_compression(), m.payload, m.metadata) for m in sent]
+
+
+def test_send_capture_dir_raises_without_openexr(monkeypatch, tmp_path):
+    import sys
+    monkeypatch.setitem(sys.modules, "OpenEXR", None)   # import OpenEXR -> ImportError
+    (tmp_path / "frame_0000000.json").write_text("{}")
+    (tmp_path / "frame_0000000.exr").write_bytes(b"")
+    with pytest.raises(ImportError, match=r"ramms-tools\[exr\]"):
+        StreamSender().send_capture_dir(tmp_path)
+
+
+def test_stream_test_cli_exits_without_openexr(monkeypatch, tmp_path, capsys):
+    import sys
+    from ramms_tools.scripts import stream_test
+    monkeypatch.setitem(sys.modules, "OpenEXR", None)
+    monkeypatch.setattr(sys, "argv", ["ramms-stream-test", "--mask-dir", str(tmp_path)])
+    with pytest.raises(SystemExit) as e:
+        stream_test.main()
+    assert e.value.code == 1 and "ramms-tools[exr]" in capsys.readouterr().out

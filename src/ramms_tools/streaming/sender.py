@@ -815,10 +815,12 @@ class StreamSender:
         If fps > 0, paces sending at that rate.  Returns number of frames sent.
 
         Each EXR is decoded to BGRA8 (the UE sink has no EXR format) and sent
-        with its JSON metadata.  Needs OpenEXR (``pip install ramms-tools[exr]``).
+        with its JSON metadata.  Needs OpenEXR (``pip install ramms-tools[exr]``):
+        raises ImportError, before sending anything, without it.
         """
-        # The decoder ramms-stream-test's capture replay uses.
-        from ramms_tools.scripts.stream_test import load_exr_frame
+        from .exr import load_exr_frame, require_openexr
+
+        require_openexr()
 
         capture_path = Path(capture_dir)
         if not capture_path.is_dir():

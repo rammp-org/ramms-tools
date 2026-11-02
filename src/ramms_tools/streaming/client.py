@@ -45,7 +45,7 @@ from ramms_tools.streaming.protocol import (
     StreamHeader,
     StreamMessage,
 )
-from ramms_tools.streaming.compression import decompress_payload
+from ramms_tools.streaming.compression import can_decompress, decompress_payload
 
 logger = logging.getLogger(__name__)
 
@@ -62,16 +62,29 @@ _FRAME_TYPES = frozenset({
 })
 
 
+class _MissingCodec(Exception):
+    """A frame's codec is not installed here: it is delivered as it was sent."""
+
+
+def _require_codecs(*codecs: Compression) -> None:
+    missing = [c.name for c in codecs if not can_decompress(c)]
+    if missing:
+        raise _MissingCodec("/".join(missing))
+
+
 def _decompress_rgbd(msg: StreamMessage) -> tuple[bytes, bytes]:
     """A compressed FRAME_RGBD is a JPEG colour block then an LZ4 depth block
     (header flagged JPEG); the metadata's rgb_size gives the split.  Returns
     the raw payload (BGRA8 then float32 depth) and metadata restating the
-    raw sizes."""
+    raw sizes.  Raises _MissingCodec, before touching anything, if either
+    codec is not installed."""
     meta = msg.get_metadata_json()
+    depth_lz4 = meta.get("depth_comp") == "lz4"
+    _require_codecs(Compression.JPEG, *([Compression.LZ4] if depth_lz4 else []))
     rgb_size = int(meta.get("rgb_size", len(msg.payload)))
     rgb = decompress_payload(msg.payload[:rgb_size], Compression.JPEG)
     depth = msg.payload[rgb_size:]
-    if meta.get("depth_comp") == "lz4":
+    if depth_lz4:
         depth = decompress_payload(depth, Compression.LZ4)
     for key in ("rgb_comp", "depth_comp", "rgb_raw_size", "depth_raw_size"):
         meta.pop(key, None)
@@ -147,6 +160,9 @@ class StreamClient:
         # Out-of-band PING reply handling
         self._ping_event = threading.Event()
         self._ping_rtt: float = 0.0
+
+        # Codecs already warned about as missing (once each, not per frame)
+        self._missing_codecs_warned: set[str] = set()
 
     # ── Connection ────────────────────────────────────────────────────
 
@@ -346,10 +362,17 @@ class StreamClient:
                         if mtype == MessageType.FRAME_RGBD:
                             msg.payload, msg.metadata = _decompress_rgbd(msg)
                         else:
+                            _require_codecs(comp)
                             msg.payload = decompress_payload(
                                 msg.payload, comp,
                             )
                         msg.header.set_compression(Compression.NONE)
+                    except _MissingCodec as e:
+                        if str(e) not in self._missing_codecs_warned:
+                            self._missing_codecs_warned.add(str(e))
+                            logger.warning(
+                                "%s not installed: delivering those frames compressed "
+                                "(pip install ramms-tools[compression])", e)
                     except Exception:
                         logger.exception("Decompression failed for channel %d", ch)
 
