@@ -262,7 +262,7 @@ class IMUPage(Container):
 
         self._resolve_and_stream(actor_input, comp_input, rate_hz)
 
-    @work(exclusive=True, thread=True)
+    @work(exclusive=True, thread=True, group="poll")
     def _resolve_and_stream(self, actor_hint: str, comp_hint: str,
                              rate_hz: int) -> None:
         app: RammsTUI = self.app  # type: ignore[assignment]
@@ -386,16 +386,20 @@ class IMUPage(Container):
                 except Exception:
                     pass
             elif self._is_component:
-                loc = app.ue._get_property(obj_path, "RelativeLocation")
-                if isinstance(loc, dict):
-                    position = {"x": loc.get("X", 0),
-                                "y": loc.get("Y", 0),
-                                "z": loc.get("Z", 0)}
-                rot = app.ue._get_property(obj_path, "RelativeRotation")
-                if isinstance(rot, dict):
-                    orientation = {"roll": rot.get("Roll", 0),
-                                   "pitch": rot.get("Pitch", 0),
-                                   "yaw": rot.get("Yaw", 0)}
+                # The component's world transform (RelativeLocation and
+                # RelativeRotation are relative to its parent).
+                result = app.ue._call_function(
+                    obj_path, "GetSocketTransform",
+                    {"InSocketName": "None", "TransformSpace": "RTS_World"})
+                if isinstance(result, dict):
+                    pos = result.get("Translation", {})
+                    position = {"x": pos.get("X", 0),
+                                "y": pos.get("Y", 0),
+                                "z": pos.get("Z", 0)}
+                    rot = result.get("Rotation", {})
+                    orientation = quat_to_euler(
+                        rot.get("X", 0.0), rot.get("Y", 0.0),
+                        rot.get("Z", 0.0), rot.get("W", 1.0))
                 try:
                     vel = app.ue._call_function(
                         obj_path, "GetPhysicsLinearVelocity")

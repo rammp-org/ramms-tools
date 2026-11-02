@@ -261,8 +261,8 @@ ramms-gripper --interactive                      # REPL mode
 
 ```bash
 ramms-rammp-gen1 --describe                           # Show motors and positions
-ramms-rammp-gen1 --set-angular YawMotor 45.0          # Set angular motor target
-ramms-rammp-gen1 --set-linear LiftMotor 50.0          # Set linear motor target (cm)
+ramms-rammp-gen1 --set-angular motor_swing_arm_l 5.0   # Set angular motor target (degrees)
+ramms-rammp-gen1 --set-linear dw_main_plate_l 2.0     # Set linear motor target (cm)
 ramms-rammp-gen1 --home                               # All motors to 0
 ramms-rammp-gen1 --interactive                        # REPL mode
 ```
@@ -388,7 +388,7 @@ with StreamClient("127.0.0.1", 30030) as client:
         # Per-channel stats
         stats = client.get_channel_stats()
         for ch, cs in stats.items():
-            print(f"  Ch {ch}: {cs.fps:.1f} fps, {cs.frames} frames")
+            print(f"  Ch {ch}: {cs.fps():.1f} fps, {cs.frames} frames")
 
 # Send images to UE
 with StreamSender("127.0.0.1", 30030) as sender:

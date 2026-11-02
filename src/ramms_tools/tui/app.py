@@ -34,7 +34,7 @@ class RammsTUI(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
-        Binding("h", "home_all", "Home All"),
+        Binding("h", "home_all", "Home (this tab)"),
         Binding("1", "tab('dashboard')", "Dashboard", show=False),
         Binding("2", "tab('arm')", "Arm", show=False),
         Binding("3", "tab('rammp-gen1')", "RAMMP Gen1", show=False),
@@ -83,7 +83,7 @@ class RammsTUI(App):
         # Activate dashboard by default
         self._activate_page("tab-dashboard")
 
-    @work(exclusive=True, thread=True)
+    @work(exclusive=True, thread=True, group="poll")
     def _check_connection(self) -> None:
         if not self.ue:
             return
@@ -172,19 +172,18 @@ class RammsTUI(App):
                 pass
 
     def action_home_all(self) -> None:
-        """Home all joints and motors."""
-        try:
-            arm = self.query_one("#page-arm", ArmPage)
-            if arm:
-                arm._home_all()
-        except Exception:
-            pass
-        try:
-            page = self.query_one("#page-rammp-gen1", RammpGen1Page)
-            if page:
-                page._home_all()
-        except Exception:
-            pass
+        """Home the joints or motors of the tab on screen.
+
+        Only that tab's: a key press elsewhere must not drive the arm or
+        drop the chair's lifts (during a curb crossing, say).
+        """
+        active = self.query_one("#tabs", TabbedContent).active
+        if active == "tab-arm":
+            self.query_one("#page-arm", ArmPage)._home_all()
+        elif active == "tab-rammp-gen1":
+            self.query_one("#page-rammp-gen1", RammpGen1Page)._home_all()
+        else:
+            self.notify("Open the Arm or RAMMP Gen1 tab to home it.")
 
     def action_tab(self, tab_name: str) -> None:
         tabs = self.query_one("#tabs", TabbedContent)

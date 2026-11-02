@@ -134,6 +134,7 @@ def run_synthetic(args: argparse.Namespace) -> None:
             if frame_interval > elapsed:
                 time.sleep(frame_interval - elapsed)
 
+        sender.disconnect(flush=True)  # send what is still queued
         print(f"\nDone! Sent {args.num_frames} frames.")
     finally:
         sender.disconnect()
@@ -893,13 +894,14 @@ def run_capture_replay(args: argparse.Namespace) -> None:
 
         elapsed_total = time.monotonic() - t_start
         send_fps = frame_count / max(send_time_accum, 0.001)
+        sender.disconnect(flush=True)  # send what is still queued
         print(f"\nDone! Sent {frame_count} frames × {num_cameras} cameras "
               f"= {total_sent} total in {elapsed_total:.1f}s "
               f"(tx {send_fps:.1f} fps, "
               f"overall {frame_count / max(elapsed_total, 0.001):.1f} fps)")
     finally:
         sender.disconnect()
-        pool.shutdown(wait=False)
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,13 +1073,14 @@ def run_mask_replay(args: argparse.Namespace) -> None:
 
         elapsed_total = time.monotonic() - t_start
         send_fps = frame_count / max(send_time_accum, 0.001)
+        sender.disconnect(flush=True)  # send what is still queued
         print(f"\nDone! Sent {frame_count} mask frames "
               f"in {elapsed_total:.1f}s "
               f"(tx {send_fps:.1f} fps, "
               f"overall {frame_count / max(elapsed_total, 0.001):.1f} fps)")
     finally:
         sender.disconnect()
-        pool.shutdown(wait=False)
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1242,13 +1245,14 @@ def run_motion_replay(args: argparse.Namespace) -> None:
 
         elapsed_total = time.monotonic() - t_start
         send_fps = frame_count / max(send_time_accum, 0.001)
+        sender.disconnect(flush=True)  # send what is still queued
         print(f"\nDone! Sent {frame_count} motion frames "
               f"in {elapsed_total:.1f}s "
               f"(tx {send_fps:.1f} fps, "
               f"overall {frame_count / max(elapsed_total, 0.001):.1f} fps)")
     finally:
         sender.disconnect()
-        pool.shutdown(wait=False)
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _parse_material_params(raw: list[str]) -> dict[str, float] | None:
@@ -1384,20 +1388,29 @@ def main() -> None:
             print(f"  {actor}/{cam}  ({n} frames)")
         sys.exit(0)
 
-    if args.synthetic:
-        if args.capture_dir or args.mask_dir or args.motion_dir:
-            print("ERROR: --synthetic cannot be combined with "
-                  "--capture-dir, --mask-dir, or --motion-dir")
-            sys.exit(1)
-        run_synthetic(args)
-    elif args.capture_dir:
-        # capture-dir mode: masks and motion are integrated into the same loop
-        run_capture_replay(args)
-    elif args.mask_dir and not args.motion_dir:
-        run_mask_replay(args)
-    elif args.motion_dir and not args.mask_dir:
-        run_motion_replay(args)
-    elif args.mask_dir and args.motion_dir:
+    try:
+        if args.synthetic:
+            if args.capture_dir or args.mask_dir or args.motion_dir:
+                print("ERROR: --synthetic cannot be combined with "
+                      "--capture-dir, --mask-dir, or --motion-dir")
+                sys.exit(1)
+            run_synthetic(args)
+            return
+        if args.capture_dir:
+            # capture-dir mode: masks and motion are integrated into the same loop
+            run_capture_replay(args)
+            return
+        if args.mask_dir and not args.motion_dir:
+            run_mask_replay(args)
+            return
+        if args.motion_dir and not args.mask_dir:
+            run_motion_replay(args)
+            return
+    except (ConnectionError, TimeoutError) as e:
+        print(f"ERROR: cannot reach the RMSS server at {args.host}:{args.port} ({e})")
+        sys.exit(1)
+
+    if args.mask_dir and args.motion_dir:
         print("ERROR: --mask-dir + --motion-dir without --capture-dir is not "
               "supported. Use --capture-dir to stream them together.")
         sys.exit(1)

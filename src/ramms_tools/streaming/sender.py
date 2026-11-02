@@ -227,8 +227,10 @@ class StreamSender:
         self.connect()
         return self
 
-    def __exit__(self, *args) -> None:
-        self.disconnect()
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # Leaving the block normally sends what was queued in it; on an
+        # exception the queue is dropped.
+        self.disconnect(flush=exc_type is None)
 
     # ── Send helpers ──────────────────────────────────────────────────
 
@@ -355,7 +357,7 @@ class StreamSender:
         if compression != Compression.NONE:
             msg.header.set_compression(compression)
 
-        meta = metadata or {}
+        meta = dict(metadata or {})  # a copy: the caller may reuse its dict
         meta.setdefault("w", width)
         meta.setdefault("h", height)
         meta.setdefault("fmt", fmt)
@@ -451,7 +453,7 @@ class StreamSender:
         msg.header.sequence_num = self._next_seq(channel)
         msg.header.timestamp = StreamHeader.now_timestamp()
 
-        meta = metadata or {}
+        meta = dict(metadata or {})  # a copy: the caller may reuse its dict
         meta.setdefault("w", width)
         meta.setdefault("h", height)
         meta.setdefault("fmt", "float32")
@@ -525,7 +527,7 @@ class StreamSender:
         msg.header.sequence_num = self._next_seq(channel)
         msg.header.timestamp = StreamHeader.now_timestamp()
 
-        meta = metadata or {}
+        meta = dict(metadata or {})  # a copy: the caller may reuse its dict
         meta.setdefault("w", width)
         meta.setdefault("h", height)
         meta.setdefault("fmt", "16uc1")
@@ -618,7 +620,7 @@ class StreamSender:
         if compression != Compression.NONE:
             msg.header.set_compression(compression)
 
-        meta = metadata or {}
+        meta = dict(metadata or {})  # a copy: the caller may reuse its dict
         meta.setdefault("w", width)
         meta.setdefault("h", height)
         meta.setdefault("fmt", fmt)
@@ -754,7 +756,7 @@ class StreamSender:
         msg.header.sequence_num = self._next_seq(channel)
         msg.header.timestamp = StreamHeader.now_timestamp()
 
-        meta = metadata or {}
+        meta = dict(metadata or {})  # a copy: the caller may reuse its dict
         meta.setdefault("w", width)
         meta.setdefault("h", height)
         meta.setdefault("fmt", "rg32f")
@@ -812,10 +814,12 @@ class StreamSender:
         The directory should contain frame_XXXXXXX.exr + frame_XXXXXXX.json pairs.
         If fps > 0, paces sending at that rate.  Returns number of frames sent.
 
-        NOTE: This reads the JSON metadata and sends it along. The EXR pixel data
-        is read as raw bytes — the UE sink component will need to interpret the format.
-        For simplicity, this sends the raw EXR file bytes with message type IMAGE_DATA.
+        Each EXR is decoded to BGRA8 (the UE sink has no EXR format) and sent
+        with its JSON metadata.  Needs OpenEXR (``pip install ramms-tools[exr]``).
         """
+        # The decoder ramms-stream-test's capture replay uses.
+        from ramms_tools.scripts.stream_test import load_exr_frame
+
         capture_path = Path(capture_dir)
         if not capture_path.is_dir():
             raise FileNotFoundError(f"Capture directory not found: {capture_dir}")
@@ -843,23 +847,25 @@ class StreamSender:
             with open(jf, "r") as f:
                 meta = json.load(f)
 
-            # Read EXR as raw bytes
-            with open(exr_file, "rb") as f:
-                exr_data = f.read()
+            frame = load_exr_frame(exr_file)
+            if frame is None:
+                logger.warning("Could not read %s, skipping", exr_file.name)
+                continue
+            bgra, _, width, height = frame
 
             meta["source"] = "capture_replay"
             meta["original_file"] = exr_file.name
 
             self.send_image(
                 channel=channel,
-                image_bytes=exr_data,
-                width=meta.get("Width", meta.get("w", 0)),
-                height=meta.get("Height", meta.get("h", 0)),
-                fmt="exr",
+                image_bytes=bgra.tobytes(),
+                width=width,
+                height=height,
+                fmt="bgra8",
                 metadata=meta,
             )
             sent += 1
-            logger.debug("Sent frame %s (%d bytes)", exr_file.name, len(exr_data))
+            logger.debug("Sent frame %s (%dx%d)", exr_file.name, width, height)
 
             if frame_interval > 0:
                 time.sleep(frame_interval)

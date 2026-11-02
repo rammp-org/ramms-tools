@@ -38,6 +38,8 @@ from typing import Callable, Iterable, Optional
 
 from ramms_tools.streaming.protocol import (
     HEADER_SIZE,
+    MAGIC,
+    VERSION,
     Compression,
     MessageType,
     StreamHeader,
@@ -58,6 +60,23 @@ _FRAME_TYPES = frozenset({
     MessageType.OCTO_MAP,
     MessageType.IMAGE_DATA,
 })
+
+
+def _decompress_rgbd(msg: StreamMessage) -> tuple[bytes, bytes]:
+    """A compressed FRAME_RGBD is a JPEG colour block then an LZ4 depth block
+    (header flagged JPEG); the metadata's rgb_size gives the split.  Returns
+    the raw payload (BGRA8 then float32 depth) and metadata restating the
+    raw sizes."""
+    meta = msg.get_metadata_json()
+    rgb_size = int(meta.get("rgb_size", len(msg.payload)))
+    rgb = decompress_payload(msg.payload[:rgb_size], Compression.JPEG)
+    depth = msg.payload[rgb_size:]
+    if meta.get("depth_comp") == "lz4":
+        depth = decompress_payload(depth, Compression.LZ4)
+    for key in ("rgb_comp", "depth_comp", "rgb_raw_size", "depth_raw_size"):
+        meta.pop(key, None)
+    meta["rgb_size"], meta["depth_size"] = len(rgb), len(depth)
+    return rgb + depth, json.dumps(meta).encode("utf-8")
 
 
 @dataclass
@@ -241,6 +260,10 @@ class StreamClient:
 
     def _recv_loop(self) -> None:
         buf = bytearray()
+        # Bytes the next message needs: a large frame arrives over many
+        # recv calls, and copying the buffer to parse it after each one
+        # would be quadratic in the frame size.
+        need = HEADER_SIZE
         while not self._stopping.is_set():
             try:
                 self._sock.settimeout(0.2)
@@ -259,11 +282,25 @@ class StreamClient:
                     self._connected.clear()
                 break
 
+            if len(buf) < need:
+                continue
+
             # Parse complete messages — convert to bytes once per recv
             # iteration, then use offsets to avoid repeated copies.
             buf_bytes = bytes(buf)
             offset = 0
             while True:
+                if (len(buf_bytes) - offset >= HEADER_SIZE
+                        and (buf_bytes[offset:offset + 4] != MAGIC
+                             or buf_bytes[offset + 4] != VERSION)):
+                    # Lost framing (corrupt bytes or another protocol
+                    # version): skip to the next magic instead of waiting
+                    # forever for a message that never completes.
+                    nxt = buf_bytes.find(MAGIC, offset + 1)
+                    skip_to = nxt if nxt >= 0 else len(buf_bytes) - (len(MAGIC) - 1)
+                    logger.warning("Bad RMSS header; skipped %d bytes", skip_to - offset)
+                    offset = skip_to
+                    continue
                 result = StreamMessage.deserialize(buf_bytes, offset)
                 if result is None:
                     break
@@ -272,6 +309,9 @@ class StreamClient:
                 self.messages_received += 1
 
                 mtype = msg.header.message_type
+                if not isinstance(mtype, MessageType):
+                    logger.debug("Skipping message with unknown opcode 0x%02X", mtype)
+                    continue
 
                 # Handle PING replies out-of-band (don't enqueue)
                 if mtype == MessageType.PING:
@@ -303,9 +343,12 @@ class StreamClient:
                 comp = msg.header.get_compression()
                 if self._auto_decompress and comp != Compression.NONE:
                     try:
-                        msg.payload = decompress_payload(
-                            msg.payload, comp,
-                        )
+                        if mtype == MessageType.FRAME_RGBD:
+                            msg.payload, msg.metadata = _decompress_rgbd(msg)
+                        else:
+                            msg.payload = decompress_payload(
+                                msg.payload, comp,
+                            )
                         msg.header.set_compression(Compression.NONE)
                     except Exception:
                         logger.exception("Decompression failed for channel %d", ch)
@@ -329,6 +372,8 @@ class StreamClient:
             # Compact buffer
             if offset > 0:
                 del buf[:offset]
+            header = StreamHeader.from_bytes(bytes(buf[:HEADER_SIZE]))
+            need = header.total_message_size if header else HEADER_SIZE
 
     # ── Polling API ───────────────────────────────────────────────────
 

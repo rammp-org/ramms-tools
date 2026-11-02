@@ -83,6 +83,19 @@ def resolve_target(ue: UnrealRemote, actor_hint: str,
 
     bone = bone_name if bone_name else None
     if bone:
+        # Bones and sockets belong to a component; on an unknown name UE
+        # quietly returns the component's own transform.
+        if not is_component:
+            raise RuntimeError("--bone needs --component (the mesh it is on)")
+        try:
+            exists = ue._call_function(target_path, "DoesSocketExist",
+                                       {"InSocketName": bone})
+        except UnrealRemoteError:
+            exists = None   # not allow-listed by this simulator: can't check
+        if isinstance(exists, dict):
+            exists = exists.get("ReturnValue")
+        if exists is False:
+            raise RuntimeError(f"No bone or socket '{bone}' on {target_path}")
         label = f"{label}[{bone}]"
 
     return {
@@ -132,12 +145,13 @@ def read_imu_sample(ue: UnrealRemote, target: dict,
     is_component = target.get("is_component", False)
     now = time.time()
 
-    if bone:
-        # For bones, call GetBoneTransform-like functions
-        # Use GetSocketTransform which works for both sockets and bones
+    if bone or is_component:
+        # GetSocketTransform works for bones, sockets and, with no socket
+        # name, the component itself, always in world space (a component's
+        # RelativeLocation/RelativeRotation are relative to its parent).
         try:
             result = ue._call_function(obj_path, "GetSocketTransform", {
-                "InSocketName": bone,
+                "InSocketName": bone or "None",
                 "TransformSpace": "RTS_World",
             })
 
@@ -159,61 +173,31 @@ def read_imu_sample(ue: UnrealRemote, target: dict,
             orientation = {"roll": 0, "pitch": 0, "yaw": 0}
     else:
         # For actors: use K2_GetActorLocation/K2_GetActorRotation (UFUNCTIONs)
-        # For components: use properties RelativeLocation/RelativeRotation
-
-        if is_component:
-            try:
-                loc = ue._get_property(obj_path, "RelativeLocation")
-                if isinstance(loc, dict):
-                    position = {
-                        "x": loc.get("X", 0.0),
-                        "y": loc.get("Y", 0.0),
-                        "z": loc.get("Z", 0.0),
-                    }
-                else:
-                    position = {"x": 0, "y": 0, "z": 0}
-            except UnrealRemoteError:
+        try:
+            loc = ue._call_function(obj_path, "K2_GetActorLocation")
+            if isinstance(loc, dict):
+                position = {
+                    "x": loc.get("X", 0.0),
+                    "y": loc.get("Y", 0.0),
+                    "z": loc.get("Z", 0.0),
+                }
+            else:
                 position = {"x": 0, "y": 0, "z": 0}
+        except UnrealRemoteError:
+            position = {"x": 0, "y": 0, "z": 0}
 
-            try:
-                rot = ue._get_property(obj_path, "RelativeRotation")
-                if isinstance(rot, dict):
-                    orientation = {
-                        "roll": rot.get("Roll", 0.0),
-                        "pitch": rot.get("Pitch", 0.0),
-                        "yaw": rot.get("Yaw", 0.0),
-                    }
-                else:
-                    orientation = {"roll": 0, "pitch": 0, "yaw": 0}
-            except UnrealRemoteError:
+        try:
+            rot = ue._call_function(obj_path, "K2_GetActorRotation")
+            if isinstance(rot, dict):
+                orientation = {
+                    "roll": rot.get("Roll", 0.0),
+                    "pitch": rot.get("Pitch", 0.0),
+                    "yaw": rot.get("Yaw", 0.0),
+                }
+            else:
                 orientation = {"roll": 0, "pitch": 0, "yaw": 0}
-        else:
-            # Actor-level functions
-            try:
-                loc = ue._call_function(obj_path, "K2_GetActorLocation")
-                if isinstance(loc, dict):
-                    position = {
-                        "x": loc.get("X", 0.0),
-                        "y": loc.get("Y", 0.0),
-                        "z": loc.get("Z", 0.0),
-                    }
-                else:
-                    position = {"x": 0, "y": 0, "z": 0}
-            except UnrealRemoteError:
-                position = {"x": 0, "y": 0, "z": 0}
-
-            try:
-                rot = ue._call_function(obj_path, "K2_GetActorRotation")
-                if isinstance(rot, dict):
-                    orientation = {
-                        "roll": rot.get("Roll", 0.0),
-                        "pitch": rot.get("Pitch", 0.0),
-                        "yaw": rot.get("Yaw", 0.0),
-                    }
-                else:
-                    orientation = {"roll": 0, "pitch": 0, "yaw": 0}
-            except UnrealRemoteError:
-                orientation = {"roll": 0, "pitch": 0, "yaw": 0}
+        except UnrealRemoteError:
+            orientation = {"roll": 0, "pitch": 0, "yaw": 0}
 
     # -- Fetch physics velocity and angular velocity from UE when available --
     phys_velocity_cm = {"x": 0, "y": 0, "z": 0}
@@ -290,7 +274,8 @@ def read_imu_sample(ue: UnrealRemote, target: dict,
     has_phys_angvel = any(phys_angular_vel.values())
 
     if prev_sample and dt > 0:
-        prev_pos = prev_sample["position"]
+        # The raw cm position: the sample's "position" is in metres.
+        prev_pos = prev_sample["_position_cm"]
 
         # -- Linear velocity --
         if has_phys_vel:
@@ -362,6 +347,7 @@ def read_imu_sample(ue: UnrealRemote, target: dict,
         "orientation": orientation,   # always world-referenced, degrees
         "position": position_m,       # metres, always world frame
         "_velocity": velocity_for_next,  # m/s, internal
+        "_position_cm": position,        # cm, internal: the next sample's deltas
     }
 
     if frame == "world":
@@ -517,6 +503,8 @@ def main():
                         help="Enable debug logging")
 
     args = parser.parse_args()
+    if args.rate <= 0:
+        parser.error("--rate must be above 0")
 
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)

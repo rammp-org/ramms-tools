@@ -120,7 +120,8 @@ def discover(ue: UnrealRemote) -> None:
 
     print("\n=== Actors (via GEngine WorldContexts) ===")
     try:
-        result = call_bridge(ue, "GetAllActorPaths")
+        # An actor query: it is on the core bridge, not the UI one.
+        result = ue._call_function(UnrealRemote.RAMMS_CORE_BRIDGE, "GetAllActorPaths")
         paths = result if isinstance(result, list) else []
         if paths:
             for p in paths[:50]:

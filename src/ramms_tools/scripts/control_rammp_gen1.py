@@ -5,8 +5,8 @@ Control RAMMP Gen1 motor positions via Unreal Engine Remote Control API.
 Usage:
     python control_rammp_gen1.py --list-actors              # Find actors with RAMMP Gen1 component
     python control_rammp_gen1.py --describe                 # Show motors and current positions
-    python control_rammp_gen1.py --set-angular Yaw 45.0     # Set angular motor target
-    python control_rammp_gen1.py --set-linear Lift 50.0     # Set linear motor target (cm)
+    python control_rammp_gen1.py --set-angular motor_swing_arm_l 5.0   # Set angular motor target
+    python control_rammp_gen1.py --set-linear dw_main_plate_l 2.0     # Set linear motor target (cm)
     python control_rammp_gen1.py --interactive              # Interactive REPL
     python control_rammp_gen1.py --home                     # All motors to 0
 
@@ -119,13 +119,24 @@ def describe_rammp_gen1(comp):
     print()
 
 
+def _check_motor(motors: list[dict], name: str, kind: str) -> None:
+    """Raise ValueError unless name is one of the motors (the controller
+    ignores an unknown name, so the command would silently do nothing).
+    Unreal's names ignore case."""
+    names = [m.get("ConstraintName", "") for m in motors]
+    if motors and name.lower() not in (n.lower() for n in names):
+        raise ValueError(f"no {kind} motor '{name}' (have: {', '.join(names)})")
+
+
 def set_angular_motor(comp, name: str, angle: float):
     """Set an angular motor target angle."""
+    _check_motor(get_angular_motors(comp), name, "angular")
     comp.call("SetAngularMotorTarget", MotorName=name, TargetAngle=angle)
 
 
 def set_linear_motor(comp, name: str, position: float):
     """Set a linear motor target position in cm."""
+    _check_motor(get_linear_motors(comp), name, "linear")
     comp.call("SetLinearMotorTarget", MotorName=name, TargetPosition=position)
 
 
@@ -194,8 +205,11 @@ def interactive_mode(comp):
                 print(f"  Error: {e}")
 
         elif cmd == "home":
-            count = home_all(comp)
-            print(f"  Homed {count} motors to 0")
+            try:
+                count = home_all(comp)
+                print(f"  Homed {count} motors to 0")
+            except UnrealRemoteError as e:
+                print(f"  Error: {e}")
 
         else:
             print(f"  Unknown command: {cmd}")
@@ -262,23 +276,27 @@ def main():
             sys.exit(1)
         print(f"Found: {comp.object_path}\n")
 
-    if args.describe:
-        describe_rammp_gen1(comp)
-    elif args.set_angular:
-        name, angle = args.set_angular[0], float(args.set_angular[1])
-        set_angular_motor(comp, name, angle)
-        print(f"Angular {name} → {angle}°")
-    elif args.set_linear:
-        name, pos = args.set_linear[0], float(args.set_linear[1])
-        set_linear_motor(comp, name, pos)
-        print(f"Linear {name} → {pos}cm")
-    elif args.home:
-        count = home_all(comp)
-        print(f"Homed {count} motors to 0")
-    elif args.interactive:
-        interactive_mode(comp)
-    else:
-        parser.print_help()
+    try:
+        if args.describe:
+            describe_rammp_gen1(comp)
+        elif args.set_angular:
+            name, angle = args.set_angular[0], float(args.set_angular[1])
+            set_angular_motor(comp, name, angle)
+            print(f"Angular {name} → {angle}°")
+        elif args.set_linear:
+            name, pos = args.set_linear[0], float(args.set_linear[1])
+            set_linear_motor(comp, name, pos)
+            print(f"Linear {name} → {pos}cm")
+        elif args.home:
+            count = home_all(comp)
+            print(f"Homed {count} motors to 0")
+        elif args.interactive:
+            interactive_mode(comp)
+        else:
+            parser.print_help()
+    except (ValueError, UnrealRemoteError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
