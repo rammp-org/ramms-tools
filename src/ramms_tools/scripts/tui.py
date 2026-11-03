@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """RAMMS TUI — Terminal UI for monitoring and controlling RAMMS robotics.
 
-Launch the interactive TUI dashboard for the Mebot, Kinova arm, and
+Launch the interactive TUI dashboard for the RAMMP Gen1, Kinova arm, and
 IMU data streaming.
 
 Usage:
     ramms-tui                         # Connect to localhost:30010
     ramms-tui --host 192.168.1.10     # Connect to remote host
-    ramms-tui --port 30030            # Use non-default streaming port
+    ramms-tui --port 30011            # Use a non-default Remote Control port
 """
 
 import argparse

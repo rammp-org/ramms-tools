@@ -17,6 +17,7 @@ from ramms_tools.streaming.sender import StreamSender
 from ramms_tools.streaming.compression import (
     has_jpeg,
     has_lz4,
+    can_decompress,
     decompress_payload,
     compress_jpeg,
     compress_lz4,
@@ -33,6 +34,7 @@ __all__ = [
     "StreamSender",
     "has_jpeg",
     "has_lz4",
+    "can_decompress",
     "decompress_payload",
     "compress_jpeg",
     "compress_lz4",

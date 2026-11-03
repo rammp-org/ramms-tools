@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Control Mebot motor positions via Unreal Engine Remote Control API.
+Control RAMMP Gen1 motor positions via Unreal Engine Remote Control API.
 
 Usage:
-    python control_mebot.py --list-actors              # Find actors with Mebot component
-    python control_mebot.py --describe                 # Show motors and current positions
-    python control_mebot.py --set-angular Yaw 45.0     # Set angular motor target
-    python control_mebot.py --set-linear Lift 50.0     # Set linear motor target (cm)
-    python control_mebot.py --interactive              # Interactive REPL
-    python control_mebot.py --home                     # All motors to 0
+    python control_rammp_gen1.py --list-actors              # Find actors with RAMMP Gen1 component
+    python control_rammp_gen1.py --describe                 # Show motors and current positions
+    python control_rammp_gen1.py --set-angular motor_swing_arm_l 5.0   # Set angular motor target
+    python control_rammp_gen1.py --set-linear dw_main_plate_l 2.0     # Set linear motor target (cm)
+    python control_rammp_gen1.py --interactive              # Interactive REPL
+    python control_rammp_gen1.py --home                     # All motors to 0
 
 Actor/component discovery:
-    By default the script finds the first actor with a MebotControllerComponent.
+    By default the script finds the first actor with a RammpGen1ControllerComponent.
     Use --actor to specify an actor path, and --component for the component name.
 
 Requires Unreal Engine running with Remote Control API plugin enabled (port 30010).
@@ -24,19 +24,19 @@ import sys
 from ramms_tools.unreal_remote import UnrealRemote, UnrealRemoteError
 
 
-def find_mebot_actor(ue: UnrealRemote, actor_hint: str = "") -> tuple:
+def find_rammp_gen1_actor(ue: UnrealRemote, actor_hint: str = "") -> tuple:
     """
-    Find an actor with a MebotControllerComponent.
+    Find an actor with a RammpGen1ControllerComponent.
 
     Returns (actor_proxy, component_proxy) or (None, None).
     """
     if actor_hint:
         actor = ue.actor(actor_hint)
-        comp = _find_component(ue, actor.object_path, "MebotController")
+        comp = _find_component(ue, actor.object_path, "RammpGen1Controller")
         return (actor, comp) if comp else (actor, None)
 
     # Single server-side call to find actors with matching component
-    results = ue.find_actors_by_component("MebotController")
+    results = ue.find_actors_by_component("RammpGen1Controller")
     if results:
         r = results[0]
         return r["actor_proxy"], ue.actor(r["component_path"])
@@ -44,7 +44,7 @@ def find_mebot_actor(ue: UnrealRemote, actor_hint: str = "") -> tuple:
     # Fallback: iterate actors (slower)
     actors = ue.find_actors()
     for actor in actors:
-        comp = _find_component(ue, actor.object_path, "MebotController")
+        comp = _find_component(ue, actor.object_path, "RammpGen1Controller")
         if comp:
             return actor, comp
     return None, None
@@ -89,9 +89,9 @@ def get_linear_motors(comp) -> list[dict]:
     return []
 
 
-def describe_mebot(comp):
+def describe_rammp_gen1(comp):
     """Print current motor state."""
-    print("\nMebot Controller")
+    print("\nRAMMP Gen1 Controller")
     print("=" * 50)
 
     angular = get_angular_motors(comp)
@@ -119,13 +119,24 @@ def describe_mebot(comp):
     print()
 
 
+def _check_motor(motors: list[dict], name: str, kind: str) -> None:
+    """Raise ValueError unless name is one of the motors (the controller
+    ignores an unknown name, so the command would silently do nothing).
+    Unreal's names ignore case."""
+    names = [m.get("ConstraintName", "") for m in motors]
+    if motors and name.lower() not in (n.lower() for n in names):
+        raise ValueError(f"no {kind} motor '{name}' (have: {', '.join(names)})")
+
+
 def set_angular_motor(comp, name: str, angle: float):
     """Set an angular motor target angle."""
+    _check_motor(get_angular_motors(comp), name, "angular")
     comp.call("SetAngularMotorTarget", MotorName=name, TargetAngle=angle)
 
 
 def set_linear_motor(comp, name: str, position: float):
     """Set a linear motor target position in cm."""
+    _check_motor(get_linear_motors(comp), name, "linear")
     comp.call("SetLinearMotorTarget", MotorName=name, TargetPosition=position)
 
 
@@ -146,8 +157,8 @@ def home_all(comp):
 
 
 def interactive_mode(comp):
-    """Interactive REPL for controlling mebot motors."""
-    print("\n=== Mebot Motor Controller ===")
+    """Interactive REPL for controlling RAMMP Gen1 motors."""
+    print("\n=== RAMMP Gen1 Motor Controller ===")
     print("Commands:")
     print("  motors                          Show all motors")
     print("  angular <name> <angle>          Set angular motor (degrees)")
@@ -158,7 +169,7 @@ def interactive_mode(comp):
 
     while True:
         try:
-            line = input("mebot> ").strip()
+            line = input("rammp-gen1> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
             break
@@ -173,7 +184,7 @@ def interactive_mode(comp):
             break
 
         elif cmd in ("motors", "state", "read", "describe"):
-            describe_mebot(comp)
+            describe_rammp_gen1(comp)
 
         elif cmd in ("angular", "ang", "a") and len(parts) >= 3:
             try:
@@ -194,8 +205,11 @@ def interactive_mode(comp):
                 print(f"  Error: {e}")
 
         elif cmd == "home":
-            count = home_all(comp)
-            print(f"  Homed {count} motors to 0")
+            try:
+                count = home_all(comp)
+                print(f"  Homed {count} motors to 0")
+            except UnrealRemoteError as e:
+                print(f"  Error: {e}")
 
         else:
             print(f"  Unknown command: {cmd}")
@@ -203,7 +217,7 @@ def interactive_mode(comp):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Control Mebot motors via Unreal Remote Control")
+        description="Control RAMMP Gen1 motors via Unreal Remote Control")
     parser.add_argument("--actor", default="",
                         help="Actor path (auto-discovered if omitted)")
     parser.add_argument("--component", default="",
@@ -215,7 +229,7 @@ def main():
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--list-actors", action="store_true",
-                       help="List actors with Mebot components")
+                       help="List actors with RAMMP Gen1 components")
     group.add_argument("--describe", action="store_true",
                        help="Show motors and current state")
     group.add_argument("--set-angular", nargs=2, metavar=("NAME", "ANGLE"),
@@ -240,45 +254,49 @@ def main():
     print("Connected!\n")
 
     if args.list_actors:
-        print("Searching for actors with MebotControllerComponent...")
-        results = ue.find_actors_by_component("MebotController")
+        print("Searching for actors with RammpGen1ControllerComponent...")
+        results = ue.find_actors_by_component("RammpGen1Controller")
         for r in results:
             print(f"  Actor: {r['actor_path']}")
             print(f"  Component: {r['component_path']} ({r['component_class']})")
             print()
         if not results:
-            print("  No actors with MebotControllerComponent found")
+            print("  No actors with RammpGen1ControllerComponent found")
         return
 
     # Find or connect to the component
     if args.component:
         comp = ue.actor(args.component)
     else:
-        print("Searching for Mebot controller...")
-        actor, comp = find_mebot_actor(ue, args.actor)
+        print("Searching for RAMMP Gen1 controller...")
+        actor, comp = find_rammp_gen1_actor(ue, args.actor)
         if not comp:
-            print("No MebotControllerComponent found!")
+            print("No RammpGen1ControllerComponent found!")
             print("Use --list-actors to see available actors, or --actor / --component to specify.")
             sys.exit(1)
         print(f"Found: {comp.object_path}\n")
 
-    if args.describe:
-        describe_mebot(comp)
-    elif args.set_angular:
-        name, angle = args.set_angular[0], float(args.set_angular[1])
-        set_angular_motor(comp, name, angle)
-        print(f"Angular {name} → {angle}°")
-    elif args.set_linear:
-        name, pos = args.set_linear[0], float(args.set_linear[1])
-        set_linear_motor(comp, name, pos)
-        print(f"Linear {name} → {pos}cm")
-    elif args.home:
-        count = home_all(comp)
-        print(f"Homed {count} motors to 0")
-    elif args.interactive:
-        interactive_mode(comp)
-    else:
-        parser.print_help()
+    try:
+        if args.describe:
+            describe_rammp_gen1(comp)
+        elif args.set_angular:
+            name, angle = args.set_angular[0], float(args.set_angular[1])
+            set_angular_motor(comp, name, angle)
+            print(f"Angular {name} → {angle}°")
+        elif args.set_linear:
+            name, pos = args.set_linear[0], float(args.set_linear[1])
+            set_linear_motor(comp, name, pos)
+            print(f"Linear {name} → {pos}cm")
+        elif args.home:
+            count = home_all(comp)
+            print(f"Homed {count} motors to 0")
+        elif args.interactive:
+            interactive_mode(comp)
+        else:
+            parser.print_help()
+    except (ValueError, UnrealRemoteError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

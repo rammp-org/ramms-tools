@@ -128,7 +128,12 @@ class StreamHeader:
         if magic != MAGIC or ver != VERSION:
             return None
         h = cls()
-        h.message_type = MessageType(msg_type)
+        try:
+            h.message_type = MessageType(msg_type)
+        except ValueError:
+            # An opcode this client doesn't know (a newer server): kept as
+            # the raw int so the message can still be framed and skipped.
+            h.message_type = msg_type
         h.channel_id = channel
         h.flags = flags
         h.sequence_num = seq

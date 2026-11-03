@@ -81,7 +81,7 @@ class ArmPage(Container):
             return
         self._refresh_angles()
 
-    @work(exclusive=True, thread=True)
+    @work(exclusive=True, thread=True, group="poll")
     def _refresh_angles(self) -> None:
         app: RammsTUI = self.app  # type: ignore[assignment]
         if not app.ue or not app.connected or not app.arm_comp:

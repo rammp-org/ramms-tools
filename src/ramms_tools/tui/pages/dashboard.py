@@ -78,7 +78,7 @@ class DashboardPage(Container):
         yield Static("RAMMS Control Dashboard", classes="dash-header")
         with Horizontal(classes="dash-row"):
             yield SummaryCard("🦾  Kinova Gen3 Arm", "card-arm")
-            yield SummaryCard("🤖  Mebot Controller", "card-mebot")
+            yield SummaryCard("🤖  RAMMP Gen1 Controller", "card-rammp-gen1")
         with Horizontal(classes="dash-row"):
             yield SummaryCard("📡  System Info", "card-system")
             yield SummaryCard("🧭  IMU", "card-imu")
@@ -91,7 +91,7 @@ class DashboardPage(Container):
             return
         self._refresh_dashboard()
 
-    @work(exclusive=True, thread=True)
+    @work(exclusive=True, thread=True, group="poll")
     def _refresh_dashboard(self) -> None:
         app: RammsTUI = self.app  # type: ignore[assignment]
         if not app.ue or not app.connected:
@@ -123,26 +123,26 @@ class DashboardPage(Container):
             else:
                 arm_detail += "\nGripper: not found"
 
-        # Mebot summary
-        mebot_status = "Not found"
-        mebot_detail = ""
-        mebot_found = False
-        if app.mebot_comp:
-            mebot_found = True
-            mebot_status = "Connected"
+        # RAMMP Gen1 summary
+        rammp_gen1_status = "Not found"
+        rammp_gen1_detail = ""
+        rammp_gen1_found = False
+        if app.rammp_gen1_comp:
+            rammp_gen1_found = True
+            rammp_gen1_status = "Connected"
             try:
-                angular = app.mebot_comp.call("GetAngularMotors")
-                linear = app.mebot_comp.call("GetLinearMotors")
+                angular = app.rammp_gen1_comp.call("GetAngularMotors")
+                linear = app.rammp_gen1_comp.call("GetLinearMotors")
                 na = len(angular) if isinstance(angular, list) else 0
                 nl = len(linear) if isinstance(linear, list) else 0
-                mebot_detail = f"{na} angular + {nl} linear motors"
+                rammp_gen1_detail = f"{na} angular + {nl} linear motors"
             except Exception:
-                mebot_detail = "(read error)"
+                rammp_gen1_detail = "(read error)"
 
         # System info
         host = app.ue.base_url
         arm_path = app.arm_comp.object_path if app.arm_comp else "—"
-        mebot_path = app.mebot_comp.object_path if app.mebot_comp else "—"
+        rammp_gen1_path = app.rammp_gen1_comp.object_path if app.rammp_gen1_comp else "—"
 
         def _update():
             try:
@@ -151,18 +151,18 @@ class DashboardPage(Container):
                 s.set_class(not arm_found, "not-found")
                 self.query_one("#card-arm-detail", Static).update(arm_detail)
 
-                s = self.query_one("#card-mebot-status", Static)
-                s.update(f"{'✓' if mebot_found else '✗'} {mebot_status}")
-                s.set_class(not mebot_found, "not-found")
-                self.query_one("#card-mebot-detail", Static).update(mebot_detail)
+                s = self.query_one("#card-rammp-gen1-status", Static)
+                s.update(f"{'✓' if rammp_gen1_found else '✗'} {rammp_gen1_status}")
+                s.set_class(not rammp_gen1_found, "not-found")
+                self.query_one("#card-rammp-gen1-detail", Static).update(rammp_gen1_detail)
 
                 self.query_one("#card-system-status", Static).update(
                     f"Host: {host}")
                 self.query_one("#card-system-detail", Static).update(
-                    f"Arm: {arm_path}\nMebot: {mebot_path}")
+                    f"Arm: {arm_path}\nRAMMP Gen1: {rammp_gen1_path}")
 
                 self.query_one("#card-imu-status", Static).update(
-                    "Available" if arm_found or mebot_found else "No targets")
+                    "Available" if arm_found or rammp_gen1_found else "No targets")
             except Exception:
                 pass
 

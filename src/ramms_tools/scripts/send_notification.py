@@ -186,12 +186,10 @@ def main():
     print(f"Connecting to UE Remote Control at http://{args.host}:{args.port}...")
     ue = UnrealRemote(host=args.host, http_port=args.port,
                       ui_bridge="/Script/RammsUI.Default__RammsRemoteBridge")
-    try:
-        ue.ping()
-        print("Connected!\n")
-    except Exception as e:
-        print(f"Connection failed: {e}")
+    if not ue.ping():   # returns False rather than raising
+        print("Connection failed!")
         sys.exit(1)
+    print("Connected!\n")
 
     # Dispatch
     if args.dismiss_all:

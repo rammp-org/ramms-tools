@@ -130,7 +130,7 @@ def interactive_mode(comp):
                 angle = float(parts[2])
                 set_joint(comp, idx, angle)
                 print(f"  Joint {idx} → {angle}°")
-            except (ValueError, IndexError) as e:
+            except (ValueError, IndexError, UnrealRemoteError) as e:
                 print(f"  Error: {e}")
 
         elif cmd == "setall" and len(parts) >= 2:
@@ -138,14 +138,17 @@ def interactive_mode(comp):
                 angles = [float(x) for x in parts[1:]]
                 set_all_joints(comp, angles)
                 print(f"  Set {len(angles)} joints: {angles}")
-            except ValueError as e:
+            except (ValueError, UnrealRemoteError) as e:
                 print(f"  Error: {e}")
 
         elif cmd == "home":
-            angles = get_joint_angles(comp)
-            home = [0.0] * len(angles) if angles else [0.0] * 7
-            set_all_joints(comp, home)
-            print(f"  Homed {len(home)} joints to 0°")
+            try:
+                angles = get_joint_angles(comp)
+                home = [0.0] * len(angles) if angles else [0.0] * 7
+                set_all_joints(comp, home)
+                print(f"  Homed {len(home)} joints to 0°")
+            except UnrealRemoteError as e:
+                print(f"  Error: {e}")
 
         else:
             print(f"  Unknown command: {cmd}")
@@ -213,24 +216,28 @@ def main():
             sys.exit(1)
         print(f"Found: {comp.object_path}\n")
 
-    if args.describe:
-        describe_kinova(comp)
-    elif args.set_all:
-        set_all_joints(comp, args.set_all)
-        print(f"Set {len(args.set_all)} joints: {args.set_all}")
-    elif args.set_joint:
-        idx, angle = int(args.set_joint[0]), float(args.set_joint[1])
-        set_joint(comp, idx, angle)
-        print(f"Joint {idx} → {angle}°")
-    elif args.home:
-        angles = get_joint_angles(comp)
-        home = [0.0] * len(angles) if angles else [0.0] * 7
-        set_all_joints(comp, home)
-        print(f"Homed {len(home)} joints to 0°")
-    elif args.interactive:
-        interactive_mode(comp)
-    else:
-        parser.print_help()
+    try:
+        if args.describe:
+            describe_kinova(comp)
+        elif args.set_all:
+            set_all_joints(comp, args.set_all)
+            print(f"Set {len(args.set_all)} joints: {args.set_all}")
+        elif args.set_joint:
+            idx, angle = int(args.set_joint[0]), float(args.set_joint[1])
+            set_joint(comp, idx, angle)
+            print(f"Joint {idx} → {angle}°")
+        elif args.home:
+            angles = get_joint_angles(comp)
+            home = [0.0] * len(angles) if angles else [0.0] * 7
+            set_all_joints(comp, home)
+            print(f"Homed {len(home)} joints to 0°")
+        elif args.interactive:
+            interactive_mode(comp)
+        else:
+            parser.print_help()
+    except (ValueError, UnrealRemoteError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

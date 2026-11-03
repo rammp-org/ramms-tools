@@ -167,6 +167,7 @@ def _run_replay(args: argparse.Namespace) -> None:
             fps=args.replay_fps,
             max_frames=args.max_frames,
         )
+        sender.disconnect(flush=True)  # send what is still queued
         print(f"Replayed {count} frames from {args.replay}")
     finally:
         sender.disconnect()
@@ -241,12 +242,17 @@ def main() -> None:
     args = parser.parse_args()
     _setup_logging(args.verbose)
 
-    if args.replay:
-        _run_replay(args)
-    elif args.ping:
-        _run_ping(args)
-    else:
-        _run_receive(args)
+    try:
+        if args.replay:
+            _run_replay(args)
+        elif args.ping:
+            _run_ping(args)
+        else:
+            _run_receive(args)
+    except (ConnectionError, TimeoutError) as e:
+        print(f"Cannot reach the RMSS server at {args.host}:{args.port} ({e})",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
