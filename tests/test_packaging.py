@@ -14,9 +14,15 @@ is what these tests are for.
 """
 from __future__ import annotations
 
+import os
 import pathlib
+import subprocess
+import sys
+import textwrap
 
 import pytest
+
+import ramms_tools
 
 try:
     import tomllib  # Python >= 3.11
@@ -91,13 +97,49 @@ def test_version_is_single_sourced_from_the_package():
 def test_runtime_dependencies_are_importable_without_the_extras():
     """What rammp-UI-bridge imports must work with the declared deps alone.
 
-    Pillow and lz4 are optional and guarded by try/except in
-    ramms_tools.streaming.compression; if an unguarded import creeps in, this
-    import still succeeds locally (where the extras are installed) but fails on
-    the robot, so assert the guards report cleanly rather than the import.
+    Pillow and lz4 are optional, and ramms_tools.streaming.compression guards
+    both with try/except ImportError. Asserting that here in-process would
+    prove nothing: a development machine has them installed, so an unguarded
+    import would succeed locally and only fail on the robot. Run it in a fresh
+    interpreter with those two packages made unimportable instead.
     """
-    from ramms_tools.streaming import StreamSender, has_jpeg, has_lz4
+    blocked = textwrap.dedent(
+        """
+        import sys
 
-    assert StreamSender is not None
-    assert isinstance(has_jpeg(), bool)
-    assert isinstance(has_lz4(), bool)
+        class Blocker:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] in {"PIL", "lz4"}:
+                    raise ImportError("blocked for test: " + name)
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+
+        from ramms_tools.streaming import StreamSender, has_jpeg, has_lz4
+
+        assert StreamSender is not None, "StreamSender did not import"
+        assert has_jpeg() is False, "has_jpeg() should be False without Pillow"
+        assert has_lz4() is False, "has_lz4() should be False without lz4"
+        print("OK")
+        """
+    )
+
+    # Make ramms_tools importable in the child whether the tests run against an
+    # installed package or a source checkout.
+    package_root = pathlib.Path(ramms_tools.__file__).resolve().parent.parent
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(package_root), env.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
+
+    result = subprocess.run(
+        [sys.executable, "-c", blocked],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        "importing ramms_tools.streaming without Pillow/lz4 failed -- an "
+        f"optional dependency is imported unguarded:\n{result.stderr}"
+    )
+    assert "OK" in result.stdout, result.stdout
