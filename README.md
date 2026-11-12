@@ -9,8 +9,12 @@ Python tools for interacting with RAMMS-based Unreal Engine projects via the
 # From the repo root (editable / development install)
 pip install -e .
 
-# Or install directly from GitHub
+# Or install directly from GitHub (default branch -- moves under you)
 pip install git+https://github.com/rammp-org/ramms-tools.git
+
+# Pin to a release tag instead, for robots and other projects that depend on
+# this one. Tags are what lets a consumer upgrade deliberately.
+pip install 'git+https://github.com/rammp-org/ramms-tools.git@v0.2.1'
 
 # With EXR support (for camera capture replay)
 pip install -e '.[exr]'
@@ -19,6 +23,11 @@ pip install -e '.[exr]'
 ## Requirements
 
 - Python ≥ 3.10
+- NumPy ≥ 1.21. The floor deliberately matches what Ubuntu 22.04 / ROS 2 Humble
+  ships (`python3-numpy` 1.21.5), so installing this package onto a robot does
+  **not** upgrade the system NumPy -- doing so breaks the system `python3-scipy`,
+  which is built against NumPy < 1.25. Newer NumPy (including 2.x) is supported
+  and used on development machines; nothing here requires it.
 - Unreal Engine running with the **Remote Control API** plugin enabled (default port 30010)
   - UE 5.6+ refuses remote function calls that are not allow-listed; the RAMMS project ships
     `Config/DefaultRemoteControl.ini` listing the bridges, robot components and engine getters

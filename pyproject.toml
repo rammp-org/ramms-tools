@@ -1,16 +1,24 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=68.0,<80", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ramms-tools"
-version = "0.2.0"
+# Single-sourced from ramms_tools.__version__ so a release tag, the installed
+# dist metadata and the importable module cannot disagree.
+dynamic = ["version"]
 description = "Python tools for interacting with RAMMS-based Unreal Engine projects via Remote Control API"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
+# Keep this floor at what Ubuntu 22.04 / ROS 2 Humble ships (python3-numpy
+# 1.21.5). Installing ramms-tools onto a robot must not drag NumPy forward:
+# the system python3-scipy 1.8.0 is built against NumPy < 1.25, so an upgrade
+# breaks every ROS node that imports SciPy. Nothing here needs a newer NumPy --
+# the package only uses frombuffer/zeros/empty/clip/copyto/multiply/unique and
+# the fixed-width dtypes, all long-stable API.
 dependencies = [
-    "numpy>=1.24.0",
+    "numpy>=1.21",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -44,6 +52,9 @@ ramms-imu = "ramms_tools.scripts.stream_imu:main"
 ramms-stream-test = "ramms_tools.scripts.stream_test:main"
 ramms-tui = "ramms_tools.scripts.tui:main"
 ramms-worldgen = "ramms_tools.scripts.worldgen_cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "ramms_tools.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
