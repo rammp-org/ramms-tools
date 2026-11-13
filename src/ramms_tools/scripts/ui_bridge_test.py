@@ -36,6 +36,7 @@ import json
 import os
 import select
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -463,6 +464,99 @@ def cmd_events(client, args):
         return 0
 
 
+class VideoFeeder:
+    """Background synthetic video, so boxes have something to sit on.
+
+    The two layers are independent feeds: the scene camera renders
+    `SceneColorStreamID` (channel 0) and the engine overlay renders
+    `OverlayColorStreamID` (channel 2). Sending only one leaves the other
+    blank no matter what objects are pushed at it, which is the single most
+    confusing thing about driving this interface by hand.
+    """
+
+    def __init__(self, client, host, port, width=640, height=360, fps=12.0,
+                 overlay=True):
+        self.client = client
+        self.host, self.port = host, port
+        self.width, self.height, self.fps = width, height, fps
+        self.overlay = overlay
+        self._thread = None
+        self._stop = threading.Event()
+        self.error = None
+
+    def _settings(self):
+        def setting(name, default):
+            try:
+                return self.client.get_setting(name) or default
+            except BridgeError:
+                return default
+
+        scene_color = setting("SceneColorStreamID", "camera/scene/color")
+        overlay_color = setting("OverlayColorStreamID", "engine/overlay")
+        data = setting("SceneDataStreams", []) or []
+        scene_depth = next((d.get("StreamID") for d in data
+                            if d.get("Kind") == "Depth"), "camera/scene/depth")
+        return scene_color, scene_depth, overlay_color
+
+    def _run(self):
+        try:
+            import numpy as np
+
+            from ramms_tools.streaming import StreamSender
+        except ImportError as exc:
+            self.error = f"no video (needs numpy): {exc}"
+            return
+        scene_color, scene_depth, overlay_color = self._settings()
+        w, h = self.width, self.height
+        sender = StreamSender(host=self.host, port=self.port)
+        try:
+            sender.connect()
+        except OSError as exc:
+            self.error = f"no video (RMSS {self.host}:{self.port}): {exc}"
+            return
+        start = time.monotonic()
+        try:
+            while not self._stop.is_set():
+                t = time.monotonic() - start
+                img = np.zeros((h, w, 4), dtype=np.uint8)
+                img[:, :, 0] = np.linspace(0, 255, w, dtype=np.uint8)[None, :]
+                img[:, :, 1] = np.linspace(0, 255, h, dtype=np.uint8)[:, None]
+                img[:, :, 2] = int((t * 60) % 256)
+                img[:, :, 3] = 255
+                bar = int((t * w / 3.0) % w)
+                img[:, max(0, bar - 4):bar + 4, :3] = 255
+                sender.send_image(0, img.tobytes(), w, h, fmt="bgra8",
+                                  group="camera/scene", role="color", stream_id=scene_color)
+                depth = np.linspace(300, 4000, h, dtype=np.uint16)[:, None].repeat(w, axis=1)
+                sender.send_depth_uint16(1, depth.tobytes(), w, h, group="camera/scene",
+                                         role="depth", stream_id=scene_depth)
+                if self.overlay:
+                    ov = np.zeros((h, w, 4), dtype=np.uint8)
+                    ov[:, :, 2] = 255
+                    ov[:, :, 3] = 255
+                    cy, cx = h // 2, int((t * w / 2.0) % w)
+                    ov[max(0, cy - 40):cy + 40, max(0, cx - 40):cx + 40, 1] = 255
+                    sender.send_image(2, ov.tobytes(), w, h, fmt="bgra8", group="overlay",
+                                      role="color", stream_id=overlay_color)
+                self._stop.wait(max(0.0, 1.0 / self.fps))
+        finally:
+            try:
+                sender.disconnect(flush=True)
+            except Exception:  # noqa: BLE001 - teardown must not mask the real result
+                pass
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        time.sleep(1.0)  # let a first frame land before anything is pushed
+        return self.error
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=3.0)
+
+
 def cmd_stream(client, args):
     try:
         import numpy as np
@@ -620,7 +714,27 @@ def cmd_selftest(client, args):
 
 
 def cmd_walkthrough(client, args):
-    """Guided pass: push each surface, pause, and confirm taps round-trip."""
+    """Guided pass: push each surface, pause, and confirm taps round-trip.
+
+    Streams synthetic video on both layers throughout, because detection boxes
+    are drawn over a camera's image: with nothing streaming, the scene camera
+    and the engine overlay have no frames, and objects pushed at either look
+    like they did not arrive.
+    """
+    feeder = None
+    if not args.no_video:
+        feeder = VideoFeeder(client, args.host, args.stream_port)
+        problem = feeder.start()
+        print(f"  {problem}" if problem else
+              "  streaming synthetic video on the scene and overlay layers")
+    try:
+        return _walkthrough_steps(client, args)
+    finally:
+        if feeder:
+            feeder.stop()
+
+
+def _walkthrough_steps(client, args):
     steps = [
         ("Idle panel", lambda: client.update_panel(PANEL_SCENARIOS["idle"][0]),
          PANEL_SCENARIOS["idle"][1], []),
@@ -644,7 +758,16 @@ def cmd_walkthrough(client, args):
          "Same three boxes, highlight moves to bowl_2.", []),
         ("Objects cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _scene_stream_id(client))),
-         "All boxes disappear.", []),
+         "All boxes disappear from the scene camera.", []),
+        ("Overlay objects", lambda: client.update_detected_objects(
+            detected_objects_payload(sample_objects("overlay"), "bowl_2",
+                                     _overlay_stream_id(client))),
+         "Boxes now on the ENGINE OVERLAY, not the scene camera, bowl_2\n"
+         "          highlighted. The two layers are independent: each needs its own\n"
+         "          frames and its own objects.", []),
+        ("Overlay cleared", lambda: client.update_detected_objects(
+            detected_objects_payload([], "", _overlay_stream_id(client))),
+         "The overlay's boxes disappear.", []),
         ("Camera feed close", client.close_camera_feed,
          "The camera feed disappears.", []),
     ]
@@ -674,6 +797,13 @@ def cmd_walkthrough(client, args):
 def _scene_stream_id(client):
     try:
         return client.get_setting("SceneColorStreamID") or ""
+    except BridgeError:
+        return ""
+
+
+def _overlay_stream_id(client):
+    try:
+        return client.get_setting("OverlayColorStreamID") or ""
     except BridgeError:
         return ""
 
@@ -777,6 +907,8 @@ def main():
     p = sub.add_parser("walkthrough", help="guided pass over every surface")
     p.add_argument("--timeout", type=float, default=60.0)
     p.add_argument("--no-taps", action="store_true", help="never wait for a tap")
+    p.add_argument("--no-video", action="store_true",
+                   help="do not stream synthetic frames during the walkthrough")
 
     args = parser.parse_args()
     client = BridgeClient(args.host, args.port, preset=args.preset, verbose=args.verbose)
