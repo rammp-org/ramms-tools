@@ -437,9 +437,17 @@ def cmd_events(client, args):
 
 
 def cmd_stream(client, args):
-    import numpy as np
+    try:
+        import numpy as np
 
-    from ramms_tools.streaming import StreamSender
+        from ramms_tools.streaming import StreamSender
+    except ImportError as exc:
+        # numpy is a declared dependency, so this only bites when running
+        # straight from a source checkout via PYTHONPATH, where nothing
+        # resolved it. Every other command here is stdlib-only.
+        print(f"the stream command needs numpy, which is not importable here: {exc}")
+        print("  pip install ramms-tools   (or: pip install numpy)")
+        return 2
 
     def setting(name, default):
         try:
