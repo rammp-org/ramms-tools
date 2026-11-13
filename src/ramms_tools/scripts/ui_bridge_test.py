@@ -128,9 +128,14 @@ class BridgeClient:
     def call(self, function, **parameters):
         """Call a preset function, checking parameter names against the preset.
 
-        UE matches parameters by name and silently ignores ones it does not
-        recognise, so a typo shows up as an empty string on the UE side rather
-        than an error. Catch that here instead.
+        UE silently ignores parameters it does not recognise, so an unknown
+        name shows up as an empty string on the UE side rather than an error.
+        Catch that here instead.
+
+        Matching is case-INSENSITIVE, though: PanelJSON, PanelJson and
+        paneljson all land (verified against a live editor), so only a genuinely
+        unrecognised name is a problem. Compare case-insensitively or this
+        refuses calls that would have worked.
         """
         declared = self._arguments.get(function)
         if declared is None and not self._labels:
@@ -140,11 +145,13 @@ class BridgeClient:
             except BridgeError:
                 declared = None
         if declared is not None:
-            unknown = sorted(set(parameters) - set(declared))
+            known = {name.lower() for name in declared if name}
+            unknown = sorted(n for n in parameters if n.lower() not in known)
             if unknown:
                 raise BridgeError(
                     f"{function} does not take {unknown}; it declares {declared}. "
-                    "UE would accept the call and receive an empty value."
+                    "UE would accept the call with HTTP 200 and receive an empty "
+                    "value for the real parameter."
                 )
         label = urllib.parse.quote(self.label_for(function))
         payload = {"Parameters": parameters, "GenerateTransaction": False}

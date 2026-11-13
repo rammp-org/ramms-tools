@@ -553,10 +553,13 @@ Two things it guards, both of which fail silently against a real editor:
   `Poll UIEvents`, not `PollUIEvents`, which returns
   `"Unable to resolve the preset field."` The tool discovers the mapping from
   the preset rather than hardcoding it.
-- **A mis-named parameter is accepted with HTTP 200 and arrives empty** — UE
-  matches parameters by name and ignores the rest, so `PanelJson` instead of
-  `PanelJSON` looks like a success and renders nothing. Every call is checked
-  against the argument names the preset declares before it is sent.
+- **An unrecognised parameter is accepted with HTTP 200 and arrives empty** —
+  UE ignores parameters it does not recognise, so the function receives an empty
+  string and `UpdatePanel` clears the panel instead of updating it, with no
+  error anywhere. Every call is checked against the argument names the preset
+  declares before it is sent. (Case does *not* matter: `PanelJSON`, `PanelJson`
+  and `paneljson` all land, so the check is case-insensitive and only a genuinely
+  unknown name is refused.)
 
 It also encodes `box`/`centroid` as `{"X":..,"Y":..,"Z":..,"W":..}` objects
 rather than bare arrays, which UE's JSON struct converter rejects for

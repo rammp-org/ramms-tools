@@ -139,13 +139,32 @@ def _client_with_preset(arguments):
 
 
 def test_unknown_parameter_is_refused_before_it_reaches_ue():
-    """A typo must fail loudly here; UE would accept it and see an empty string."""
+    """An unrecognised name must fail loudly here.
+
+    UE accepts the call with HTTP 200 and hands the function an empty string --
+    for UpdatePanel that clears the panel rather than updating it, with nothing
+    reported anywhere.
+    """
     client = _client_with_preset({"UpdatePanel": ["PanelJSON"]})
     with pytest.raises(BridgeError) as excinfo:
-        client.call("UpdatePanel", PanelJson="{}")  # wrong casing
+        client.call("UpdatePanel", NotAParameter="{}")
     message = str(excinfo.value)
-    assert "PanelJson" in message
+    assert "NotAParameter" in message
     assert "PanelJSON" in message
+
+
+@pytest.mark.parametrize("spelling", ["PanelJSON", "PanelJson", "paneljson"])
+def test_parameter_matching_is_case_insensitive(monkeypatch, spelling):
+    """UE resolves parameters case-insensitively, verified against a live editor:
+    all three of these deliver the payload. Refusing them would block calls that
+    work."""
+    client = _client_with_preset({"UpdatePanel": ["PanelJSON"]})
+    sent = {}
+    monkeypatch.setattr(client, "_request",
+                        lambda m, e, payload=None: sent.update(payload=payload)
+                        or {"ReturnedValues": [{}]})
+    client.call("UpdatePanel", **{spelling: "{}"})
+    assert sent["payload"]["Parameters"] == {spelling: "{}"}
 
 
 def test_declared_parameter_is_not_refused(monkeypatch):
