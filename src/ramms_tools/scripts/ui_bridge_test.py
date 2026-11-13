@@ -374,13 +374,15 @@ def cmd_discover(client, args):
 
 def cmd_panel(client, args):
     pan, expectation = PANEL_SCENARIOS[args.scenario]
+    ids = scenario_buttons(args.scenario)
+    # Before the push, so a fast tap is not left behind the baseline.
+    since = _current_sequence(client) if (args.wait and ids) else None
     client.update_panel(pan)
     print(f"pushed panel scenario {args.scenario!r}")
     print(f"  expect: {expectation}")
-    ids = scenario_buttons(args.scenario)
     print(f"  button_ids: {ids or '(none)'}")
     if args.wait and ids:
-        return _await_button(client, ids, args.timeout)
+        return _await_button(client, ids, args.timeout, since=since)
     return 0
 
 
@@ -394,6 +396,7 @@ def cmd_objects(client, args):
             stream_id = ""
     objects = [] if args.clear else sample_objects(args.source, args.pixels)
     payload = detected_objects_payload(objects, args.select or "", stream_id)
+    since = _current_sequence(client) if args.wait else None
     client.update_detected_objects(payload)
     if args.clear:
         print(f"cleared detected objects on stream_id={stream_id!r}")
@@ -409,7 +412,8 @@ def cmd_objects(client, args):
               "FallbackDetectionImageSize (640x480) if nothing is streaming -- so "
               "these only land correctly against a 1280x720 feed.")
     if args.wait:
-        return _await_tap(client, [o["instance_id"] for o in objects], args.timeout)
+        return _await_tap(client, [o["instance_id"] for o in objects], args.timeout,
+                          since=since)
     return 0
 
 
@@ -468,6 +472,12 @@ def cmd_events(client, args):
             time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\nstopped")
+        if args.expect and not seen_expected:
+            # --expect promises "exit 0 only once this id arrives". Cancelling
+            # the wait leaves the assertion unmet, so a script must not read
+            # it as a successful round-trip.
+            print(f"FAIL: interrupted before {args.expect!r} arrived")
+            return 1
         return 0
 
 
@@ -546,6 +556,11 @@ class VideoFeeder:
                     sender.send_image(2, ov.tobytes(), w, h, fmt="bgra8", group="overlay",
                                       role="color", stream_id=overlay_color)
                 self._stop.wait(max(0.0, 1.0 / self.fps))
+        except OSError as exc:
+            # Queued sends are reported by the worker, but anything raised here
+            # would otherwise end the thread in silence and look like "video is
+            # running" for the rest of the walkthrough.
+            self.error = f"video stopped: {exc}"
         finally:
             try:
                 sender.disconnect(flush=True)
@@ -590,9 +605,21 @@ def cmd_stream(client, args):
                         if d.get("Kind") == "Depth"), "camera/scene/depth")
 
     w, h = args.width, args.height
-    sender = StreamSender(host=args.host, port=args.stream_port)
+    # queue_size=0 sends synchronously, so a socket error raises here instead of
+    # being logged by a worker thread while this command still prints
+    # "sent N frames ... dropped 0" and exits 0. This is a diagnostic: it should
+    # fail loudly. (It still only proves the bytes left the socket, not that the
+    # editor rendered them -- that part is eyes-only.)
+    sender = StreamSender(host=args.host, port=args.stream_port, queue_size=0)
     print(f"connecting to RMSS at {args.host}:{args.stream_port} ...")
-    sender.connect()
+    try:
+        sender.connect()
+    except OSError as exc:
+        # Usually the editor is not in PIE: RammsStreamReceiver only listens
+        # while the game world exists.
+        print(f"  cannot reach the RMSS server: {exc}")
+        print("  is PIE running? the stream receiver only listens during play.")
+        return 2
     print(f"  scene colour -> ch0 {scene_color!r}")
     print(f"  scene depth  -> ch1 {scene_depth!r}")
     if args.overlay:
@@ -637,8 +664,9 @@ def cmd_stream(client, args):
     finally:
         sender.disconnect(flush=True)
     elapsed = time.monotonic() - start
-    print(f"sent {frames} frames in {elapsed:.1f}s ({frames / max(elapsed, 1e-6):.1f} fps), "
-          f"dropped {sender.dropped_frames}")
+    # No drop counter here: nothing is queued, so a frame either went out or
+    # raised.
+    print(f"sent {frames} frames in {elapsed:.1f}s ({frames / max(elapsed, 1e-6):.1f} fps)")
     return 0
 
 
@@ -667,11 +695,19 @@ def cmd_selftest(client, args):
 
     print("parameter-name guard")
     try:
-        client.call("UpdatePanel", PanelJson="{}")
-        check(False, "a mis-cased parameter name is rejected",
-              "the wrong name was sent to UE, which would receive an empty string")
+        client.call("UpdatePanel", NotAParameter="{}")
+        check(False, "an unknown parameter name is rejected",
+              "it was sent to UE, which accepts the call and receives an empty "
+              "string -- clearing the panel instead of updating it")
     except BridgeError:
-        check(True, "a mis-cased parameter name is rejected before sending")
+        check(True, "an unknown parameter name is rejected before sending")
+    try:
+        # Case does not matter to UE: PanelJSON/PanelJson/paneljson all land.
+        # Refusing these would block calls that work.
+        client.call("UpdatePanel", PanelJson=json.dumps(PANEL_SCENARIOS["idle"][0]))
+        check(True, "a differently-cased parameter name is accepted")
+    except BridgeError as exc:
+        check(False, "a differently-cased parameter name is accepted", str(exc))
 
     print("pushes accepted")
     for name in PANEL_SCENARIOS:
@@ -739,6 +775,8 @@ def cmd_walkthrough(client, args):
     finally:
         if feeder:
             feeder.stop()
+            if feeder.error:
+                print(f"  note: {feeder.error}")
 
 
 def _walkthrough_steps(client, args):
@@ -781,6 +819,7 @@ def _walkthrough_steps(client, args):
 
     for index, (title, action, expectation, ids) in enumerate(steps, 1):
         print(f"\n[{index}/{len(steps)}] {title}")
+        since = _current_sequence(client) if (ids and not args.no_taps) else None
         try:
             action()
         except BridgeError as exc:
@@ -789,7 +828,8 @@ def _walkthrough_steps(client, args):
         print(f"  expect: {expectation}")
         if ids and not args.no_taps:
             print(f"  tap any of {ids} (or press Enter to skip)")
-            if _await_button(client, ids, args.timeout, allow_skip=True) == 1:
+            if _await_button(client, ids, args.timeout, allow_skip=True,
+                             since=since) == 1:
                 return 1
         else:
             input("  press Enter to continue ")
@@ -829,8 +869,23 @@ def _describe(event):
     return json.dumps(event)
 
 
-def _await(client, wanted, timeout, kind, allow_skip=False):
-    since, _ = client.poll_events(0)
+def _current_sequence(client):
+    """The latest event sequence, to use as a baseline before pushing."""
+    latest, _ = client.poll_events(0)
+    return latest
+
+
+def _await(client, wanted, timeout, kind, allow_skip=False, since=None):
+    """Wait for an event of `kind` carrying one of `wanted`.
+
+    Callers capture `since` *before* the push they are waiting on: a tap that
+    lands between the push and this call would otherwise sit behind the
+    baseline and never be seen, timing out a wait that actually succeeded.
+    It is not reset to 0 either, which would accept a stale tap from an
+    earlier step.
+    """
+    if since is None:
+        since = _current_sequence(client)
     deadline = time.monotonic() + timeout
     # Enter-to-skip needs a selectable stdin, which Windows does not give us for
     # console handles; there we just wait the timeout out.
@@ -854,12 +909,12 @@ def _await(client, wanted, timeout, kind, allow_skip=False):
     return 0 if allow_skip else 1
 
 
-def _await_button(client, ids, timeout, allow_skip=False):
-    return _await(client, set(ids), timeout, "button_press", allow_skip)
+def _await_button(client, ids, timeout, allow_skip=False, since=None):
+    return _await(client, set(ids), timeout, "button_press", allow_skip, since)
 
 
-def _await_tap(client, ids, timeout):
-    return _await(client, set(ids), timeout, "object_tapped")
+def _await_tap(client, ids, timeout, since=None):
+    return _await(client, set(ids), timeout, "object_tapped", since=since)
 
 
 def main():

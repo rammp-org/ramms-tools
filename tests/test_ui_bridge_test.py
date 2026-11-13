@@ -240,3 +240,125 @@ def test_remote_control_errors_are_raised_not_returned():
             client._request("GET", "/remote/preset/RCP_RammsBridge")
     finally:
         module.urllib.request.urlopen = original
+
+
+# ── waiting for taps ─────────────────────────────────────────────────
+
+class _FakeClient:
+    """Minimal stand-in that records which baselines were polled."""
+
+    def __init__(self, events_by_since=None, latest=0):
+        self.events_by_since = events_by_since or {}
+        self.latest = latest
+        self.polled = []
+
+    def poll_events(self, since=0):
+        self.polled.append(since)
+        return self.latest, self.events_by_since.get(since, [])
+
+
+def test_await_uses_a_supplied_baseline_without_rebaselining():
+    """A tap landing between the push and the wait must still be seen.
+
+    Re-polling from 0 here to find "current" would move the cursor past that
+    tap and time out a wait that actually succeeded.
+    """
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    tap = {"event_type": "object_tapped", "instance_id": "cup_1", "seq": 6}
+    client = _FakeClient({5: [tap]}, latest=6)
+    assert module._await(client, {"cup_1"}, 5.0, "object_tapped", since=5) == 0
+    assert 0 not in client.polled, "must not re-baseline when given a sequence"
+    assert client.polled[0] == 5
+
+
+def test_await_without_a_baseline_starts_from_current():
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    client = _FakeClient({}, latest=9)
+    module._await(client, {"nope"}, 0.01, "button_press")
+    assert client.polled[0] == 0, "first poll establishes the baseline"
+
+
+def test_await_ignores_a_stale_tap_from_before_the_baseline():
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    stale = {"event_type": "object_tapped", "instance_id": "cup_1", "seq": 2}
+    client = _FakeClient({7: []}, latest=7)
+    client.events_by_since[2] = [stale]
+    assert module._await(client, {"cup_1"}, 0.05, "object_tapped", since=7) == 1
+
+
+# ── exit statuses ────────────────────────────────────────────────────
+
+def test_interrupting_an_expectation_exits_nonzero():
+    """--expect promises 'exit 0 only once this id arrives'.
+
+    Cancelling the wait leaves it unmet, and a script must not read that as a
+    successful round-trip.
+    """
+    import argparse
+
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    class Interrupting:
+        def poll_events(self, since=0):
+            raise KeyboardInterrupt
+
+    args = argparse.Namespace(since=0, timeout=0.0, follow=True, interval=0.01,
+                              expect="probe:ok")
+    assert module.cmd_events(Interrupting(), args) == 1
+
+
+def test_interrupting_a_watch_only_session_exits_zero():
+    import argparse
+
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    class Interrupting:
+        def poll_events(self, since=0):
+            raise KeyboardInterrupt
+
+    args = argparse.Namespace(since=0, timeout=0.0, follow=True, interval=0.01,
+                              expect="")
+    assert module.cmd_events(Interrupting(), args) == 0
+
+
+def test_stream_sends_synchronously_so_failures_surface(monkeypatch):
+    """A diagnostic must not print 'sent N frames' over a failed send.
+
+    With the default queued sender a socket error is logged by the worker while
+    the command still reports success and exits 0.
+    """
+    import argparse
+
+    import ramms_tools.streaming as streaming
+
+    recorded = {}
+
+    class RecordingSender:
+        def __init__(self, host, port, queue_size=4):
+            recorded["queue_size"] = queue_size
+            self.dropped_frames = 0
+
+        def connect(self):
+            pass
+
+        def send_image(self, *a, **k):
+            pass
+
+        def send_depth_uint16(self, *a, **k):
+            pass
+
+        def disconnect(self, flush=False):
+            pass
+
+    monkeypatch.setattr(streaming, "StreamSender", RecordingSender)
+    client = _FakeClient({}, latest=0)
+    client.get_setting = lambda name, *a, **k: ""
+    args = argparse.Namespace(host="127.0.0.1", stream_port=30030, seconds=0.0,
+                              fps=60.0, width=4, height=2, overlay=False)
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    assert module.cmd_stream(client, args) == 0
+    assert recorded["queue_size"] == 0
