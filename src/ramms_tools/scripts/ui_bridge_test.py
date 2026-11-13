@@ -308,13 +308,34 @@ def scenario_buttons(name):
 
 # ── object scenarios ─────────────────────────────────────────────────
 
-def sample_objects(source):
-    return [
-        detected_object("cup_1", "cup", (120, 140, 300, 360), source=source),
-        detected_object("bowl_2", "bowl", (420, 200, 640, 420), source=source),
-        detected_object("tap_3", "faucet", (700, 80, 820, 300),
-                        centroid=(760, 260), source=source),
-    ]
+# Normalized (0-1) boxes, which is what the widget wants by default.
+#
+# URammsCameraWidget::GetDetectionCoordinateScale treats every coordinate <= 1.0
+# as already normalized and uses it as-is; anything larger is taken as PIXELS of
+# the current frame and divided by that frame's size -- or by
+# FallbackDetectionImageSize, (640, 480), before any frame has arrived. So a
+# pixel-space box drawn for a 1280x720 feed lands at twice its intended position
+# against the fallback and falls off the right edge entirely. Normalized boxes
+# show up in the same place whatever is (or isn't) streaming.
+NORMALIZED_SAMPLES = [
+    ("cup_1", "cup", (0.08, 0.12, 0.34, 0.55), None),
+    ("bowl_2", "bowl", (0.40, 0.30, 0.68, 0.78), None),
+    ("tap_3", "faucet", (0.74, 0.10, 0.92, 0.48), (0.88, 0.42)),
+]
+
+# The same three in the pixel space of a 1280x720 feed, for --pixels.
+PIXEL_SAMPLES = [
+    ("cup_1", "cup", (102, 86, 435, 396), None),
+    ("bowl_2", "bowl", (512, 216, 870, 562), None),
+    ("tap_3", "faucet", (947, 72, 1178, 346), (1126, 302)),
+]
+
+
+def sample_objects(source, pixels=False):
+    """Three tappable objects, normalized unless `pixels` asks otherwise."""
+    samples = PIXEL_SAMPLES if pixels else NORMALIZED_SAMPLES
+    return [detected_object(iid, cls, box, centroid, source)
+            for iid, cls, box, centroid in samples]
 
 
 # ── commands ─────────────────────────────────────────────────────────
@@ -363,16 +384,22 @@ def cmd_objects(client, args):
             stream_id = client.get_setting(prop) or ""
         except BridgeError:
             stream_id = ""
-    objects = [] if args.clear else sample_objects(args.source)
+    objects = [] if args.clear else sample_objects(args.source, args.pixels)
     payload = detected_objects_payload(objects, args.select or "", stream_id)
     client.update_detected_objects(payload)
     if args.clear:
         print(f"cleared detected objects on stream_id={stream_id!r}")
         print("  expect: every box disappears from the view.")
         return 0
-    print(f"pushed {len(objects)} objects on stream_id={stream_id!r} source={args.source!r}")
+    space = "pixel (1280x720)" if args.pixels else "normalized 0-1"
+    print(f"pushed {len(objects)} objects on stream_id={stream_id!r} source={args.source!r} "
+          f"in {space} coordinates")
     print(f"  expect: boxes for {[o['instance_id'] for o in objects]}"
           + (f", with {args.select!r} highlighted" if args.select else ""))
+    if args.pixels:
+        print("  note: pixel boxes are divided by the live frame size, or by "
+              "FallbackDetectionImageSize (640x480) if nothing is streaming -- so "
+              "these only land correctly against a 1280x720 feed.")
     if args.wait:
         return _await_tap(client, [o["instance_id"] for o in objects], args.timeout)
     return 0
@@ -610,7 +637,7 @@ def cmd_walkthrough(client, args):
         ("Detected objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "cup_1",
                                      _scene_stream_id(client))),
-         "Three boxes on the scene view, cup_1 highlighted.", []),
+         "Three boxes on the scene view, cup_1 highlighted. Coordinates are\n          normalized, so they land the same whether or not a feed is streaming.", []),
         ("Selection moves", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "bowl_2",
                                      _scene_stream_id(client))),
@@ -723,6 +750,8 @@ def main():
     p.add_argument("--select", default="", help="instance_id to highlight")
     p.add_argument("--stream-id", default="", help="override the stream_id")
     p.add_argument("--clear", action="store_true", help="push an empty list instead")
+    p.add_argument("--pixels", action="store_true",
+                   help="send pixel-space boxes for a 1280x720 feed instead of normalized 0-1")
     p.add_argument("--wait", action="store_true", help="wait for an object tap")
     p.add_argument("--timeout", type=float, default=60.0)
 

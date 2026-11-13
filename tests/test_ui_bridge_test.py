@@ -89,6 +89,32 @@ def test_explicit_centroid_wins():
     assert obj["centroid"] == {"X": 90, "Y": 10}
 
 
+def test_samples_are_normalized_by_default():
+    """Pixel boxes get divided by the live frame size (or a 640x480 fallback), so
+    a box drawn for 1280x720 lands off-screen. Coordinates <= 1.0 are used as-is."""
+    for obj in sample_objects("scene"):
+        for key in ("X", "Y", "Z", "W"):
+            assert 0.0 <= obj["box"][key] <= 1.0, obj
+        for key in ("X", "Y"):
+            assert 0.0 <= obj["centroid"][key] <= 1.0, obj
+
+
+def test_pixel_samples_fit_a_1280x720_frame():
+    for obj in sample_objects("scene", pixels=True):
+        assert obj["box"]["Z"] <= 1280 and obj["box"]["W"] <= 720, obj
+        assert obj["box"]["X"] >= 0 and obj["box"]["Y"] >= 0, obj
+        # Above 1.0 everywhere, or the widget would read them as normalized.
+        assert obj["box"]["Z"] > 1.0 and obj["box"]["W"] > 1.0, obj
+
+
+def test_box_is_never_degenerate():
+    """A box whose min equals its max reads as 'no box' and is skipped."""
+    for pixels in (False, True):
+        for obj in sample_objects("scene", pixels=pixels):
+            assert obj["box"]["X"] != obj["box"]["Z"], obj
+            assert obj["box"]["Y"] != obj["box"]["W"], obj
+
+
 def test_payload_carries_selection_and_stream_id():
     payload = detected_objects_payload(sample_objects("scene"), "cup_1", "camera/scene/color")
     assert payload["selected_instance_id"] == "cup_1"
