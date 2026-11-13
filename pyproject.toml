@@ -52,6 +52,7 @@ ramms-imu = "ramms_tools.scripts.stream_imu:main"
 ramms-stream-test = "ramms_tools.scripts.stream_test:main"
 ramms-tui = "ramms_tools.scripts.tui:main"
 ramms-worldgen = "ramms_tools.scripts.worldgen_cli:main"
+ramms-ui-bridge-test = "ramms_tools.scripts.ui_bridge_test:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "ramms_tools.__version__"}
