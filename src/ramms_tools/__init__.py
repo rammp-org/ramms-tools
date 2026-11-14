@@ -6,4 +6,4 @@ controlling robots, streaming sensor data, generating worlds
 (``ramms_tools.worldgen``) and managing UI via the UE Remote Control HTTP API.
 """
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"

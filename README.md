@@ -528,6 +528,48 @@ Requires the `exr` optional dependency for capture replay:
 pip install 'ramms-tools[exr]'   # OpenEXR + Imath
 ```
 
+### `ramms-ui-bridge-test` — RAMMP UI Bridge Interfaces
+
+Exercise the `RammsBridgeReceiver` surfaces the RAMMP UI bridge drives —
+panels and buttons, detected-object and world-state views, the camera feed, the
+RMSS camera streams, and the UI events that come back — without needing ROS 2
+or the bridge itself. Useful for UI work, and for reproducing a bridge problem
+in isolation.
+
+```bash
+ramms-ui-bridge-test discover                 # what RCP_RammsBridge exposes + live stream IDs
+ramms-ui-bridge-test selftest                 # non-interactive transport checks, exits non-zero on failure
+ramms-ui-bridge-test panel --scenario error   # idle|selection|progress|paused|error|stress|empty
+ramms-ui-bridge-test objects --select cup_1   # tappable boxes, with one highlighted
+ramms-ui-bridge-test camera open              # OpenCameraFeed / CloseCameraFeed
+ramms-ui-bridge-test stream --seconds 10 --overlay   # synthetic scene colour + depth + overlay
+ramms-ui-bridge-test events --follow          # watch button presses and object taps live
+ramms-ui-bridge-test walkthrough              # guided pass over every surface
+```
+
+Two things it guards, both of which fail silently against a real editor:
+
+- **Preset functions are called by their exposed label, not their C++ name** —
+  `Poll UIEvents`, not `PollUIEvents`, which returns
+  `"Unable to resolve the preset field."` The tool discovers the mapping from
+  the preset rather than hardcoding it.
+- **An unrecognised parameter is accepted with HTTP 200 and arrives empty** —
+  UE ignores parameters it does not recognise, so the function receives an empty
+  string and `UpdatePanel` clears the panel instead of updating it, with no
+  error anywhere. Every call is checked against the argument names the preset
+  declares before it is sent. (Case does *not* matter: `PanelJSON`, `PanelJson`
+  and `paneljson` all land, so the check is case-insensitive and only a genuinely
+  unknown name is refused.)
+
+It also encodes `box`/`centroid` as `{"X":..,"Y":..,"Z":..,"W":..}` objects
+rather than bare arrays, which UE's JSON struct converter rejects for
+`FVector4`/`FVector2D`.
+
+Requires the editor running with Remote Control (HTTP on 30010) and a level
+containing `RammsBridgeReceiver`. What a panel *looks* like still needs eyes:
+no panel/world-state/camera state is readable back, so each scenario prints
+what you should see, and the tap round-trip is what gets asserted.
+
 ### `ramms-worldgen` — World Generation
 
 Drive RammsWorldGen from the shell: list presets and example maps, open a map,
