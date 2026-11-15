@@ -43,17 +43,17 @@ class SensingError(UnrealRemoteError):
 
 
 # What the bridge accepts as a sensor name (SENSING_SPEC 3.2): it is the component's name and the camera's stream name.
-_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 _RESERVED_SUFFIXES = ("_depth", "_dmv", "_seg", "_stream")       # the sim's own helper components per camera
 MAX_CAMERA_SIZE = 4096
 
 
 def check_sensor_name(name: str) -> str:
-    """A sensor name the bridge takes: 1..64 of A-Z a-z 0-9 _ - . and not ending in a reserved helper suffix
+    """A sensor name the bridge takes: 1..64 of A-Z a-z 0-9 _ - (no '.') and not ending in a reserved helper suffix
     (_depth, _dmv, _seg, _stream). Returns it; raises SensingError."""
     n = str(name).strip()
     if not _NAME_RE.match(n):
-        raise SensingError(f"sensor name {name!r}: 1..64 characters of A-Z a-z 0-9 _ - .")
+        raise SensingError(f"sensor name {name!r}: 1..64 characters of A-Z a-z 0-9 _ - (no '.')")
     if n.lower().endswith(_RESERVED_SUFFIXES):
         raise SensingError(f"sensor name {name!r} ends in a suffix the sim keeps for its helpers ({', '.join(_RESERVED_SUFFIXES)})")
     return n
@@ -102,7 +102,7 @@ class SensorMount:
     and mask; its stream ids are camera/<name>/color, camera/<name>/depth, motion/<name>, mask/<name>, and its
     stream source component is <name>_stream. Stream ids carry only the name: two robots' "front_camera" share
     them, so a camera is picked by actor (and channel), never by name alone. The sim clamps width / height to
-    1..4096 (settings report what it used). Names: 1..64 of A-Z a-z 0-9 _ - . (check_sensor_name).
+    1..4096 (settings report what it used). Names: 1..64 of A-Z a-z 0-9 _ - (check_sensor_name).
     """
     name: str
     kind: str = "ToF"
@@ -480,6 +480,19 @@ class StreamStatus:
     def capturing(self) -> bool:
         return as_bool(self.capture.get("capturing", False))
 
+    @property
+    def streams_on(self) -> Optional[bool]:
+        """The camera streams are started (capture["streams_on"]; None from sims that do not report it)."""
+        v = self.capture.get("streams_on")
+        return None if v is None else as_bool(v)
+
+    @property
+    def started_by_streams(self) -> Optional[bool]:
+        """The capture session was started by the camera streams -- stop_streams() then stops it (None from sims that
+        do not report it)."""
+        v = self.capture.get("started_by_streams")
+        return None if v is None else as_bool(v)
+
     def cameras(self, actor: Optional[str] = None) -> list[str]:
         return sorted({s.camera for s in self.streams if s.camera and (actor is None or same_actor(s.actor, actor))})
 
@@ -679,7 +692,8 @@ class Sensing:
         """
         Stream an IMU target's physics-step samples over RMSS (StartImuStreamJson; needs a play world; starts the RMSS
         server if it is not running): one FrameData (fmt imu_f64x18) per game tick with new samples, on `channel`
-        (-1 = the next free one >= 1000). Returns its StreamInfo (channel, stream_id "imu/<actor name>/<target>" --
+        (-1 = the next free one >= 1000, skipping the cameras' channels; a channel a camera uses is refused). Returns
+        its StreamInfo (channel, stream_id "imu/<actor name>/<target>" --
         the body's name for target "" --, port); read it with ImuStream.from_info, which subscribes on connect. Do so
         promptly: the sim stops a stream no RMSS client has subscribed to for 30 s (and frees its point). Stop it with
         stop_imu_stream. A world runs at most 8 IMU streams; Remote Control callers get 32 tracked IMU points.
@@ -712,17 +726,25 @@ class Sensing:
     def start_streams(self, **options: Any) -> StreamStatus:
         """
         Start the RMSS server if needed and the cameras' capture and streams (needs a play world: PIE or a
-        game). Options (all optional): port, every_n_frames, color, depth, motion, segmentation, save_to_disk
-        (default false). Options left None are not sent (the bridge's defaults apply).
+        game). Options (all optional): port, every_n_frames, color, depth, motion, segmentation. Options left None
+        are not sent (the bridge's defaults apply). Disk writes cannot be turned on over the bridge -- the sim refuses
+        "save_to_disk": true (Remote Control is reachable from the network) -- so save_to_disk=True raises
+        SensingError here; False changes nothing and is not sent.
         """
         unknown = sorted(set(options) - set(_STREAM_OPTIONS))
         if unknown:
             raise SensingError(f"unknown stream options: {', '.join(unknown)} (known: {', '.join(_STREAM_OPTIONS)})")
-        opts = {k: v for k, v in options.items() if v is not None}
+        if options.get("save_to_disk"):
+            raise SensingError("the sim refuses disk writes over the bridge (save_to_disk): capture to disk in the "
+                               "editor, or save the streamed frames on this side (ramms-sensors camera --save)")
+        opts = {k: v for k, v in options.items() if v is not None and k != "save_to_disk"}
         return StreamStatus.from_json(self._json("StartCameraStreamsJson", OptionsJson=json.dumps(opts)))
 
     def stop_streams(self) -> bool:
-        """Stop the capture (the RMSS server stays up)."""
+        """Undo what start_streams did: unregister the rig cameras it registered with capture, stop the capture
+        session only if the streams started it, and restore the capture rate / disk settings it changed (cameras
+        and a session something else set up keep running). The RMSS server stays up. False when there was nothing
+        to stop or the world is not a play world."""
         return as_bool(self._call("StopCameraStreams"))
 
     def status(self) -> StreamStatus:

@@ -215,7 +215,9 @@ Adding / removing sensors and starting streams need a play world (PIE or a
 game) on sims from the fix round; older sims keep a mount added in the editor
 world and build it at BeginPlay (`"built": false`). A parent component the
 actor does not have is an error. Sensor names are 1..64 characters of
-`A-Z a-z 0-9 _ - .`, not ending in `_depth`, `_dmv`, `_seg` or `_stream`.
+`A-Z a-z 0-9 _ -` (no `.`), not ending in `_depth`, `_dmv`, `_seg` or `_stream`.
+`start_streams` cannot turn disk writes on (the sim refuses it over the bridge);
+`stop_streams` undoes only what the streams set up.
 
 Every sensor looks along its local +X; mount locations are cm from the parent
 component (a MuJoCo body such as `chassis`, or `""` for the root), rotations

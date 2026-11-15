@@ -181,7 +181,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-depth", action="store_true")
     s.add_argument("--no-motion", action="store_true")
     s.add_argument("--no-segmentation", action="store_true")
-    s.add_argument("--save-to-disk", action="store_true", help="also write the captures on the engine's disk")
     sub.add_parser("classes", help="segmentation classes (mask values)")
     s = sub.add_parser("camera", help="grab a camera's colour / depth / motion / mask frames over RMSS")
     s.add_argument("name")
@@ -376,12 +375,11 @@ def _run(p: argparse.ArgumentParser, a: argparse.Namespace, ue, sensing: Sensing
             st = sensing.start_streams(port=a.stream_port, every_n_frames=a.every,
                                        color=False if a.no_color else None, depth=False if a.no_depth else None,
                                        motion=False if a.no_motion else None,
-                                       segmentation=False if a.no_segmentation else None,
-                                       save_to_disk=True if a.save_to_disk else None)
+                                       segmentation=False if a.no_segmentation else None)
         elif a.action == "stop":
             ok = sensing.stop_streams()
-            print("capture stopped (the RMSS server stays up)" if ok else
-                  "not stopped: no capture in this world, or not a play world (PIE or a game)")
+            print("camera streams stopped: what they set up is undone (the RMSS server stays up)" if ok else
+                  "not stopped: no camera streams in this world, or not a play world (PIE or a game)")
             st = sensing.status()
         else:
             st = sensing.status()

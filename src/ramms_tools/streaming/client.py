@@ -1,9 +1,10 @@
 """RMSS StreamClient — connects to the UE streaming server and receives frames.
 
 The server sends a connection no frames until it has sent SUBSCRIBE:
-``subscribe(channels)`` for those channels, ``subscribe()`` (no channels) for
-every channel. A connection that never subscribes receives nothing (a PING
-still answers). ``poll()`` / ``iter_messages()`` warn once when used without a
+``subscribe(channels)`` for those channels, ``subscribe()`` (no channels, or an
+empty list) for every channel. A connection that never subscribes receives
+nothing (a PING still answers). ``unsubscribe(channels)`` drops those channels;
+``unsubscribe()`` -- or dropping the last one -- leaves it receiving nothing. ``poll()`` / ``iter_messages()`` warn once when used without a
 subscription.
 
 Usage::
@@ -240,7 +241,8 @@ class StreamClient:
         logger.info("Subscribed to channels=%s compression=%s", channels, compression)
 
     def unsubscribe(self, channels: list[int] | None = None) -> None:
-        """Send an UNSUBSCRIBE message."""
+        """Send an UNSUBSCRIBE message: these channels stop; with no list -- or once the last channel subscribed to is
+        gone -- the connection gets nothing until it subscribes again."""
         meta = {}
         if channels is not None:
             meta["channels"] = channels
@@ -249,6 +251,8 @@ class StreamClient:
         msg.header.timestamp = StreamHeader.now_timestamp()
         msg.set_metadata_string(json.dumps(meta))
         self._send(msg)
+        if channels is None:
+            self.subscribed = False
 
     def ping(self) -> float:
         """Send a PING and wait for the response.  Returns round-trip time in seconds.

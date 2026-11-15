@@ -13,9 +13,11 @@ Every frame's metadata carries ``stream_id``, ``group`` (the camera name),
 ``role``, ``name`` and ``fmt``, plus ``actor`` (the camera's actor path: stream
 ids carry only the camera name, so pick a robot's camera by actor) and
 ``frame`` (the capture's frame number, the same for every role of one capture);
-a mask's adds ``classes`` ({"<value>": "<class>"}) and the class count
+a mask's adds ``classes`` ({"<value>": "<class>"}), ``reserved`` (the stencil
+values the sim keeps for itself; newer sims) and the value count
 ``{"NumSegmentIDs": n}`` under ``MaterialScalarParameters`` (read first) and
-``material_params``.
+``material_params`` -- on newer sims high enough to cover the reserved values
+and the frame's highest value too.
 
     from ramms_tools.streaming.frames import decode_message
     frame = decode_message(msg)          # Frame(role='depth', array=..., camera='front_camera', ...)
@@ -121,6 +123,7 @@ class Frame:
     classes: dict[int, str] = field(default_factory=dict)   # mask frames: class value -> fine class name
     num_segment_ids: int = 0
     actor: str = ""                 # the metadata's actor path ("" when the sender gives none)
+    reserved: tuple[int, ...] = ()  # mask frames: the values the sim reserves (metadata "reserved"; () when absent)
     frame_number: Optional[int] = None   # the capture's frame number (metadata "frame"): equal across one capture's roles
 
     @property
@@ -228,6 +231,16 @@ def mask_classes(meta: dict) -> dict[int, str]:
     return out
 
 
+def _reserved(meta: dict) -> tuple[int, ...]:
+    out = []
+    for v in meta.get("reserved") or []:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            continue
+    return tuple(out)
+
+
 def _frame_number(meta: dict) -> Optional[int]:
     v = meta.get("frame")
     try:
@@ -273,7 +286,8 @@ def decode_message(msg: StreamMessage, role: Optional[str] = None) -> Frame:
                  camera=str(meta.get("group", "") or ""), fmt=str(meta.get("fmt", "") or ""),
                  classes=mask_classes(meta) if role == "mask" else {},
                  num_segment_ids=_num_segment_ids(meta) if role == "mask" else 0,
-                 actor=str(meta.get("actor", "") or ""), frame_number=_frame_number(meta))
+                 actor=str(meta.get("actor", "") or ""), frame_number=_frame_number(meta),
+                 reserved=_reserved(meta) if role == "mask" else ())
 
 
 def decode_rgbd(msg: StreamMessage) -> tuple[Frame, Frame]:
