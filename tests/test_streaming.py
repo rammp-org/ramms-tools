@@ -31,6 +31,7 @@ def receive(chunks, count, timeout=3.0):
     ours, theirs = socket.socketpair()
     client._sock = ours
     client._connected.set()
+    client.subscribed = True                    # as after a SUBSCRIBE: the server sends nothing before one
     t = threading.Thread(target=client._recv_loop, daemon=True)
     t.start()
     for c in chunks:

@@ -1,6 +1,7 @@
 """Offline tests for ramms_tools.control against recorded control surfaces (run: python -m pytest tests)."""
 import gc
 import logging
+import threading
 import time
 
 import pytest
@@ -392,12 +393,18 @@ def test_keep_alive_stop_waits_for_a_slow_send_and_releases_last():
     """An engine hitch longer than the join: the release still comes after the last send."""
     cs, fake, _ = surface(deadman=False)
     ka = cs.keep_alive({"drive.forward": 0.3, "drive.turn": 0.2}, rate=20).start()
-    time.sleep(0.12)
-    _slow(fake, {"drive.forward"}, 0.6)
-    time.sleep(0.06)                                          # a send of drive.forward is in flight
+    wait_for(lambda: fake.sets, what="a first round")
+    inflight = threading.Event()
+
+    def hitch(func, p):
+        if func == "SetControl" and p["Id"] == "drive.forward":
+            inflight.set()
+            time.sleep(0.6)
+    fake.on_call = hitch
+    assert inflight.wait(10.0)                                # a send of drive.forward is in flight
     ka.join_timeout = 0.1                                     # shorter than the hitch
     ka.stop()
-    time.sleep(1.0)                                           # the sender comes back and releases
+    wait_for(lambda: not ka.running, what="the sender to come back and release")
     last_set = max(i for i, (kind, cid) in enumerate(fake.events) if kind == "set")
     first_final_release = min(i for i, (kind, cid) in enumerate(fake.events) if kind == "release")
     assert first_final_release > last_set and fake.latched() == {} and not ka.running

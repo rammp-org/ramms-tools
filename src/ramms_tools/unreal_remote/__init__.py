@@ -48,6 +48,9 @@ Usage:
     # Out parameters come back beside ReturnValue: ask for the full response
     curb = ue.actor(curb_controller_path)
     curb.call_full("GetStatusLine")   # {"OutSeverity": "Info", "ReturnValue": "Ready"}
+
+    # Several calls in one request (/remote/batch: run in order, in one engine frame); one per call as a fallback
+    ue.call_many([(curb_controller_path, "GetPhase", None), (curb_controller_path, "GetStatusLine", None)])
 """
 
 from __future__ import annotations

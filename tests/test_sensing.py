@@ -424,6 +424,14 @@ def test_stream_control_status_and_classes():
     assert sensing.stop_streams() and not sensing.status().capturing
     with pytest.raises(SensingError, match="unknown stream options: fps"):
         sensing.start_streams(fps=30)
+    with pytest.raises(SensingError, match="refuses disk writes"):            # the sim refuses "save_to_disk": true
+        sensing.start_streams(save_to_disk=True)
+    sensing.start_streams(save_to_disk=False)
+    assert "save_to_disk" not in bridge.options                               # false changes nothing: not sent
+    assert st.streams_on is None and st.started_by_streams is None            # older sims: not reported
+    st2 = StreamStatus.from_json({"server": {"running": True, "port": 30030},
+                                  "capture": {"capturing": True, "streams_on": True, "started_by_streams": False}})
+    assert st2.streams_on is True and st2.started_by_streams is False
     table = sensing.segmentation_classes()
     assert table.names() == {3: "Car", 7: "Curb"} and table.classes[0].coarse == "Vehicle" and len(table.coarse) == 2
     assert table.num_segment_ids == 8 and table.reserved == [0]
@@ -447,8 +455,8 @@ def test_contract_details():
     sonar = SensorReading.from_json({"name": "s", "kind": "Sonar", "distance_cm": 50.0, "hit": True, "has_sample": False,
                                      "max_range_cm": 500})
     assert sonar.has_sample is False and sonar.summary() == "no sample yet" and sonar.max_range_cm == 500.0
-    assert check_sensor_name("front_cam.v2") == "front_cam.v2"
-    for bad in ("", "a b", "x" * 65, "cam_stream", "tof_depth", "a/b"):
+    assert check_sensor_name("front_cam-v2") == "front_cam-v2"
+    for bad in ("", "a b", "x" * 65, "cam_stream", "tof_depth", "a/b", "front_cam.v2"):     # no '.' any more
         with pytest.raises(SensingError):
             check_sensor_name(bad)
     with pytest.raises(SensingError, match="reserved|suffix"):
@@ -787,7 +795,10 @@ def test_frame_helpers():
     m2.payload = bytes([3])
     assert decode_message(m2).num_segment_ids == 9          # the key StreamSender and rammp-ui use wins
     m2.metadata = json.dumps({"w": 1, "h": 1, "fmt": "mono8", "role": "mask", "material_params": {"NumSegmentIDs": 5}}).encode()
-    assert decode_message(m2).num_segment_ids == 5
+    assert decode_message(m2).num_segment_ids == 5 and decode_message(m2).reserved == ()      # older sims: no "reserved"
+    m2.metadata = json.dumps({"w": 1, "h": 1, "fmt": "mono8", "role": "mask", "reserved": [0, 255],
+                              "material_params": {"NumSegmentIDs": 256}}).encode()
+    assert decode_message(m2).reserved == (0, 255) and decode_message(m2).num_segment_ids == 256
     # 16-bit millimetre depth comes out in cm
     d = StreamMessage()
     d.header.message_type = MessageType.FRAME_DEPTH
