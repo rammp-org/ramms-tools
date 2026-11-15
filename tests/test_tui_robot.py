@@ -70,7 +70,16 @@ def test_robot_page_builds_and_commands():
             # Choosing a drive mode switches it.
             app.query_one("#robot-mode", Select).value = "holonomic"
             await _until(pilot, lambda: comps["DriveModeSelector"].active == "holonomic")
+            await _settled(pilot, app)
     run(scenario())
+
+
+async def _settled(pilot, app):
+    """The page rebuilt after a mode change: let its new selectors finish mounting before the app is torn down (a
+    Select torn down mid-mount fails in its own on_mount)."""
+    await _until(pilot, lambda: app.query_one("#robot-mode", Select).value == "holonomic", timeout=10.0)
+    await _until(pilot, lambda: all(w.is_mounted for w in app.query(Select)), timeout=10.0)
+    await pilot.pause(0.2)
 
 
 def test_robot_page_gen1_style_and_no_sensing():
@@ -101,14 +110,18 @@ def test_robot_page_refills_its_selectors_after_a_rebuild():
             page = app.query_one(RobotPage)
             page.activate()
             await _until(pilot, lambda: page.robot is not None and page._buttons)
-            sel = lambda: app.query_one("#sel-curb_view_labels", Select)        # noqa: E731
-            await _until(pilot, lambda: sel().value == 1)
+            def labels():
+                # The selector of the moment (mounting, or rebuilt): None until there is one.
+                found = [w for w in app.query("#sel-curb_view_labels") if w.is_mounted]
+                return found[-1].value if found else None
+            await _until(pilot, lambda: labels() == 1, timeout=10.0)
             app.query_one("#robot-mode", Select).value = "holonomic"           # rebuilds the controls
             await _until(pilot, lambda: comps["DriveModeSelector"].active == "holonomic")
-            await _until(pilot, lambda: sel().value == 1, timeout=10.0)
+            await _until(pilot, lambda: labels() == 1, timeout=10.0)
             comps["ControlSurface"].values["curb.view.sensing"] = float("nan")  # an unreadable answer
             await _until(pilot, lambda: page._tick > 6, timeout=10.0)
             assert "poll:" not in str(app.query_one("#robot-status-bar", Static).render())
+            await _settled(pilot, app)
     run(scenario())
 
 

@@ -7,7 +7,7 @@ import time
 import pytest
 
 from fake_remote import FakeRemote, robot_world
-from test_robot import scripted_phases
+from test_robot import runs_until_held, scripted_phases
 from test_sensing import FakeSensingBridge
 from test_worldgen_terrain import GRADED, FakeWorldGenBridge, traffic_world
 from ramms_tools.scripts import _common, control_cli, curb_cli, sensors_cli, worldgen_cli
@@ -182,10 +182,20 @@ def test_curb_detect_assist_style_plan_seat(world, capsys):
 
 def test_curb_go_starts_and_waits_holding_forward(world, capsys):
     ue, path, comps = world("gen1", deadman=False)
-    comps["CurbController"].handlers["StartCrossing"] = lambda p: {"OutReason": "", "ReturnValue": True}
-    # Each GetPhase -- the loop's and the stick sender's own reads -- takes the script a step.
-    scripted_phases(comps["CurbController"], [("Idle", "Ready", "Info")] * 2 + [("Level", "Crossing", "Info")] * 40
-                    + [("Done", "Crossed 15 cm", "Info")])
+    started = {"v": False}
+
+    def start(p):
+        started["v"] = True
+        return {"OutReason": "", "ReturnValue": True}
+    comps["CurbController"].handlers["StartCrossing"] = start
+    fake = comps["ControlSurface"]
+
+    def now():                                  # Idle until started; under way until the stick was held; done
+        if not started["v"]:
+            return ("Idle", "Ready", "Info")
+        return ("Done", "Crossed 15 cm", "Info") if fake.sets else ("Level", "Crossing", "Info")
+    comps["CurbController"].handlers.update(GetPhase=lambda p: {"ReturnValue": now()[0]},
+                                            GetStatusLine=lambda p: {"OutSeverity": now()[2], "ReturnValue": now()[1]})
     assert curb_cli.main(["go", "--wait", "--wait-timeout", "10"]) == 0
     out = capsys.readouterr().out
     # The crossing is started directly (the controller selects the curb mode); go never selects it by hand.
@@ -206,8 +216,7 @@ def test_curb_go_refuses_a_stick_out_of_range(world, capsys, value):
 
 def test_curb_go_does_not_take_over_a_crossing_it_did_not_start(world, capsys):
     ue, path, comps = world("gen1", deadman=False)
-    scripted_phases(comps["CurbController"], [("FrontUp", "Crossing up 15.0 cm: Front omni wheels up", "Info")] * 60
-                    + [("Done", "Done", "Info")])
+    runs_until_held(comps["CurbController"], comps["ControlSurface"])
     assert curb_cli.main(["go", "--wait"]) == 1
     err = capsys.readouterr().err
     assert "already under way" in err and "--join" in err and comps["ControlSurface"].sets == []

@@ -24,7 +24,7 @@ under way and the robot is in the curb drive mode. The sender reads both in
 the same request as each send, so it lets go in the round that sees the
 crossing done, stopped or faulted: at most one send lands after it ends, none
 after that. Without --wait, `go` only starts the crossing: it then waits,
-paused, for a stick. A crossing already under way that this did not start (the
+paused, for a stick (`go --wait --join` holds it). A crossing already under way that this did not start (the
 rider's, curb assist's, another client's) is not taken over -- a Remote stick
 outranks the rider's -- unless --join (--no-hold only watches it). Ctrl+C /
 SIGTERM / SIGHUP during `go --wait` releases the stick and aborts the crossing
@@ -216,7 +216,7 @@ def _go(a: argparse.Namespace, robot: Robot, curb) -> int:
         else:
             print(f"crossing started (drive mode {robot.mode})" + (f": {reason}" if reason else ""))
     if not a.wait:
-        print("it moves only while the stick (drive.forward) is held forward: `ramms-curb go --wait` holds it")
+        print("it moves only while the stick (drive.forward) is held forward: `ramms-curb go --wait --join` holds it")
         return 0
     hold = a.forward if holding else None
     if hold is not None:

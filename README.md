@@ -896,7 +896,7 @@ while the crossing is under way in the curb drive mode. The sender reads both
 with each send and lets go in the round that sees the crossing done, stopped or
 faulted (at most one send after it, released at once), holding it again if a
 Gen2 crossing retries. Without `--wait`, the crossing waits, paused, for a
-stick. A crossing already under way that `go` did not start (the rider's, curb
+stick (`go --wait --join` holds it). A crossing already under way that `go` did not start (the rider's, curb
 assist's, another client's) is not taken over unless `--join`; `--no-hold`
 only watches it. Ctrl+C / SIGTERM / SIGHUP during `go --wait` release the stick
 and abort the crossing (`--on-interrupt pause` leaves it paused:

@@ -1,4 +1,5 @@
 """Offline tests for ramms_tools.robot: drive modes, Gen1 vs Gen2 curb, seat, out parameters (run: python -m pytest tests)."""
+import threading
 import time
 
 import pytest
@@ -229,8 +230,8 @@ def test_gen2_waits_for_a_retry_slower_than_a_fixed_grace():
     c.RETRY_GRACE_SECONDS = 0.1
     t0 = {"t": None}
     timed_phases(comps["CurbNegotiation"], [(0.0, "Idle", "Ready", "Info"), (0.02, "Approach", "Crossing up", "Info"),
-                                            (0.1,) + RETRYING, (0.8, "Cross", "Crossing up", "Info"),
-                                            (1.0, "Done", "Done: crossed", "Info")], t0)
+                                            (0.4,) + RETRYING, (1.2, "Cross", "Crossing up", "Info"),
+                                            (2.0, "Done", "Done: crossed", "Info")], t0)
     t0["t"] = time.monotonic()
     run = c.wait_until_done(timeout=10.0, poll=0.02)
     assert run.succeeded and [e.phase for e in run.events][-2:] == ["Cross", "Done"]
@@ -252,7 +253,7 @@ def test_gen1_start_still_being_made_is_waited_for():
     c = Robot.find(ue=ue).curb
     t0 = {"t": None}
     timed_phases(comps["CurbController"], [(0.0, "Idle", "Starting: up 15.0 cm, 40 cm ahead", "Info"),
-                                           (0.4, "Level", "Crossing up 15.0 cm", "Info"), (0.6, "Done", "Done", "Info")], t0)
+                                           (0.4, "Level", "Crossing up 15.0 cm", "Info"), (1.4, "Done", "Done", "Info")], t0)
     t0["t"] = time.monotonic()
     run = c.wait_until_done(timeout=10.0, poll=0.02, start_grace=0.1)
     assert run.started and run.succeeded
@@ -294,15 +295,58 @@ def timed_phases(comp, script, t0):
     return now
 
 
-def _phase_at_sets(fake, ue, now):
-    """Record, for each SetControl of drive.forward, the phase the fake answered at that moment."""
-    seen = []
+class Staged:
+    """
+    A crossing that moves on by what happened, not by the clock (so a loaded machine cannot skip a stage): GetPhase /
+    GetStatusLine answer the current stage; a stage ends, at a read, once it has lasted `min_s` and `done(st)` is
+    true -- st counts the stage's reads by the waiting loop (main thread) and its drive.forward sets and releases --
+    or after 10 s. Stage 0 lasts until the crossing is started (start()).
+    """
 
-    def hook(func, p):
+    def __init__(self, comp, fake, stages):
+        self.stages, self.fake, self.i, self.started = stages, fake, 0, False
+        self.t, self.main_reads, self.sets0, self.rel0 = time.monotonic(), 0, 0, 0
+        self.log = []                                      # (time, function, phase) of every drive.forward call
+        self.lock = threading.Lock()
+        comp.handlers.update(GetPhase=self._phase, GetStatusLine=self._status)
+        fake.on_call = self._hook
+
+    def start(self, p=None):
+        self.started = True
+        return {"OutReason": "", "ReturnValue": True}
+
+    def _advance(self):
+        while self.i + 1 < len(self.stages) and (self.i > 0 or self.started):
+            st = {"reads": self.main_reads, "sets": len(self.fake.set_times) - self.sets0,
+                  "releases": len(self.fake.release_times) - self.rel0, "since": time.monotonic() - self.t}
+            _, _, _, min_s, done = self.stages[self.i]
+            if self.i > 0 and not (st["since"] >= 10.0 or (st["since"] >= min_s and done(st))):
+                return
+            self.i += 1
+            self.t, self.main_reads = time.monotonic(), 0
+            self.sets0, self.rel0 = len(self.fake.set_times), len(self.fake.release_times)
+
+    def now(self):
+        return self.stages[self.i][:3]
+
+    def _phase(self, p):
+        with self.lock:
+            self._advance()
+            if threading.current_thread() is threading.main_thread():
+                self.main_reads += 1
+            return {"ReturnValue": self.now()[0]}
+
+    def _status(self, p):
+        with self.lock:
+            ph, text, sev = self.now()
+            return {"OutSeverity": sev, "ReturnValue": text}
+
+    def _hook(self, func, p):
         if p.get("Id") == "drive.forward":
-            seen.append((time.monotonic(), func, now()[1]))
-    fake.on_call = hook
-    return seen
+            self.log.append((time.monotonic(), func, self.now()[0]))
+
+
+ALWAYS = (lambda st: True)
 
 
 def test_cross_holds_the_stick_only_while_the_crossing_runs():
@@ -311,28 +355,24 @@ def test_cross_holds_the_stick_only_while_the_crossing_runs():
     ue, path, comps = robot_world("gen2", deadman=False)
     c = Robot.find(ue=ue).curb
     c.RETRY_GRACE_SECONDS = 1.0
-    t0 = {"t": None}
-    script = [(0.0, "Idle", "Ready", "Info"), (0.05, "Approach", "Crossing", "Info"),
-              (0.5, "Faulted", "Faulted: refused at rest", "Fault"), (1.1, "Cross", "Crossing", "Info"),
-              (1.5, "Done", "Crossed", "Info")]
-    now = timed_phases(comps["CurbNegotiation"], script, t0)
-
-    def start(p):
-        t0["t"] = time.monotonic()
-        return {"OutReason": "", "ReturnValue": True}
-    comps["CurbNegotiation"].handlers["NegotiateStepAhead"] = start
     fake = comps["ControlSurface"]
-    seen = _phase_at_sets(fake, ue, now)
+    run_ = Staged(comps["CurbNegotiation"], fake, [
+        ("Idle", "Ready", "Info", 0, ALWAYS),
+        ("Approach", "Crossing", "Info", 0.1, lambda st: st["sets"] >= 2 and st["reads"] >= 1),
+        ("Faulted", "Faulted: refused at rest", "Fault", 0.2, lambda st: st["releases"] >= 1 and st["reads"] >= 1),
+        ("Cross", "Crossing", "Info", 0.1, lambda st: st["sets"] >= 2 and st["reads"] >= 1),
+        ("Done", "Crossed", "Info", 0, ALWAYS)])
+    comps["CurbNegotiation"].handlers["NegotiateStepAhead"] = run_.start
     events = []
     run = c.cross(on_event=events.append)
     assert run.succeeded and [e.phase for e in events if e.phase != "Idle"] == ["Approach", "Faulted", "Cross", "Done"]
-    sets = [ph for t, f, ph in seen if f == "SetControl"]
+    sets = [ph for t, f, ph in run_.log if f == "SetControl"]
     assert {"Approach", "Cross"} <= set(sets)
     # The sender reads the phase in the request of each send (the fake answers a whole batch at one instant, as the
     # engine does in one frame): at most the one send that went with the read that saw the end lands after it.
     assert sets.count("Faulted") <= 1 and sets.count("Done") <= 1 and "Idle" not in sets
     assert all(v == 1.0 for _, cid, v in fake.set_times if cid == "drive.forward")       # full stick by default
-    assert "Faulted" in [ph for t, f, ph in seen if f == "ReleaseControl"]               # let go when the fault was seen
+    assert "Faulted" in [ph for t, f, ph in run_.log if f == "ReleaseControl"]           # let go when the fault was seen
     assert fake.latched() == {} and run.stick_refused == 0
 
 
@@ -341,75 +381,76 @@ def test_cross_lets_go_however_slow_the_callbacks_are():
     the crossing ends and hands the robot back (the review's 1.3 s of sends after Done)."""
     ue, path, comps = robot_world("gen1", deadman=True)
     c = Robot.find(ue=ue).curb
-    t0 = {"t": None}
-    now = timed_phases(comps["CurbController"], [(0.0, "Idle", "Ready", "Info"), (0.05, "Level", "Crossing up", "Info"),
-                                                 (0.4, "Restore", "Crossing up: back", "Info"),
-                                                 (0.6, "Done", "Done: crossed", "Info")], t0)
-
-    def start(p):
-        t0["t"] = time.monotonic()
-        return {"OutReason": "", "ReturnValue": True}
-    comps["CurbController"].handlers["StartCrossing"] = start
     fake = comps["ControlSurface"]
-    seen = _phase_at_sets(fake, ue, now)
+    run_ = Staged(comps["CurbController"], fake, [
+        ("Idle", "Ready", "Info", 0, ALWAYS),
+        ("Level", "Crossing up", "Info", 0.1, lambda st: st["sets"] >= 2 and st["reads"] >= 1),
+        ("Restore", "Crossing up: back", "Info", 0.1, lambda st: st["reads"] >= 1),   # the loop is now in on_event
+        ("Done", "Done: crossed", "Info", 0, ALWAYS)])
+    comps["CurbController"].handlers["StartCrossing"] = run_.start
+    slept = {}
 
     def on_event(e):
         if e.phase == "Restore":
             time.sleep(1.5)             # a user callback, a GUI, a blocked stdout
+            slept["until"] = time.monotonic()
     run = c.cross(on_event=on_event)
     assert run.succeeded
-    sets = [(t, ph) for t, f, ph in seen if f == "SetControl"]
-    assert "Level" in [ph for _, ph in sets]
-    late = [t for t, ph in sets if ph == "Done"]
-    # At most the one send in the same request as the read that saw Done -- and the sender released it in its next
-    # request, while the loop was still asleep in on_event.
-    assert len(late) <= 1
-    done_at = t0["t"] + 0.6
-    releases = [t for t, cid in fake.release_times if cid == "drive.forward" and t > done_at]
-    assert releases and releases[0] - (late[0] if late else done_at) < 0.5
+    sets = [ph for t, f, ph in run_.log if f == "SetControl"]
+    assert "Level" in sets and sets.count("Done") <= 1    # at most the send in the request whose read saw Done ...
+    done_releases = [t for t, f, ph in run_.log if f == "ReleaseControl" and ph == "Done"]
+    assert done_releases and done_releases[0] < slept["until"]    # ... released by the sender while the loop slept
     assert fake.latched() == {}
 
 
 def test_stick_waits_for_the_curb_mode():
     """Gen2 begins its Approach at once, while the selector may still wait to hand over to the curb mode (the robot
-    turning): a stick held then would drive the outgoing differential mode. It is held only in the curb mode."""
+    turning: URammsDriveModeSelector keeps the outgoing differential mode driving on the operator's commands). A
+    stick held then would drive that mode; it is held only once the curb mode is active."""
     ue, path, comps = robot_world("gen2", deadman=True)
     c = Robot.find(ue=ue).curb
     sel = comps["DriveModeSelector"]
     sel.curb_pending = True                      # the hand-over is still waiting
-    t0 = {"t": None}
-    now = timed_phases(comps["CurbNegotiation"], [(0.0, "Idle", "Ready", "Info"), (0.02, "Approach", "Crossing up", "Info"),
-                                                  (1.2, "Done", "Done: crossed", "Info")], t0)
-
-    def start(p):
-        t0["t"] = time.monotonic()
-        return {"OutReason": "", "ReturnValue": True}
-    comps["CurbNegotiation"].handlers["NegotiateStepAhead"] = start
     fake = comps["ControlSurface"]
     switched = {"t": None}
 
-    def hand_over():
-        if t0["t"] is not None and time.monotonic() - t0["t"] > 0.5 and sel.curb_pending:
-            sel.curb_pending = False
+    def hand_over(st):
+        if st["reads"] >= 3 and switched["t"] is None:
+            sel.curb_pending = False             # the selector hands over now
             switched["t"] = time.monotonic()
-        return False
-    run = c.cross(should_stop=hand_over)
+        return switched["t"] is not None and st["sets"] >= 2
+    run_ = Staged(comps["CurbNegotiation"], fake, [
+        ("Idle", "Ready", "Info", 0, ALWAYS),
+        ("Approach", "Crossing up", "Info", 0.3, hand_over),
+        ("Done", "Done: crossed", "Info", 0, ALWAYS)])
+    comps["CurbNegotiation"].handlers["NegotiateStepAhead"] = run_.start
+    run = c.cross()
     assert run.succeeded and switched["t"] is not None
     times = [t for t, cid, v in fake.set_times if cid == "drive.forward"]
     assert times and min(times) >= switched["t"]           # nothing before the curb mode was active
     assert fake.latched() == {}
 
 
+def runs_until_held(comp, fake, phase="FrontUp", text="Crossing up 15.0 cm: Front omni wheels up", timeout=10.0):
+    """A crossing under way that ends once the stick has been held (whatever the machine's load): GetPhase /
+    GetStatusLine answer `phase` until a drive.forward set was taken, then Done."""
+    end = time.monotonic() + timeout
+
+    def now():
+        held = any(cid == "drive.forward" for cid, _, _ in fake.sets) or time.monotonic() > end
+        return ("Done", "Done", "Info") if held else (phase, text, "Info")
+    comp.handlers.update(GetPhase=lambda p: {"ReturnValue": now()[0]},
+                         GetStatusLine=lambda p: {"OutSeverity": now()[2], "ReturnValue": now()[1]})
+
+
 def test_cross_does_not_take_over_a_crossing_it_did_not_start():
     ue, path, comps = robot_world("gen1", deadman=False)
     c = Robot.find(ue=ue).curb
-    scripted_phases(comps["CurbController"], [("FrontUp", "Crossing up 15.0 cm: Front omni wheels up", "Info")] * 3
-                    + [("Done", "Done", "Info")])
+    runs_until_held(comps["CurbController"], comps["ControlSurface"])
     run = c.cross()
     assert not run.started and run.already_running and "join=True" in run.reason
     assert ue.calls_to("StartCrossing") == [] and comps["ControlSurface"].sets == []
     # Asked to, it joins and holds the stick for it.
-    scripted_phases(comps["CurbController"], [("FrontUp", "Crossing up", "Info")] * 40 + [("Done", "Done", "Info")])
     run = c.cross(join=True, poll=0.01)
     assert run.succeeded and ("drive.forward", 1.0, "Remote") in comps["ControlSurface"].sets
     assert comps["ControlSurface"].latched() == {}
