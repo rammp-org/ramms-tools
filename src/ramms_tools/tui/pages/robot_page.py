@@ -429,10 +429,12 @@ class RobotPage(Container):
         """Show a value read from the robot without sending it back as a command (None: unreadable, left as is)."""
         if value is None:
             return
-        try:
-            w = self.query_one(f"#{widget_id}")
-        except Exception:
+        # Only a widget that is mounted (composed) and not on its way out: a rebuild mounts new selectors under the
+        # same ids while the old ones are still being removed. One not ready yet is filled by the next poll.
+        ready = [w for w in self.query(f"#{widget_id}") if w.is_mounted and w.is_attached]
+        if not ready:
             return
+        w = ready[-1]
         if self._known.get(widget_id) == value:
             return
         self._known[widget_id] = value
