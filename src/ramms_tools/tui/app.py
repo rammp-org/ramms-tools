@@ -10,7 +10,7 @@ from textual.widgets import Footer, Header, TabbedContent, TabPane
 
 from ramms_tools.unreal_remote import UnrealRemote
 from ramms_tools.tui.widgets import ConnectionBar
-from ramms_tools.tui.pages import ArmPage, DashboardPage, IMUPage, RammpGen1Page, StreamPage
+from ramms_tools.tui.pages import ArmPage, DashboardPage, IMUPage, RammpGen1Page, RobotPage, StreamPage
 
 
 class RammsTUI(App):
@@ -40,6 +40,7 @@ class RammsTUI(App):
         Binding("3", "tab('rammp-gen1')", "RAMMP Gen1", show=False),
         Binding("4", "tab('imu')", "IMU", show=False),
         Binding("5", "tab('stream')", "Stream", show=False),
+        Binding("6", "tab('robot')", "Robot", show=False),
     ]
 
     connected: reactive[bool] = reactive(False)
@@ -68,6 +69,8 @@ class RammsTUI(App):
                 yield IMUPage(id="page-imu")
             with TabPane("📡 Stream", id="tab-stream"):
                 yield StreamPage(id="page-stream")
+            with TabPane("🛞 Robot", id="tab-robot"):
+                yield RobotPage(id="page-robot")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -142,6 +145,7 @@ class RammsTUI(App):
             "tab-rammp-gen1": "page-rammp-gen1",
             "tab-imu": "page-imu",
             "tab-stream": "page-stream",
+            "tab-robot": "page-robot",
         }
         for tab_id, page_id in pages.items():
             try:
@@ -158,6 +162,12 @@ class RammsTUI(App):
         self._check_connection()
         self._discover_components()
         # Force refresh the active page
+        try:
+            robot_page = self.query_one("#page-robot", RobotPage)
+            if robot_page._active:
+                robot_page.refresh_page()
+        except Exception:
+            pass
         for page_id in ("page-dashboard", "page-arm", "page-rammp-gen1"):
             try:
                 page = self.query_one(f"#{page_id}")

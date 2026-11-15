@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """RAMMS TUI — Terminal UI for monitoring and controlling RAMMS robotics.
 
-Launch the interactive TUI dashboard for the RAMMP Gen1, Kinova arm, and
-IMU data streaming.
+Launch the interactive TUI dashboard for the RAMMP Gen1, Kinova arm, IMU
+data streaming, and any robot's control surface (Robot tab: drive mode, curb
+crossing, controls, readback and sensors).
 
 Usage:
     ramms-tui                         # Connect to localhost:30010

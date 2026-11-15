@@ -28,6 +28,15 @@ Remote Control with plain strings and numbers, and this module wraps that.
     for seed, path in wg.batch("PRE_Downtown", range(20), out_dir="data/downtown"):
         print(seed, path)
 
+    # graded streets, curb heights and rough ground (friendly names for the terrain parameters)
+    gen.set_terrain(max_grade=0.08, cross_slope=0.02, curb_min=10, curb_max=20, roughness=0.5, potholes=2)
+    gen.generate(seed=7)
+    print(gen.manifest().terrain_summary())          # max running grade, cross-slope / curb-height ranges, ...
+
+    # moving traffic on a traffic level (PIE or a game)
+    from ramms_tools.worldgen import Traffic
+    print(Traffic().status())                        # spawners, cars, signal phase
+
 Everything here also works against a running game (-game or packaged with the
 Remote Control plugin enabled), since the generator and the bridge are runtime
 code; only ``open_map`` behaves differently (travel vs. editor load).
@@ -41,9 +50,11 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional, Union
 
 from ramms_tools.unreal_remote import UnrealRemote, UnrealRemoteError
-from .manifest import Feature, Manifest, Route
+from .manifest import ROUGHNESS_FEATURES, Feature, Manifest, Route
+from .traffic import CarPose, SignalState, Traffic, TrafficError
 
-__all__ = ["WorldGen", "Generator", "Manifest", "Feature", "Route", "WorldGenError", "BRIDGE"]
+__all__ = ["WorldGen", "Generator", "Manifest", "Feature", "Route", "WorldGenError", "BRIDGE", "Traffic", "TrafficError",
+           "SignalState", "CarPose", "TERRAIN_PARAMS", "ROUGHNESS_PARAMS", "ROUGHNESS_FEATURES", "terrain_values"]
 
 BRIDGE = "/Script/RammsWorldGen.Default__RammsWorldGenBridge"
 
@@ -53,6 +64,61 @@ ParamValue = Union[float, int, bool, str]
 
 class WorldGenError(UnrealRemoteError):
     pass
+
+
+# Friendly names for the graded-street and rough-ground parameters (RammsWorldGen README, "Parameters" and
+# "Adjusting slope, cross slope and curb heights"): friendly -> (parameter, min, max); None = no bound.
+# Slopes are fractions (rise / run: 0.05 = 5 %), heights and lengths cm, densities per 100 m, chances 0..1.
+TERRAIN_PARAMS: dict[str, tuple[str, float, Optional[float]]] = {
+    "max_grade": ("MaxStreetGrade", 0.0, 0.15),                         # street grade between intersections, +-
+    "crown": ("RoadCrown", 0.0, 0.08),                                  # each road half falls to its gutter
+    "cross_slope": ("SidewalkCrossSlope", 0.0, 0.08),                   # walks rise toward the lots (0.6-1 of it)
+    "noncompliant_cross_slope": ("NonCompliantCrossSlopeChance", 0.0, 1.0),   # share of blocks drawing 3-6 %
+    "curb_height": ("CurbHeight", 0.0, None),                           # every curb when CurbHeightMax is 0
+    "curb_min": ("CurbHeightMin", 0.0, None),                           # per-block curb heights (never under 2 cm)
+    "curb_max": ("CurbHeightMax", 0.0, None),                           # 0 = every curb CurbHeight
+}
+ROUGHNESS_PARAMS: dict[str, tuple[str, float, Optional[float]]] = {
+    "roughness": ("SurfaceRoughness", 0.0, 1.0),                        # panel lips
+    "panel_length": ("PanelLength", 60.0, None),                        # cm (150; the plugin's ClampMin is 60)
+    "heaves": ("HeaveDensity", 0.0, None),                              # tilted panels per 100 m of side
+    "cracks": ("CrackDensity", 0.0, None),
+    "covers": ("CoverDensity", 0.0, None),                              # utility covers
+    "paving": ("PavingPatchDensity", 0.0, None),                        # brick / setts patches
+    "potholes": ("PotholeDensity", 0.0, None),                          # per 100 m of road
+    "humps": ("SpeedHumpChance", 0.0, 1.0),                             # per street segment
+    "root_heaves": ("RootHeaveChance", 0.0, 1.0),                       # per street tree in a pit
+}
+_ALL_TERRAIN = {**TERRAIN_PARAMS, **ROUGHNESS_PARAMS}
+# What flat=True zeroes: everything that switches the ground model on (CurbHeight, CurbHeightMin, PanelLength stay).
+_FLAT = ("MaxStreetGrade", "RoadCrown", "SidewalkCrossSlope", "NonCompliantCrossSlopeChance", "CurbHeightMax",
+         "SurfaceRoughness", "HeaveDensity", "CrackDensity", "CoverDensity", "PavingPatchDensity", "PotholeDensity",
+         "SpeedHumpChance", "RootHeaveChance")
+
+
+def terrain_values(flat: bool = False, **friendly: Optional[float]) -> dict[str, float]:
+    """
+    The parameter block for set_terrain: friendly names (or the parameter names themselves) -> parameter values,
+    range-checked against the README. None values are skipped. flat=True starts from the flat, smooth world.
+    Raises KeyError for an unknown name, ValueError for a value out of range.
+    """
+    by_param = {param: (param, lo, hi) for param, lo, hi in _ALL_TERRAIN.values()}
+    out: dict[str, float] = {name: 0.0 for name in _FLAT} if flat else {}
+    for key, value in friendly.items():
+        if value is None:
+            continue
+        spec = _ALL_TERRAIN.get(key) or by_param.get(key)
+        if spec is None:
+            raise KeyError(f"unknown terrain setting {key!r} (known: {', '.join(sorted(_ALL_TERRAIN))})")
+        param, lo, hi = spec
+        v = float(value)
+        if v < lo or (hi is not None and v > hi):
+            raise ValueError(f"{key} ({param}) must be in {lo:g}..{'' if hi is None else f'{hi:g}'}, not {v:g}")
+        out[param] = v
+    cmin, cmax = out.get("CurbHeightMin"), out.get("CurbHeightMax")
+    if cmin is not None and cmax and cmax < max(cmin, 2.0):
+        raise ValueError(f"curb_max ({cmax:g}) is below curb_min ({cmin:g}; never under 2 cm)")
+    return out
 
 
 def _as_list(result: Any) -> list:
@@ -203,6 +269,31 @@ class Generator:
     def clear_overrides(self) -> None:
         self.wg._call("ClearOverrides", GeneratorPath=self.path)
 
+    def set_terrain(self, flat: bool = False, strict: bool = False, **friendly: Optional[float]) -> dict:
+        """
+        Graded streets, curb heights and rough ground by friendly name, as overrides (next generate()):
+
+            max_grade (MaxStreetGrade, 0..0.15), crown (RoadCrown, 0..0.08), cross_slope (SidewalkCrossSlope,
+            0..0.08), noncompliant_cross_slope (NonCompliantCrossSlopeChance, 0..1), curb_height (CurbHeight),
+            curb_min / curb_max (CurbHeightMin / CurbHeightMax, cm; curb_max 0 = every curb CurbHeight),
+            roughness (SurfaceRoughness, 0..1), panel_length (PanelLength, cm), heaves (HeaveDensity), cracks
+            (CrackDensity), covers (CoverDensity), paving (PavingPatchDensity), potholes (PotholeDensity),
+            humps (SpeedHumpChance, 0..1), root_heaves (RootHeaveChance, 0..1).
+
+        The parameter names work too. flat=True first zeroes every terrain and roughness parameter. Returns
+        set_params' {"applied", "unknown"}; strict=True raises KeyError when the plugin does not know one
+        (an older RammsWorldGen). Raises ValueError for a value out of the README's range.
+        """
+        values = terrain_values(flat=flat, **friendly)
+        if not values:
+            return {"ok": True, "applied": [], "unknown": []}
+        return self.set_params(values, strict=strict)
+
+    def terrain(self) -> dict[str, ParamValue]:
+        """The current terrain and roughness parameters by friendly name (those the plugin has)."""
+        p = self.params()
+        return {friendly: p[param] for friendly, (param, _, _) in _ALL_TERRAIN.items() if param in p}
+
     def vary_glass(self) -> int:
         """
         Re-roll the per-placement glass look (frost / blur, tint, ripple, opacity) of the current world from
@@ -247,6 +338,10 @@ class WorldGen:
 
     def _call(self, func: str, **params: Any) -> Any:
         return self.ue._call_function(BRIDGE, func, params if params else None)
+
+    def traffic(self) -> Traffic:
+        """The level's moving traffic (spawners, signal clocks, cars) on the same connection."""
+        return Traffic(self.ue)
 
     # ── discovery ───────────────────────────────────────────────────
 

@@ -44,6 +44,13 @@ Usage:
 
     # Duck-typed method calls (auto-translated to remote calls)
     actor.SetActorLocation(NewLocation={"X": 100, "Y": 0, "Z": 50})
+
+    # Out parameters come back beside ReturnValue: ask for the full response
+    curb = ue.actor(curb_controller_path)
+    curb.call_full("GetStatusLine")   # {"OutSeverity": "Info", "ReturnValue": "Ready"}
+
+    # Several calls in one request (/remote/batch: run in order, in one engine frame); one per call as a fallback
+    ue.call_many([(curb_controller_path, "GetPhase", None), (curb_controller_path, "GetStatusLine", None)])
 """
 
 from __future__ import annotations
@@ -61,6 +68,10 @@ logger = logging.getLogger(__name__)
 class UnrealRemoteError(Exception):
     """Raised when a remote control API call fails."""
     pass
+
+
+class _BatchUnreadable(Exception):
+    """The /remote/batch request failed, or came back in a shape call_many does not read."""
 
 
 class RemoteObjectProxy:
@@ -100,6 +111,11 @@ class RemoteObjectProxy:
         """Call a function on this object with keyword arguments as parameters."""
         client = object.__getattribute__(self, '_client')
         return client._call_function(self.object_path, function_name, kwargs)
+
+    def call_full(self, function_name: str, **kwargs) -> dict:
+        """Like call(), but return the whole response: ReturnValue plus every out parameter."""
+        client = object.__getattribute__(self, '_client')
+        return client.call_full(self.object_path, function_name, kwargs)
 
     def get_components(self, class_filter: Optional[str] = None) -> list[RemoteObjectProxy]:
         """Get components of this actor, optionally filtered by class name."""
@@ -141,6 +157,9 @@ class UnrealRemote:
                  timeout: float = 5.0, ui_bridge: Optional[str] = None):
         self.base_url = f"http://{host}:{http_port}"
         self.timeout = timeout
+        # call_many: None until a batch has been sent, True when the engine answers them, False to send one request
+        # per call (no batch route, or answers this client does not read).
+        self.batch_supported: Optional[bool] = None
         if ui_bridge is not None:
             self.ramms_ui_bridge = ui_bridge
 
@@ -264,7 +283,7 @@ class UnrealRemote:
             logger.warning(f"FindRammsWidgets failed: {e}")
             return []
 
-    def find_actors_by_component(self, component_class_filter: str
+    def find_actors_by_component(self, component_class_filter: str, strict: bool = False
                                 ) -> list[dict]:
         """
         Find actors that have a component matching a class name substring.
@@ -272,6 +291,9 @@ class UnrealRemote:
         Returns list of dicts with 'actor_path', 'actor_proxy',
         'component_name', 'component_class', and 'component_path' keys.
         Single server-side call — much faster than iterating all actors.
+        A failed call answers [] (logged at debug level); strict=True raises
+        the UnrealRemoteError instead, so "nothing found" and "could not ask"
+        can be told apart.
         """
         try:
             result = self._call_function(
@@ -299,6 +321,8 @@ class UnrealRemote:
             return entries
         except UnrealRemoteError as e:
             logger.debug(f"FindActorsByComponent failed: {e}")
+            if strict:
+                raise
             return []
 
     def find_components(self, actor_path: str,
@@ -520,6 +544,100 @@ class UnrealRemote:
             return result.get("Responses", [])
         return result if isinstance(result, list) else []
 
+    def call_many(self, calls: list[tuple[str, str, Optional[dict]]], full: bool = False,
+                  force_batch: bool = False) -> list[Any]:
+        """
+        Several function calls in one ``/remote/batch`` request: the engine
+        runs them in order, in one frame. ``calls`` are ``(object_path,
+        function_name, parameters)``. Returns one entry per call: its
+        ReturnValue (the whole response with full=True, as call_full), or the
+        UnrealRemoteError it failed with -- returned, not raised, so the other
+        calls' results are kept.
+
+        Falls back to one request per call when the engine has no batch route,
+        or answers it in a shape this client does not read (every call failed
+        in the batch but not alone); ``batch_supported`` then stays False and
+        later calls go one at a time without trying again. A single call is
+        sent on its own unless force_batch (which a caller uses to learn
+        whether batches work before it relies on one).
+        """
+        calls = [(p, f, prm or None) for p, f, prm in calls]
+        if not calls:
+            return []
+        if self.batch_supported is False or (len(calls) == 1 and not (force_batch and self.batch_supported is None)):
+            return self._call_each(calls, full)
+        try:
+            results = self._batch_calls(calls, full)
+        except _BatchUnreadable as e:
+            results = None
+            why = str(e)
+        if results is not None and not all(isinstance(r, UnrealRemoteError) for r in results):
+            self.batch_supported = True
+            return results
+        if results is not None:
+            why = f"every call failed in the batch ({results[0]})"
+        singles = self._call_each(calls, full)
+        if not all(isinstance(r, UnrealRemoteError) for r in singles):
+            if self.batch_supported is not False:
+                logger.warning("Remote Control batch not usable (%s): sending calls one request each", why)
+            self.batch_supported = False
+        return singles
+
+    def _call_each(self, calls: list[tuple[str, str, Optional[dict]]], full: bool) -> list[Any]:
+        out: list[Any] = []
+        for path, func, params in calls:
+            try:
+                out.append(self._call_function(path, func, params, full=full))
+            except UnrealRemoteError as e:
+                out.append(e)
+        return out
+
+    def _batch_calls(self, calls: list[tuple[str, str, Optional[dict]]], full: bool) -> list[Any]:
+        requests = []
+        for i, (path, func, params) in enumerate(calls):
+            body: dict[str, Any] = {"objectPath": path, "functionName": func}
+            if params:
+                body["parameters"] = params
+            requests.append({"RequestId": i, "URL": "/remote/object/call", "Verb": "PUT", "Body": body})
+        try:
+            result = self._request("PUT", "/remote/batch", {"Requests": requests})
+        except UnrealRemoteError as e:
+            raise _BatchUnreadable(str(e)) from e
+        responses = result.get("Responses") if isinstance(result, dict) else None
+        if not isinstance(responses, list):
+            raise _BatchUnreadable(f"no Responses in {str(result)[:200]}")
+        by_id: dict[int, dict] = {}
+        for r in responses:
+            if isinstance(r, dict):
+                try:
+                    by_id[int(r.get("RequestId", -1))] = r
+                except (TypeError, ValueError):
+                    pass
+        out: list[Any] = []
+        for i, (path, func, _) in enumerate(calls):
+            r = by_id.get(i)
+            if r is None:
+                raise _BatchUnreadable(f"no response for request {i}")
+            body = r.get("ResponseBody")
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body) if body.strip() else {}
+                except ValueError:
+                    pass
+            try:
+                code = int(r.get("ResponseCode", 200))
+            except (TypeError, ValueError):
+                code = 200
+            if not 200 <= code < 300:
+                out.append(UnrealRemoteError(f"HTTP {code} on PUT /remote/object/call ({func} on {path}): {body}"))
+            elif full:
+                out.append(body if body is not None else {})
+            elif isinstance(body, dict) and "ReturnValue" in body:
+                out.append(body["ReturnValue"])
+            else:
+                out.append(body if body is not None else {})
+        return out
+
     # ── Low-level operations ────────────────────────────────────────
 
     def _get_property(self, object_path: str, property_name: str,
@@ -547,9 +665,32 @@ class UnrealRemote:
         }
         return self._request("PUT", "/remote/object/property", body)
 
+    def call_full(self, object_path: str, function_name: str,
+                  parameters: Optional[dict] = None) -> dict:
+        """
+        Call a function and return the whole response as a dict.
+
+        Unreal returns a function's out parameters beside its ReturnValue
+        (``{"OutSeverity": "Info", "ReturnValue": "Ready"}``), and a void
+        function with only out parameters has no ReturnValue at all
+        (``{"OutStepCm": 0, "OutCrossingHeightCm": 0}``). ``_call_function``
+        keeps only the ReturnValue; this keeps everything. A response that is
+        not an object comes back as ``{"ReturnValue": <it>}``, an empty one
+        as ``{}``.
+        """
+        result = self._call_function(object_path, function_name, parameters, full=True)
+        if isinstance(result, dict):
+            return result
+        return {"ReturnValue": result}
+
     def _call_function(self, object_path: str, function_name: str,
-                       parameters: Optional[dict] = None) -> Any:
-        """Call a function on a remote object."""
+                       parameters: Optional[dict] = None, full: bool = False) -> Any:
+        """Call a function on a remote object.
+
+        Returns the ReturnValue when the response has one (else the response
+        as it came); with full=True the response as it came, out parameters
+        and all (see call_full).
+        """
         body: dict[str, Any] = {
             "objectPath": object_path,
             "functionName": function_name,
@@ -558,6 +699,8 @@ class UnrealRemote:
             body["parameters"] = parameters
 
         result = self._request("PUT", "/remote/object/call", body)
+        if full:
+            return result
 
         # Extract return value if present
         if isinstance(result, dict) and "ReturnValue" in result:

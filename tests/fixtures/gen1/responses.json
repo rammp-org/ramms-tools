@@ -1,0 +1,66 @@
+{
+ "DriveModeSelector": {
+  "_class": "RammsDriveModeSelector",
+  "GetAvailableModeIds": {
+   "ReturnValue": [
+    "curb",
+    "differential"
+   ]
+  },
+  "GetActiveModeId": {
+   "ReturnValue": "differential"
+  },
+  "IsSwitchingMode": {
+   "ReturnValue": false
+  },
+  "GetSwitchStatus": {
+   "ReturnValue": "differential again"
+  },
+  "GetMeasuredMotion": {
+   "ReturnValue": {
+    "ForwardCmPerSecond": 0,
+    "RightCmPerSecond": 0,
+    "YawRateDegPerSecond": 0
+   }
+  }
+ },
+ "CurbController": {
+  "_class": "RammsRammpGen1CurbController",
+  "GetPhase": {
+   "ReturnValue": "Idle"
+  },
+  "GetStatus": {
+   "ReturnValue": ""
+  },
+  "GetStatusLine": {
+   "OutSeverity": "Info",
+   "ReturnValue": "Ready"
+  },
+  "GetStats": {
+   "ReturnValue": {
+    "CrossingSeconds": 0,
+    "EdgeToRearDownSeconds": 0,
+    "EdgeToEndSeconds": 0,
+    "Stops": 0,
+    "SecondsStopped": 0,
+    "MaxAbsPitchDeg": 0,
+    "MaxAbsRollDeg": 0,
+    "MaxInclinationDeg": 0,
+    "MaxPitchRateDegS": 0,
+    "PeakRiderAccelMS2": 0,
+    "PeakRiderForeAftAccelMS2": 0,
+    "PeakRiderVerticalAccelMS2": 0,
+    "RmsRiderAccelMS2": 0,
+    "MinStabilityMarginCm": 0,
+    "MinMarginPhase": "Idle",
+    "MinFrameClearanceCm": 0,
+    "MinClearancePhase": "Idle",
+    "bFrameMeasured": false
+   }
+  },
+  "GetCrossing": {
+   "OutStepCm": 0,
+   "OutCrossingHeightCm": 0
+  }
+ }
+}

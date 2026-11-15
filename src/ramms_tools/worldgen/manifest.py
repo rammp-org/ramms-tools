@@ -45,9 +45,9 @@ def _quat_yaw(q: dict) -> float:
 # Kinds the plugin writes. Unreal FNames compare case-insensitively and a cooked build can hand
 # back a different casing than the editor ("door" vs "Door"), so names are canonicalised here.
 KNOWN_KINDS = (
-    "Aisle", "Building", "CarPark", "CheckoutLane", "Crossing", "Crosswalk", "CurbRamp", "Decor", "Door", "Driveway",
-    "Entrance", "Furniture", "Hazard", "Path", "Pond", "Prop", "Ramp", "Room", "Shrub", "Stall", "Step",
-    "Surface", "Terrain", "Threshold", "Tree", "Vehicle", "Water",
+    "Aisle", "Building", "CarPark", "CheckoutLane", "Cover", "Crossing", "Crosswalk", "Curb", "CurbRamp", "Decor", "Door",
+    "Driveway", "Entrance", "Furniture", "Grade", "Hazard", "House", "Intersection", "Path", "Pond", "Prop", "Ramp",
+    "Road", "Room", "Shrub", "SpeedHump", "Stall", "Step", "Surface", "Terrain", "Threshold", "Tree", "Vehicle", "Water",
 )
 _CANON = {k.lower(): k for k in KNOWN_KINDS}
 
@@ -58,6 +58,29 @@ def canonical_name(name: str) -> str:
     if not name:
         return name
     return _CANON.get(name.lower()) or (name[0].upper() + name[1:])
+
+
+# The features the roughness parameters lay (kind, subtype), on graded / rough ground:
+# SurfaceRoughness -> Surface/JointLip, CrackDensity -> Surface/Crack, PotholeDensity -> Surface/Pothole,
+# PavingPatchDensity -> Surface/Brick and Surface/Setts, HeaveDensity -> Hazard/Heave, RootHeaveChance ->
+# Hazard/RootHeave, CoverDensity -> Cover/Raised and Cover/Sunken, SpeedHumpChance -> SpeedHump/Hump and Table.
+ROUGHNESS_FEATURES = (
+    ("Surface", "JointLip"), ("Surface", "Crack"), ("Surface", "Pothole"), ("Surface", "Brick"), ("Surface", "Setts"),
+    ("Hazard", "Heave"), ("Hazard", "RootHeave"), ("Cover", "Raised"), ("Cover", "Sunken"),
+    ("SpeedHump", "Hump"), ("SpeedHump", "Table"),
+)
+_ROUGHNESS = {(k.lower(), st.lower()) for k, st in ROUGHNESS_FEATURES}
+
+
+def _range(values: list[float], digits: int) -> tuple[float, float]:
+    return (round(min(values), digits), round(max(values), digits)) if values else (0.0, 0.0)
+
+
+def _counts(items: Iterable[str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for it in items:
+        out[it] = out.get(it, 0) + 1
+    return dict(sorted(out.items()))
 
 
 @dataclass
@@ -308,6 +331,106 @@ class Manifest:
             if _dist_to_polyline(f.location, r.points) <= corridor:
                 out.append(f)
         return out
+
+    # ── graded streets and rough ground ─────────────────────────────
+
+    def grades(self, subtype: Optional[str] = None) -> list[Feature]:
+        """Grade records (graded ground): per sidewalk side, subtype Running (its steepest running grade along the
+        route) and Cross (its cross slope at mid-side); measure is rise / run, route the side."""
+        return self.features_of("Grade", subtype)
+
+    def grades_by_side(self) -> dict[str, dict[str, float]]:
+        """{side: {"running": grade, "cross": slope}} from the Grade records (rise / run)."""
+        out: dict[str, dict[str, float]] = {}
+        for f in self.grades():
+            side = f.route or f"{f.location[0]:.0f},{f.location[1]:.0f}"
+            out.setdefault(side, {})[f.subtype.lower()] = f.measure
+        return out
+
+    def curbs(self, subtype: Optional[str] = None) -> list[Feature]:
+        """Curb records (graded ground): per side, subtype Low (under 10 cm) / Standard / High (over 17 cm);
+        measure is the mean curb height, size.z the highest (cm)."""
+        return self.features_of("Curb", subtype)
+
+    def curb_heights(self) -> list[tuple[float, float]]:
+        """(mean, highest) curb height per side, cm."""
+        return [(f.measure, f.size[2] or f.measure) for f in self.curbs()]
+
+    def curb_ramps(self, subtype: Optional[str] = None) -> list[Feature]:
+        """Curb ramps (Standard, TooSteep, NoDetectableWarning, CrossSlope, SteepFlare)."""
+        return self.features_of("CurbRamp", subtype)
+
+    def curb_ramps_by_subtype(self) -> dict[str, int]:
+        return _counts(f.subtype or "-" for f in self.curb_ramps())
+
+    def roughness(self, subtype: Optional[str] = None) -> list[Feature]:
+        """The rough-ground features (see ROUGHNESS_FEATURES): joint lips, cracks, potholes, pavers, heaves, root
+        heaves, utility covers and speed humps; optionally one subtype."""
+        st = None if subtype is None else subtype.lower()
+        return [f for f in self.features if (f.kind.lower(), f.subtype.lower()) in _ROUGHNESS
+                and (st is None or f.subtype.lower() == st)]
+
+    def roughness_counts(self) -> dict[str, int]:
+        """How many of each rough-ground feature, keyed "Kind/Subtype"."""
+        return _counts(f"{f.kind}/{f.subtype}" for f in self.roughness())
+
+    def speed_humps(self) -> list[Feature]:
+        return self.features_of("SpeedHump")
+
+    def terrain_summary(self) -> dict:
+        """
+        The ground at a glance: steepest running grade, cross-slope range, curb-height range (lowest mean to
+        highest point, cm), curb ramps by subtype, rough-ground features by kind / subtype, and the
+        non-compliant grades. A flat world (no Grade records) reports graded False and zeros.
+        """
+        running = [abs(f.measure) for f in self.grades("Running")]
+        cross = [abs(f.measure) for f in self.grades("Cross")]
+        curbs = self.curbs()
+        lows = [f.measure for f in curbs]
+        highs = [max(f.size[2], f.measure) for f in curbs]
+        return {
+            "graded": bool(running or cross),
+            "grades": len(running) + len(cross),
+            "max_running_grade": round(max(running, default=0.0), 4),
+            "cross_slope_range": _range(cross, 4),
+            "curbs": len(curbs),
+            "curb_height_range": (round(min(lows), 1), round(max(highs), 1)) if curbs else (0.0, 0.0),
+            "curbs_by_subtype": _counts(f.subtype or "-" for f in curbs),
+            "curb_ramps": self.curb_ramps_by_subtype(),
+            "roughness": self.roughness_counts(),
+            "steep_running_grades": sum(1 for f in self.grades("Running") if not f.compliant),
+            "steep_cross_slopes": sum(1 for f in self.grades("Cross") if not f.compliant),
+        }
+
+    # ── traffic ─────────────────────────────────────────────────────
+
+    def roads(self, subtype: Optional[str] = None) -> list[Feature]:
+        """Road records (AlongX / AlongY): a live street segment; location on its centreline, size.x its length
+        between the intersection squares, size.y = measure its width (cm)."""
+        return self.features_of("Road", subtype)
+
+    def intersections(self, subtype: Optional[str] = None) -> list[Feature]:
+        """Intersection records (Cross, Tee, Through, Bend, End); measure = how many segments meet."""
+        return self.features_of("Intersection", subtype)
+
+    def traffic_signals(self) -> list[Feature]:
+        """Traffic signal posts (Prop / TrafficSignal records): each makes its nearest intersection signalized."""
+        return self.features_of("Prop", "TrafficSignal")
+
+    def traffic_summary(self) -> dict:
+        """Roads (count, total length in m, width range in cm), intersections by subtype, signals, crosswalks,
+        speed humps and potholes: what the traffic is built from."""
+        roads = self.roads()
+        return {
+            "roads": len(roads),
+            "road_length_m": round(sum(f.size[0] for f in roads) / 100.0, 1),
+            "road_width_range_cm": _range([f.measure or f.size[1] for f in roads], 1),
+            "intersections": _counts(f.subtype or "-" for f in self.intersections()),
+            "signals": len(self.traffic_signals()),
+            "crosswalks": len(self.features_of("Crosswalk")),
+            "speed_humps": len(self.speed_humps()),
+            "potholes": len(self.features_of("Surface", "Pothole")),
+        }
 
     def summary(self) -> dict:
         return {
