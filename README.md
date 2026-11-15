@@ -289,7 +289,10 @@ static bridges as whole classes, and on components and actors **only the
 functions** these tools call -- never a whole component class, which would also
 expose everything it inherits (`K2_DestroyComponent` ...) to anyone on the
 network -- and no Blueprint child classes. A project of its own needs the same
-entries (`+CustomAllowedRemoteFunctionCalls=(ClassPath=...,FunctionName=...,bAllowChildClasses=False)`).
+entries (`+CustomAllowedRemoteFunctionCalls=(ClassPath="/Script/...",FunctionName=("SetControl"),bAllowChildClasses=False)`).
+`FunctionName` is optional in UE, so its value goes in parentheses: a bare
+`FunctionName="SetControl"` does not parse, and the entry then allows every
+function of the class.
 A `/remote/batch` request is checked call by call: it needs nothing more.
 
 | Class | Functions ramms-tools calls | Used by |
