@@ -19,7 +19,17 @@ robots can both have a ``front_camera``: a camera is picked by its actor and
 its base channel, never by name alone. Every frame's metadata names its
 ``actor``; frames of another actor are dropped. Without a known base channel it
 subscribes to every channel and keeps the frames whose stream id (or group)
-names the camera -- of the given actor.
+names the camera -- of the given actor. A camera placed by hand can stream
+under another name (its stream source's StreamName): from_sensor / from_status
+take the stream ids the sim reports.
+
+The sim sends a connection no frames until it has subscribed; connect() always
+sends a SUBSCRIBE (for the camera's channels, or every channel).
+
+``grab()`` returns a ``FrameSet``: the frames of ONE capture (when the sender
+numbers its frames, as the sim does), with ``complete`` False and ``missing``
+naming the roles that had not arrived by the timeout -- never frames of
+different captures mixed without saying so (``same_capture``).
 """
 
 from __future__ import annotations
@@ -46,6 +56,36 @@ _FRAME_MESSAGES = frozenset({MessageType.FRAME_RGB, MessageType.FRAME_DEPTH, Mes
                              MessageType.FRAME_DATA, MessageType.IMAGE_DATA, MessageType.FRAME_RGBD})
 
 
+def _group_of(stream_ids: dict[str, str]) -> str:
+    """The camera name a set of stream ids is under (camera/<name>/color, motion/<name> ...)."""
+    for sid in stream_ids.values():
+        parts = str(sid).split("/")
+        if len(parts) == 3 and parts[0] == "camera":
+            return parts[1]
+        if len(parts) == 2 and parts[0] in ("motion", "mask"):
+            return parts[1]
+    return ""
+
+
+class FrameSet(dict):
+    """
+    What CameraStreams.grab() returns: {role: Frame}.
+
+    complete: every role asked for is in it; missing: the ones that are not (they had not arrived by the timeout).
+    frame_number: the capture every frame in it belongs to (None when the sender does not number its frames).
+    same_capture: the frames are of one capture -- False only when the sender gives no frame numbers, or grab() was
+    asked for the newest of each role (same_frame=False).
+    """
+
+    def __init__(self, frames: dict, wanted: Sequence[str], frame_number: Optional[int] = None,
+                 same_capture: bool = True):
+        super().__init__(frames)
+        self.missing: tuple[str, ...] = tuple(r for r in wanted if r not in frames)
+        self.complete = not self.missing
+        self.frame_number = frame_number
+        self.same_capture = same_capture
+
+
 class CameraStreams:
     """
     Subscribe to one camera's streams and decode them.
@@ -60,11 +100,14 @@ class CameraStreams:
         client: an existing StreamClient (connected or not); else one is made for host:port.
         rgbd: its stream source sends one combined FRAME_RGBD (bStreamRGBD) on the base channel instead of separate
             colour and depth (from_status / from_sensor set it from what the sim reports).
+        stream_ids: {role: stream id} as the sim reports them, for a camera whose stream source names its streams
+            otherwise than after the camera (from_status / from_sensor pass them); default camera/<name>/color ...
     """
 
     def __init__(self, camera: str, base_channel: Optional[int] = None, roles: Sequence[str] = ROLES,
                  host: str = "127.0.0.1", port: int = 30030, client: Optional[StreamClient] = None,
-                 compression: str = "none", actor: Optional[str] = None, rgbd: bool = False):
+                 compression: str = "none", actor: Optional[str] = None, rgbd: bool = False,
+                 stream_ids: Optional[dict[str, str]] = None):
         bad = [r for r in roles if r not in ROLES]
         if bad:
             raise ValueError(f"unknown roles {bad} (roles: {', '.join(ROLES)})")
@@ -78,7 +121,10 @@ class CameraStreams:
         self.compression = compression
         self.client = client or StreamClient(host, port)
         self._own_client = client is None
-        self.stream_ids = {r: sid for r, sid in camera_stream_ids(camera).items() if r in self.roles}
+        ids = camera_stream_ids(camera)
+        ids.update({r: str(sid) for r, sid in (stream_ids or {}).items() if r in ROLES and sid})
+        self.group = _group_of(ids) or camera     # the name the streams go out under (metadata "group")
+        self.stream_ids = {r: sid for r, sid in ids.items() if r in self.roles}
         self._by_id = {sid: r for r, sid in self.stream_ids.items()}
         self.channels = ({r: ch for r, ch in camera_channels(base_channel).items() if r in self.roles}
                          if base_channel is not None else {})
@@ -108,6 +154,8 @@ class CameraStreams:
             actor = actors[0] or None
         base = None
         kw.setdefault("rgbd", any(s.role == "rgbd" for s in status.camera_streams(camera, actor)))
+        kw.setdefault("stream_ids", {s.role: s.stream_id for s in status.camera_streams(camera, actor)
+                                     if s.role in ROLES and s.stream_id})
         for s in status.camera_streams(camera, actor):
             if s.role in ROLE_CHANNEL_OFFSETS and s.channel >= 0:
                 base = s.channel - ROLE_CHANNEL_OFFSETS[s.role]
@@ -133,6 +181,8 @@ class CameraStreams:
         if roles:
             kw.setdefault("roles", [r for r in ROLES if r in roles])
         kw.setdefault("actor", sensor.actor or None)
+        # A camera placed by hand streams under its stream source's StreamName, not its component name.
+        kw.setdefault("stream_ids", {st.role: st.stream_id for st in sensor.streams if st.role in ROLES and st.stream_id})
         return cls(sensor.name, base_channel=sensor.channel, **kw)
 
     def __repr__(self) -> str:
@@ -191,7 +241,7 @@ class CameraStreams:
             if role and self._by_channel and msg.header.channel_id not in self._by_channel:
                 return ""              # the same stream id from another camera of this name, on its own channel
             return role
-        if str(meta.get("group", "") or "") == self.camera:
+        if str(meta.get("group", "") or "") == self.group:
             role = message_role(msg, meta)
             return role if role in self.roles else ""
         return self._by_channel.get(msg.header.channel_id, "")
@@ -258,13 +308,16 @@ class CameraStreams:
                 return
 
     def grab(self, roles: Optional[Sequence[str]] = None, timeout: float = 5.0, same_frame: bool = True
-             ) -> dict[str, Frame]:
+             ) -> FrameSet:
         """
         One set of frames, a frame of each role (default: this camera's roles), the newest available: what is
         already queued is read first. With same_frame (the default) the set is one capture -- every frame carries the
         same metadata "frame" number -- when the sender numbers its frames (the sim does); otherwise, or for frames
-        without a number, the newest of each role. Waits up to `timeout` seconds; a role still missing then is left
-        out.
+        without a number, the newest of each role (FrameSet.same_capture False).
+
+        Waits up to `timeout` seconds. If no capture is complete by then, the answer is the newest capture with the
+        most roles, with complete False and missing naming the roles left out -- not a mix of captures (without
+        frame numbers, the newest frame of each role that came, same_capture False). Empty when nothing came.
         """
         want = set(roles or self.roles)
         latest: dict[str, Frame] = {}
@@ -280,11 +333,21 @@ class CameraStreams:
                     for fn in sorted(by_frame)[:-32]:
                         del by_frame[fn]
 
-        def complete() -> Optional[dict[str, Frame]]:
+        order = [r for r in (roles or self.roles) if r in want]
+
+        def complete() -> Optional[FrameSet]:
             if same_frame and by_frame:
                 full = [fn for fn, d in by_frame.items() if want <= set(d)]
-                return dict(by_frame[max(full)]) if full else None
-            return dict(latest) if want <= set(latest) else None
+                return FrameSet(by_frame[max(full)], order, max(full)) if full else None
+            if want <= set(latest):
+                return FrameSet(latest, order, None, same_capture=False)
+            return None
+
+        def best_partial() -> FrameSet:
+            if same_frame and by_frame:
+                fn = max(by_frame, key=lambda k: (len(by_frame[k]), k))     # the most roles, the newest of those
+                return FrameSet(by_frame[fn], order, fn)
+            return FrameSet(latest, order, None, same_capture=False)
 
         while True:                                        # what is queued now, newest last
             f = self.poll(0)
@@ -298,7 +361,7 @@ class CameraStreams:
                 return got
             left = end - time.monotonic()
             if left <= 0:
-                return dict(latest)
+                return best_partial()
             f = self.poll(min(left, 0.5))
             if f is not None:
                 take(f)

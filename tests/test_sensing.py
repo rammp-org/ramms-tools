@@ -1,5 +1,6 @@
 """Offline tests for ramms_tools.sensing and RMSS camera-frame decoding (run: python -m pytest tests)."""
 import json
+import logging
 import socket
 import threading
 import time
@@ -9,8 +10,9 @@ import pytest
 
 from fake_remote import FakeRemote, robot_world
 from ramms_tools.robot import Robot
-from ramms_tools.sensing import (BRIDGE, CameraStreams, ImuStream, RIG_PRESETS, Sensing, SensingError, SensorInfo,
-                                 SensorMount, StreamStatus, apply_rig, rig_mounts, rig_names, save_frame)
+from ramms_tools.sensing import (BRIDGE, CameraStreams, FrameSet, ImuStream, RIG_PRESETS, Sensing, SensingError,
+                                 SensorInfo, SensorMount, StreamStatus, apply_rig, imu_stream_id, rig_mounts, rig_names,
+                                 save_frame)
 from ramms_tools.streaming.client import StreamClient
 from ramms_tools.streaming.frames import (IMU_FIELDS, camera_channels, camera_stream_ids, decode_message, decode_rgbd,
                                           mask_classes, message_role)
@@ -229,20 +231,27 @@ class FakeSensingBridge:
         return {**out, "samples": [self.imu_sample(q) for q in range(first, last)], "next": last, "dropped": dropped}
 
     def StartImuStreamJson(self, p):
+        """As URammsSensingBridge::StartImuStreamJson answers: the stream itself, and the server under "server"."""
         opts = json.loads(p["OptionsJson"] or "{}")
-        ch = opts.get("channel", -1)
-        ch = 1000 if ch < 0 else ch
         self.imu_streams = getattr(self, "imu_streams", {})
-        actor = p["ActorPath"]
-        self.imu_streams[(actor, p["Target"])] = {
-            "actor": actor, "camera": "", "target": p["Target"], "role": "imu",
-            "stream_id": f"imu/{actor.rsplit('.', 1)[-1]}/{p['Target']}", "channel": ch, "message": "FrameData",
-            "fmt": "imu_f64x18"}
+        actor, target = p["ActorPath"], p["Target"].strip()
+        ch = opts.get("channel", -1)
+        if ch < 0:                                  # the lowest free channel from 1000 (a restart keeps its own)
+            old = self.imu_streams.get((actor, target))
+            taken = {e["channel"] for k, e in self.imu_streams.items() if k != (actor, target)}
+            ch = old["channel"] if old else min(c for c in range(1000, 2000) if c not in taken)
+        body = target or "chassis"
+        entry = {"actor": actor, "camera": "", "target": target, "role": "imu",
+                 "stream_id": f"imu/{actor.rsplit('.', 1)[-1]}/{target or body}", "channel": ch, "message": "FrameData",
+                 "fmt": "imu_f64x18"}
+        self.imu_streams[(actor, target)] = entry       # listed in GetStreamStatusJson's streams (StreamEntryJson)
         self.server_running = True
-        return self.GetStreamStatusJson(p)          # the stream status, as StartCameraStreamsJson answers
+        return {"ok": True, "actor": actor, "target": target, "body": body, "source": "mujoco",
+                "stream_id": entry["stream_id"], "channel": ch, "message": "FrameData", "fmt": "imu_f64x18",
+                "server": {"running": True, "port": 30030, "connections": 1}}
 
     def StopImuStream(self, p):
-        return getattr(self, "imu_streams", {}).pop((p["ActorPath"], p["Target"]), None) is not None
+        return getattr(self, "imu_streams", {}).pop((p["ActorPath"], p["Target"].strip()), None) is not None
 
     def ListImuBodiesJson(self, p):
         return {"ok": True, "actor": p["ActorPath"], "bodies": [
@@ -288,6 +297,37 @@ def test_mount_json_follows_the_spec():
         SensorMount("x", "lidar")
     with pytest.raises(SensingError, match="needs a name"):
         SensorMount("", "ToF")
+
+
+def test_sonar_mount_takes_the_keys_list_sensors_reports():
+    """ListSensorsJson reports a sonar's range / cone as max_range_cm / cone_deg, and AddSensorJson takes them too."""
+    m = SensorMount.from_dict({"name": "s", "kind": "sonar", "max_range_cm": 300, "cone_deg": 10})
+    assert (m.sonar_max_range_cm, m.sonar_cone_deg) == (300.0, 10.0)
+    assert m.to_dict()["sonar_max_range_cm"] == 300.0 and m.to_dict()["sonar_cone_deg"] == 10.0
+    assert SensorMount("s", "Sonar", max_range_cm=250).sonar_max_range_cm == 250.0      # the constructor too
+    assert SensorMount("s", "Sonar").sonar_max_range_cm == 500.0 and SensorMount("t", "ToF").max_range_cm == 400.0
+    assert SensorMount("t", "ToF", max_range_cm=120).max_range_cm == 120.0
+    with pytest.raises(SensingError, match="disagree"):
+        SensorMount.from_dict({"name": "s", "kind": "sonar", "max_range_cm": 300, "sonar_max_range_cm": 200})
+    with pytest.raises(SensingError, match="unknown mount keys: cone_deg"):
+        SensorMount.from_dict({"name": "t", "kind": "tof", "cone_deg": 10})        # only a sonar has a cone
+
+
+def test_a_mount_without_a_name_is_a_sensing_error(tmp_path):
+    with pytest.raises(SensingError, match="needs a name"):
+        SensorMount.from_dict({"kind": "tof"})
+    f = tmp_path / "rig.json"
+    f.write_text(json.dumps([{"kind": "tof", "location": [1, 2, 3]}]))
+    with pytest.raises(SensingError, match="needs a name"):
+        rig_mounts(str(f))
+
+
+def test_imu_stream_id_for_the_default_body():
+    a = "/Game/M.M:PersistentLevel.R_C_0"
+    assert imu_stream_id(a, "imu") == "imu/R_C_0/imu"
+    assert imu_stream_id(a, "", body="chassis") == "imu/R_C_0/chassis"        # target "": the body's name
+    with pytest.raises(ValueError, match="body="):
+        imu_stream_id(a, "")
 
 
 def test_rig_presets_are_valid_mounts(tmp_path):
@@ -613,7 +653,7 @@ def test_grab_returns_the_newest_complete_capture():
         send_camera(sender, "front_cam", 0, rgb[::-1].copy(), depth * 2, motion, mask, {1: "Road"}, frame=8,
                     roles=("color", "depth"))
         send_camera(sender, "front_cam", 0, rgb, depth, motion, mask, {1: "Road"}, frame=9, roles=("color",))
-        time.sleep(0.3)                                       # all queued: grab reads the queue first
+        wait_queued(client, 5)                                # all queued: grab reads the queue first
         got = cam.grab(timeout=0.5)
     client.disconnect()
     for s in socks:
@@ -621,6 +661,67 @@ def test_grab_returns_the_newest_complete_capture():
     # Frame 9 has no depth yet: the newest complete capture is 8, colour and depth of the same capture.
     assert got["color"].frame_number == got["depth"].frame_number == 8
     assert np.array_equal(got["depth"].array, depth * 2)
+    assert isinstance(got, FrameSet) and got.complete and got.frame_number == 8 and got.missing == ()
+
+
+def wait_queued(client, n, timeout=10.0):
+    """Until the client has n messages queued (a loaded machine is slow to deliver over the socket pair)."""
+    end = time.monotonic() + timeout
+    while len(client._queue) < n:
+        assert time.monotonic() < end, f"only {len(client._queue)} of {n} messages arrived"
+        time.sleep(0.01)
+
+
+def test_grab_at_timeout_is_one_capture_flagged_incomplete():
+    """No capture complete by the timeout: the newest capture with the most roles, flagged -- never colour of one
+    capture and depth of another passed off as a set."""
+    client, sender, socks = pair()
+    rgb, depth, motion, mask = sample_arrays()
+    with CameraStreams("front_cam", base_channel=0, client=client, roles=("color", "depth", "mask")) as cam:
+        send_camera(sender, "front_cam", 0, rgb, depth, motion, mask, {1: "Road"}, frame=7, roles=("color", "mask"))
+        send_camera(sender, "front_cam", 0, rgb, depth, motion, mask, {1: "Road"}, frame=8, roles=("depth",))
+        wait_queued(client, 3)
+        got = cam.grab(timeout=0.3)
+    client.disconnect()
+    for s in socks:
+        s.close()
+    assert not got.complete and got.same_capture and got.frame_number == 7
+    assert set(got) == {"color", "mask"} and got.missing == ("depth",)
+    assert all(f.frame_number == 7 for f in got.values())
+
+
+def test_from_sensor_takes_the_stream_ids_the_sim_reports():
+    """A camera placed by hand streams under its stream source's StreamName (bExactCameraFilter), not its component
+    name: the ids ListSensorsJson reports are the ones to match."""
+    client, sender, socks = pair()
+    rgb, depth, motion, mask = sample_arrays()
+    info = SensorInfo.from_json({"name": "FR_GeminiCamera", "kind": "Camera", "rig": False, "actor": "/Game/M.M:PersistentLevel.R_C_0",
+                                 "settings": {"channel": 4}, "streams": [
+                                     {"role": "color", "stream_id": "camera/front/color", "channel": 4},
+                                     {"role": "mask", "stream_id": "mask/front", "channel": 304}]})
+    with CameraStreams.from_sensor(info, client=client) as cam:
+        assert cam.group == "front" and cam.stream_ids == {"color": "camera/front/color", "mask": "mask/front"}
+        send_camera(sender, "front", 4, rgb, depth, motion, mask, {1: "Road"}, roles=("color", "mask"))
+        got = cam.grab(timeout=5.0)
+    client.disconnect()
+    for s in socks:
+        s.close()
+    assert set(got) == {"color", "mask"} and np.array_equal(got["color"].array, rgb)
+
+
+def test_a_stream_client_that_has_not_subscribed_says_so(caplog):
+    """The sim sends a connection no frames until it has subscribed."""
+    client, sender, socks = pair()
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert client.poll(0) is None and client.poll(0) is None
+        assert caplog.text.count("has not subscribed") == 1 and not client.subscribed
+        client.subscribe()
+        assert client.subscribed
+    finally:
+        client.disconnect()
+        for s in socks:
+            s.close()
 
 
 def test_camera_streams_take_a_combined_rgbd_frame():

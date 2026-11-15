@@ -11,7 +11,15 @@ with ``Sensing.body_imu`` -- keeps a ring buffer of its physics-step samples
   the ones lost when it was too slow (``dropped``).
 - **Over RMSS** (``StartImuStreamJson``): the sim sends, every game tick with new
   samples, one FrameData message (fmt ``imu_f64x18``) holding them.
-  ``ImuStream`` subscribes and yields the samples.
+  ``ImuStream`` subscribes (on connect) and yields the samples. Subscribe
+  promptly: a stream no RMSS client has subscribed to for 30 s is stopped by
+  the sim, its point freed (start it again to resume).
+
+Limits on the sim side: Remote Control callers get 32 of the world's 64
+tracked IMU points, a world runs at most 8 IMU streams, body / target names
+are at most 256 characters, a stream's port is clamped to 1..65535, and
+ReadImuSamplesJson returns complete samples only (a step not fully measured
+yet waits for the next call).
 
     from ramms_tools.sensing import Sensing, ImuStream
 
@@ -53,9 +61,13 @@ logger = logging.getLogger(__name__)
 __all__ = ["ImuSample", "ImuSamples", "ImuSampleFollower", "ImuStream", "IMU_FIELDS", "IMU_FORMAT", "imu_stream_id"]
 
 
-def imu_stream_id(actor: str, target: str) -> str:
-    """The stream id the sim gives an IMU stream: imu/<actor name>/<target>."""
-    return f"imu/{short_name(actor)}/{target}"
+def imu_stream_id(actor: str, target: str, body: str = "") -> str:
+    """The stream id the sim gives an IMU stream: imu/<actor name>/<target> -- for target "" (the actor's main
+    body) the body's name, which start_imu_stream's answer carries ("body"); pass it as `body`."""
+    name = target.strip() or body.strip()
+    if not name:
+        raise ValueError("imu_stream_id: target \"\" streams under the body's name (start_imu_stream's \"body\"): pass body=")
+    return f"imu/{short_name(actor)}/{name}"
 
 
 def _quat(v: Any) -> tuple[float, float, float, float]:

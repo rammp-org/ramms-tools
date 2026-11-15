@@ -20,9 +20,12 @@ segmentation masks over RMSS:
     status = sensing.start_streams(motion=True, segmentation=True)
     with CameraStreams.from_status(status, "front_camera", actor=robot.actor_path) as cam:
         frames = cam.grab()                                    # color / depth / motion / mask Frames of one capture
+        if not frames.complete:                                # a role had not arrived by the timeout
+            print("missing", frames.missing)
     classes = sensing.segmentation_classes().names()           # {value: fine class}
 
-Every physics-step IMU sample (ramms_tools.sensing.imu), over Remote Control or as an RMSS stream:
+Every physics-step IMU sample (ramms_tools.sensing.imu), over Remote Control or as an RMSS stream
+(``from ramms_tools.sensing import ImuStream``):
 
     for sample in sensing.follow_imu_samples(robot.actor_path, "chassis", duration=2.0):    # ReadImuSamplesJson
         print(sample.seq, sample.sim_time, sample.linear_acceleration)
@@ -56,7 +59,7 @@ from ramms_tools.streaming.frames import ROLES, Frame, camera_channels, camera_s
 
 from .bridge import (BRIDGE, KINDS, ActorSensors, SegmentationClass, SegmentationTable, Sensing, SensingError,
                      SensorInfo, SensorMount, SensorReading, StreamInfo, StreamStatus, as_mount, canonical_kind)
-from .camera import CameraStreams, save_frame
+from .camera import CameraStreams, FrameSet, save_frame
 from .imu import ImuBatch, ImuSample, ImuSampleFollower, ImuSamples, ImuStream, imu_stream_id
 from .rigs import RIG_DESCRIPTIONS, RIG_PRESETS, apply_rig, rig_mounts, rig_names
 
@@ -65,7 +68,7 @@ CameraFrame = Frame
 __all__ = [
     "Sensing", "ActorSensors", "SensorMount", "SensorInfo", "SensorReading", "StreamInfo", "StreamStatus",
     "SegmentationClass", "SegmentationTable", "SensingError", "BRIDGE", "KINDS", "as_mount", "canonical_kind",
-    "CameraStreams", "CameraFrame", "Frame", "save_frame", "ROLES", "camera_channels", "camera_stream_ids",
+    "CameraStreams", "CameraFrame", "Frame", "FrameSet", "save_frame", "ROLES", "camera_channels", "camera_stream_ids",
     "RIG_PRESETS", "RIG_DESCRIPTIONS", "rig_mounts", "rig_names", "apply_rig",
     "ImuSample", "ImuSamples", "ImuSampleFollower", "ImuStream", "ImuBatch", "imu_stream_id",
 ]

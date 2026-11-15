@@ -268,7 +268,8 @@ def _run(p: argparse.ArgumentParser, a: argparse.Namespace, ue, sensing: Sensing
 
     if a.cmd == "remove":
         ok = sensing.remove(resolve_actor(ue, a), a.name)
-        print(f"removed {a.name}" if ok else f"no rig sensor {a.name} (sensors placed by hand stay)")
+        print(f"removed {a.name}" if ok else f"not removed: no rig sensor {a.name} on the actor (sensors placed by hand "
+                                             "stay), or not a play world (sensing changes need PIE or a game)")
         return 0 if ok else 1
 
     if a.cmd == "read":
@@ -379,7 +380,8 @@ def _run(p: argparse.ArgumentParser, a: argparse.Namespace, ue, sensing: Sensing
                                        save_to_disk=True if a.save_to_disk else None)
         elif a.action == "stop":
             ok = sensing.stop_streams()
-            print("capture stopped (the RMSS server stays up)" if ok else "nothing to stop")
+            print("capture stopped (the RMSS server stays up)" if ok else
+                  "not stopped: no capture in this world, or not a play world (PIE or a game)")
             st = sensing.status()
         else:
             st = sensing.status()
@@ -535,7 +537,8 @@ def _camera(a: argparse.Namespace, ue, sensing: Sensing) -> int:
             frames = cam.grab(timeout=a.wait)
             missing = [r for r in roles if r not in frames]
             desc = "  ".join(f"{r} {tuple(f.array.shape)} {f.array.dtype}" for r, f in frames.items())
-            print(f"  set {i}: {desc}" + (f"   missing: {', '.join(missing)}" if missing else ""))
+            fn = f" (capture {frames.frame_number})" if getattr(frames, "frame_number", None) is not None else ""
+            print(f"  set {i}{fn}: {desc}" + (f"   incomplete, missing: {', '.join(missing)}" if missing else ""))
             if not frames:
                 break
             got_sets += 1

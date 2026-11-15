@@ -95,7 +95,8 @@ class SensorMount:
 
     location is cm relative to the parent component (and socket); rotation is (pitch, yaw, roll) degrees.
     parent "" attaches to the actor's root; on a MuJoCo pawn name the body component (e.g. "chassis").
-    sonar_cone_deg is the beam's HALF-angle (15 = a 30 deg beam).
+    sonar_cone_deg is the beam's HALF-angle (15 = a 30 deg beam). A sonar's range and cone also take the keys
+    ListSensorsJson reports them under, max_range_cm and cone_deg (as the sim's AddSensorJson does).
     A camera streams over RMSS on channel `channel` (-1 = the next free one: the sim keeps clear of every stream
     source in the world, each of which takes C, C+100, C+200 and C+300) and +100 / +200 / +300 for depth, motion
     and mask; its stream ids are camera/<name>/color, camera/<name>/depth, motion/<name>, mask/<name>, and its
@@ -109,14 +110,14 @@ class SensorMount:
     socket: str = ""
     location: tuple[float, float, float] = (0.0, 0.0, 0.0)
     rotation: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    # ToF
+    # ToF (max_range_cm: for a Sonar, its range when sonar_max_range_cm is not given)
     rows: int = 8
     columns: int = 8
     h_fov_deg: float = 45.0
     v_fov_deg: float = 45.0
-    max_range_cm: float = 400.0
+    max_range_cm: Optional[float] = None    # 400 for a ToF
     # Sonar
-    sonar_max_range_cm: float = 500.0
+    sonar_max_range_cm: Optional[float] = None   # 500
     sonar_cone_deg: float = 15.0            # half-angle of the beam (BeamHalfAngle): 15 = 30 deg in all
     # Camera
     width: int = 640
@@ -135,11 +136,28 @@ class SensorMount:
         self.kind = canonical_kind(self.kind)
         self.location = _triple(self.location, ("x", "y", "z"))
         self.rotation = _triple(self.rotation, ("pitch", "yaw", "roll"))
+        if self.kind == "Sonar" and self.sonar_max_range_cm is None and self.max_range_cm is not None:
+            self.sonar_max_range_cm = self.max_range_cm      # the key ListSensorsJson reports a sonar's range under
+            self.max_range_cm = None
+        self.max_range_cm = 400.0 if self.max_range_cm is None else float(self.max_range_cm)
+        self.sonar_max_range_cm = 500.0 if self.sonar_max_range_cm is None else float(self.sonar_max_range_cm)
 
     @classmethod
     def from_dict(cls, d: dict) -> "SensorMount":
         """From the spec's snake_case mount JSON (location / rotation as lists or {x,y,z} / {pitch,yaw,roll}).
-        An unknown key raises SensingError, so a typo does not silently take a default."""
+        An unknown key raises SensingError, so a typo does not silently take a default. A sonar also takes
+        max_range_cm / cone_deg (what ListSensorsJson reports) for sonar_max_range_cm / sonar_cone_deg."""
+        d = dict(d)
+        if not str(d.get("name", "") or "").strip():
+            raise SensingError(f"a sensor mount needs a name: {d!r}")
+        if str(d.get("kind", "")).strip().lower() == "sonar" and "cone_deg" in d:
+            cone = d.pop("cone_deg")
+            if "sonar_cone_deg" in d and float(d["sonar_cone_deg"]) != float(cone):
+                raise SensingError(f"{d['name']}: cone_deg {cone} and sonar_cone_deg {d['sonar_cone_deg']} disagree")
+            d["sonar_cone_deg"] = cone
+        if str(d.get("kind", "")).strip().lower() == "sonar" and "max_range_cm" in d and "sonar_max_range_cm" in d                 and float(d["max_range_cm"]) != float(d["sonar_max_range_cm"]):
+            raise SensingError(f"{d['name']}: max_range_cm {d['max_range_cm']} and sonar_max_range_cm "
+                               f"{d['sonar_max_range_cm']} disagree")
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(d) - known)
         if unknown:
@@ -661,8 +679,10 @@ class Sensing:
         """
         Stream an IMU target's physics-step samples over RMSS (StartImuStreamJson; needs a play world; starts the RMSS
         server if it is not running): one FrameData (fmt imu_f64x18) per game tick with new samples, on `channel`
-        (-1 = the next free one >= 1000). Returns its StreamInfo (channel, stream_id "imu/<actor name>/<target>",
-        port when the sim says); read it with ImuStream.from_info. Stop it with stop_imu_stream.
+        (-1 = the next free one >= 1000). Returns its StreamInfo (channel, stream_id "imu/<actor name>/<target>" --
+        the body's name for target "" --, port); read it with ImuStream.from_info, which subscribes on connect. Do so
+        promptly: the sim stops a stream no RMSS client has subscribed to for 30 s (and frees its point). Stop it with
+        stop_imu_stream. A world runs at most 8 IMU streams; Remote Control callers get 32 tracked IMU points.
         """
         opts = self._imu_options(offset, rotation, source)
         opts["channel"] = int(channel)
