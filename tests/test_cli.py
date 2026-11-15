@@ -1,6 +1,7 @@
 """Offline tests for the ramms-control / ramms-curb / ramms-sensors CLIs and the ramms-worldgen additions."""
 import json
 import signal
+import threading
 import time
 
 import pytest
@@ -50,7 +51,7 @@ def test_parsing():
     a = control_cli.build_parser().parse_args(["--host", "10.0.0.5", "set", "x", "1", "--source", "Autonomy"])
     assert a.host == "10.0.0.5" and a.source == "Autonomy"
     a = curb_cli.build_parser().parse_args(["go", "--wait", "--port", "30011"])
-    assert a.wait and a.port == 30011 and a.forward == 0.5 and not a.no_hold and a.on_interrupt == "abort"
+    assert a.wait and a.port == 30011 and a.forward == 1.0 and not a.no_hold and not a.join and a.on_interrupt == "abort"
     a = sensors_cli.build_parser().parse_args(["add", "cam", "--kind", "camera", "--at", "1,2,3", "--no-motion",
                                                "--json", '{"fov_deg": 70}', "--actor", "X"])
     m = sensors_cli.mount_from_args(a)
@@ -182,16 +183,38 @@ def test_curb_detect_assist_style_plan_seat(world, capsys):
 def test_curb_go_starts_and_waits_holding_forward(world, capsys):
     ue, path, comps = world("gen1", deadman=False)
     comps["CurbController"].handlers["StartCrossing"] = lambda p: {"OutReason": "", "ReturnValue": True}
-    scripted_phases(comps["CurbController"], [("Idle", "Ready", "Info")] + [("Level", "Crossing", "Info")] * 5
+    # Each GetPhase -- the loop's and the stick sender's own reads -- takes the script a step.
+    scripted_phases(comps["CurbController"], [("Idle", "Ready", "Info")] * 2 + [("Level", "Crossing", "Info")] * 40
                     + [("Done", "Crossed 15 cm", "Info")])
-    assert curb_cli.main(["go", "--wait", "--wait-timeout", "5"]) == 0
+    assert curb_cli.main(["go", "--wait", "--wait-timeout", "10"]) == 0
     out = capsys.readouterr().out
     # The crossing is started directly (the controller selects the curb mode); go never selects it by hand.
     assert "drive mode differential -> curb" not in out and "crossing started" in out and "done after" in out
-    assert "holding drive.forward +0.50 while the crossing is under way" in out and "CrossingSeconds" in out
+    assert "holding drive.forward +1.00 while the crossing is under way" in out and "CrossingSeconds" in out
     assert comps["DriveModeSelector"].active == "differential"
-    assert ("drive.forward", 0.5, "Remote") in comps["ControlSurface"].sets
+    assert ("drive.forward", 1.0, "Remote") in comps["ControlSurface"].sets
     assert comps["ControlSurface"].latched() == {} and "drive.forward" in comps["ControlSurface"].released
+
+
+@pytest.mark.parametrize("value", ["0.2", "1.5", "-0.5"])
+def test_curb_go_refuses_a_stick_out_of_range(world, capsys, value):
+    ue, path, comps = world("gen1")
+    with pytest.raises(SystemExit):
+        curb_cli.main(["go", "--wait", f"--forward={value}"])
+    assert "0.25..1.0" in capsys.readouterr().err and ue.calls_to("StartCrossing") == []
+
+
+def test_curb_go_does_not_take_over_a_crossing_it_did_not_start(world, capsys):
+    ue, path, comps = world("gen1", deadman=False)
+    scripted_phases(comps["CurbController"], [("FrontUp", "Crossing up 15.0 cm: Front omni wheels up", "Info")] * 60
+                    + [("Done", "Done", "Info")])
+    assert curb_cli.main(["go", "--wait"]) == 1
+    err = capsys.readouterr().err
+    assert "already under way" in err and "--join" in err and comps["ControlSurface"].sets == []
+    assert ue.calls_to("StartCrossing") == []
+    assert curb_cli.main(["go", "--wait", "--join"]) == 0                 # asked to: it holds the stick for it
+    assert "joining it" in capsys.readouterr().out and ("drive.forward", 1.0, "Remote") in comps["ControlSurface"].sets
+    assert comps["ControlSurface"].latched() == {}
 
 
 @pytest.mark.parametrize("on_interrupt", ["abort", "pause"])
@@ -199,17 +222,22 @@ def test_curb_go_wait_interrupted(world, capsys, on_interrupt):
     """Ctrl+C (or SIGTERM) mid-crossing: the stick is released first, then the crossing aborted (or left paused)."""
     ue, path, comps = world("gen1", deadman=False)
     comps["CurbController"].handlers["StartCrossing"] = lambda p: {"OutReason": "", "ReturnValue": True}
-    n = {"polls": 0}
+    n = {"polls": 0, "raised": False}
+    fake = comps["ControlSurface"]
 
     def phase(p):
-        n["polls"] += 1
-        if n["polls"] == 8:
-            raise _common.Interrupted(signal.SIGINT)
-        return {"ReturnValue": "Idle" if n["polls"] == 1 else "DriveUp"}
+        # The signal arrives once, in the main thread (the loop's poll), once the stick is held; the sender's own
+        # reads of the phase are on its thread.
+        if threading.current_thread() is threading.main_thread():
+            n["polls"] += 1
+            if not n["raised"] and (fake.sets or n["polls"] > 500):
+                n["raised"] = True
+                raise _common.Interrupted(signal.SIGINT)
+        return {"ReturnValue": "Idle" if n["polls"] <= 1 else "DriveUp"}
     comps["CurbController"].handlers["GetPhase"] = phase
     assert curb_cli.main(["go", "--wait", "--on-interrupt", on_interrupt]) == 130
     err = capsys.readouterr().err
-    assert comps["ControlSurface"].latched() == {} and ("drive.forward", 0.5, "Remote") in comps["ControlSurface"].sets
+    assert fake.latched() == {} and ("drive.forward", 1.0, "Remote") in fake.sets
     if on_interrupt == "abort":
         assert ue.calls_to("Abort") == [{"Reason": "Stopped from ramms-curb (SIGINT)"}] and "crossing aborted" in err
     else:

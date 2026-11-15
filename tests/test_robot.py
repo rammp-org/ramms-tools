@@ -207,15 +207,33 @@ def test_wait_until_done_never_started():
     assert not run.started and not run.succeeded and run.phase == "Idle" and not run.timed_out
 
 
+# What URammsCurbNegotiationController::GetStatusLine says while a fault is about to be retried (bRetryPending).
+RETRYING = ("Faulted", "Faulted, trying again: the far side not confirmed", "Attention")
+
+
 def test_gen2_waits_out_a_retried_fault():
     ue, _, comps = robot_world("gen2")
     c = Robot.find(ue=ue).curb
-    c.RETRY_GRACE_SECONDS = 0.2
-    script = [("Approach", "Crossing", "Info"), ("Faulted", "Faulted: the far side not confirmed", "Fault")] + \
-             [("Faulted", "Faulted: retrying", "Fault")] * 3 + [("Lift", "Crossing", "Info"), ("Done", "Crossed", "Info")]
+    c.RETRY_GRACE_SECONDS = 0.0                 # only the sim's "trying again" keeps it waiting
+    script = [("Approach", "Crossing", "Info")] + [RETRYING] * 30 + [("Lift", "Crossing", "Info"), ("Done", "Crossed", "Info")]
     scripted_phases(comps["CurbNegotiation"], script)
-    run = c.wait_until_done(timeout=5.0, poll=0.01)
+    run = c.wait_until_done(timeout=10.0, poll=0.01)
     assert run.succeeded and "Lift" in [e.phase for e in run.events]
+
+
+def test_gen2_waits_for_a_retry_slower_than_a_fixed_grace():
+    """The sim retries only after the robot is 0.5 s (sim time) at rest, up to 10 s: longer than any fixed grace.
+    Waited for as long as the status line says it is trying again."""
+    ue, path, comps = robot_world("gen2")
+    c = Robot.find(ue=ue).curb
+    c.RETRY_GRACE_SECONDS = 0.1
+    t0 = {"t": None}
+    timed_phases(comps["CurbNegotiation"], [(0.0, "Idle", "Ready", "Info"), (0.02, "Approach", "Crossing up", "Info"),
+                                            (0.1,) + RETRYING, (0.8, "Cross", "Crossing up", "Info"),
+                                            (1.0, "Done", "Done: crossed", "Info")], t0)
+    t0["t"] = time.monotonic()
+    run = c.wait_until_done(timeout=10.0, poll=0.02)
+    assert run.succeeded and [e.phase for e in run.events][-2:] == ["Cross", "Done"]
 
 
 def test_gen2_fault_that_stays():
@@ -225,6 +243,19 @@ def test_gen2_fault_that_stays():
     scripted_phases(comps["CurbNegotiation"], [("Approach", "Crossing", "Info"), ("Faulted", "Faulted: tipping", "Fault")])
     run = c.wait_until_done(timeout=5.0, poll=0.01)
     assert run.started and not run.succeeded and run.phase == "Faulted" and run.status.severity == "Fault"
+
+
+def test_gen1_start_still_being_made_is_waited_for():
+    """RAMMP Gen1's start is pending (phase Idle, "Starting: ...") until the curb mode is active: not "never
+    started", however long the mode switch takes."""
+    ue, _, comps = robot_world("gen1")
+    c = Robot.find(ue=ue).curb
+    t0 = {"t": None}
+    timed_phases(comps["CurbController"], [(0.0, "Idle", "Starting: up 15.0 cm, 40 cm ahead", "Info"),
+                                           (0.4, "Level", "Crossing up 15.0 cm", "Info"), (0.6, "Done", "Done", "Info")], t0)
+    t0["t"] = time.monotonic()
+    run = c.wait_until_done(timeout=10.0, poll=0.02, start_grace=0.1)
+    assert run.started and run.succeeded
 
 
 def test_edited_profiles_and_terrains_are_sent_as_edited():
@@ -263,6 +294,17 @@ def timed_phases(comp, script, t0):
     return now
 
 
+def _phase_at_sets(fake, ue, now):
+    """Record, for each SetControl of drive.forward, the phase the fake answered at that moment."""
+    seen = []
+
+    def hook(func, p):
+        if p.get("Id") == "drive.forward":
+            seen.append((time.monotonic(), func, now()[1]))
+    fake.on_call = hook
+    return seen
+
+
 def test_cross_holds_the_stick_only_while_the_crossing_runs():
     """Gen2: a fault that hands the robot back (refused at rest), then the retry. The stick is not held while it is
     Faulted -- the differential mode would drive on it -- and is released on a latching sim by the end."""
@@ -280,21 +322,108 @@ def test_cross_holds_the_stick_only_while_the_crossing_runs():
         return {"OutReason": "", "ReturnValue": True}
     comps["CurbNegotiation"].handlers["NegotiateStepAhead"] = start
     fake = comps["ControlSurface"]
-    seen = []
-    fake.on_call = lambda f, p: seen.append((time.monotonic(), f, now()[1], now()[0])) if p.get("Id") == "drive.forward" else None
+    seen = _phase_at_sets(fake, ue, now)
     events = []
-    run = c.cross(forward=0.5, on_event=events.append)
+    run = c.cross(on_event=events.append)
     assert run.succeeded and [e.phase for e in events if e.phase != "Idle"] == ["Approach", "Faulted", "Cross", "Done"]
-    sets = [(t, ph, since) for t, f, ph, since in seen if f == "SetControl"]
-    assert {ph for t, ph, _ in sets} >= {"Approach", "Cross"}
-    # Never held well into a phase that is not under way (a poll and a send of slack at most).
-    late = [(ph, round(t - t0["t"] - since, 3)) for t, ph, since in sets if ph in ("Faulted", "Done", "Idle")
-            and t - t0["t"] - since > 0.25]
-    assert late == []
-    assert all(v == 0.5 for _, cid, v in fake.set_times if cid == "drive.forward")
-    releases = [ph for t, f, ph, _ in seen if f == "ReleaseControl"]
-    assert "Faulted" in releases                               # let go when the fault was seen
+    sets = [ph for t, f, ph in seen if f == "SetControl"]
+    assert {"Approach", "Cross"} <= set(sets)
+    # The sender reads the phase in the request of each send (the fake answers a whole batch at one instant, as the
+    # engine does in one frame): at most the one send that went with the read that saw the end lands after it.
+    assert sets.count("Faulted") <= 1 and sets.count("Done") <= 1 and "Idle" not in sets
+    assert all(v == 1.0 for _, cid, v in fake.set_times if cid == "drive.forward")       # full stick by default
+    assert "Faulted" in [ph for t, f, ph in seen if f == "ReleaseControl"]               # let go when the fault was seen
     assert fake.latched() == {} and run.stick_refused == 0
+
+
+def test_cross_lets_go_however_slow_the_callbacks_are():
+    """The loop's callbacks (on_event, should_stop) run between polls; a slow one must not keep the stick held after
+    the crossing ends and hands the robot back (the review's 1.3 s of sends after Done)."""
+    ue, path, comps = robot_world("gen1", deadman=True)
+    c = Robot.find(ue=ue).curb
+    t0 = {"t": None}
+    now = timed_phases(comps["CurbController"], [(0.0, "Idle", "Ready", "Info"), (0.05, "Level", "Crossing up", "Info"),
+                                                 (0.4, "Restore", "Crossing up: back", "Info"),
+                                                 (0.6, "Done", "Done: crossed", "Info")], t0)
+
+    def start(p):
+        t0["t"] = time.monotonic()
+        return {"OutReason": "", "ReturnValue": True}
+    comps["CurbController"].handlers["StartCrossing"] = start
+    fake = comps["ControlSurface"]
+    seen = _phase_at_sets(fake, ue, now)
+
+    def on_event(e):
+        if e.phase == "Restore":
+            time.sleep(1.5)             # a user callback, a GUI, a blocked stdout
+    run = c.cross(on_event=on_event)
+    assert run.succeeded
+    sets = [(t, ph) for t, f, ph in seen if f == "SetControl"]
+    assert "Level" in [ph for _, ph in sets]
+    late = [t for t, ph in sets if ph == "Done"]
+    # At most the one send in the same request as the read that saw Done -- and the sender released it in its next
+    # request, while the loop was still asleep in on_event.
+    assert len(late) <= 1
+    done_at = t0["t"] + 0.6
+    releases = [t for t, cid in fake.release_times if cid == "drive.forward" and t > done_at]
+    assert releases and releases[0] - (late[0] if late else done_at) < 0.5
+    assert fake.latched() == {}
+
+
+def test_stick_waits_for_the_curb_mode():
+    """Gen2 begins its Approach at once, while the selector may still wait to hand over to the curb mode (the robot
+    turning): a stick held then would drive the outgoing differential mode. It is held only in the curb mode."""
+    ue, path, comps = robot_world("gen2", deadman=True)
+    c = Robot.find(ue=ue).curb
+    sel = comps["DriveModeSelector"]
+    sel.curb_pending = True                      # the hand-over is still waiting
+    t0 = {"t": None}
+    now = timed_phases(comps["CurbNegotiation"], [(0.0, "Idle", "Ready", "Info"), (0.02, "Approach", "Crossing up", "Info"),
+                                                  (1.2, "Done", "Done: crossed", "Info")], t0)
+
+    def start(p):
+        t0["t"] = time.monotonic()
+        return {"OutReason": "", "ReturnValue": True}
+    comps["CurbNegotiation"].handlers["NegotiateStepAhead"] = start
+    fake = comps["ControlSurface"]
+    switched = {"t": None}
+
+    def hand_over():
+        if t0["t"] is not None and time.monotonic() - t0["t"] > 0.5 and sel.curb_pending:
+            sel.curb_pending = False
+            switched["t"] = time.monotonic()
+        return False
+    run = c.cross(should_stop=hand_over)
+    assert run.succeeded and switched["t"] is not None
+    times = [t for t, cid, v in fake.set_times if cid == "drive.forward"]
+    assert times and min(times) >= switched["t"]           # nothing before the curb mode was active
+    assert fake.latched() == {}
+
+
+def test_cross_does_not_take_over_a_crossing_it_did_not_start():
+    ue, path, comps = robot_world("gen1", deadman=False)
+    c = Robot.find(ue=ue).curb
+    scripted_phases(comps["CurbController"], [("FrontUp", "Crossing up 15.0 cm: Front omni wheels up", "Info")] * 3
+                    + [("Done", "Done", "Info")])
+    run = c.cross()
+    assert not run.started and run.already_running and "join=True" in run.reason
+    assert ue.calls_to("StartCrossing") == [] and comps["ControlSurface"].sets == []
+    # Asked to, it joins and holds the stick for it.
+    scripted_phases(comps["CurbController"], [("FrontUp", "Crossing up", "Info")] * 40 + [("Done", "Done", "Info")])
+    run = c.cross(join=True, poll=0.01)
+    assert run.succeeded and ("drive.forward", 1.0, "Remote") in comps["ControlSurface"].sets
+    assert comps["ControlSurface"].latched() == {}
+
+
+def test_crossing_stick_range():
+    ue, path, comps = robot_world("gen1")
+    c = Robot.find(ue=ue).curb
+    for bad in (0.2, 1.5, -0.5, 0.0):
+        with pytest.raises(ValueError, match="0.25..1.0"):
+            c.cross(forward=bad)
+        with pytest.raises(ValueError, match="0.25..1.0"):
+            c.wait_until_done(hold_forward=bad)
+    assert ue.calls_to("StartCrossing") == [] and comps["ControlSurface"].sets == []
 
 
 def test_cross_refused_and_the_stick_never_sent():
@@ -316,17 +445,17 @@ def test_wait_without_a_start_never_holds_the_stick():
 def test_wait_releases_the_stick_when_interrupted():
     ue, path, comps = robot_world("gen1", deadman=False)
     c = Robot.find(ue=ue).curb
-    calls = {"n": 0}
+    comps["CurbController"].handlers["GetPhase"] = lambda p: {"ReturnValue": "Level"}
+    fake = comps["ControlSurface"]
+    deadline = time.monotonic() + 10.0
 
-    def phase(p):
-        calls["n"] += 1
-        if calls["n"] > 5:
-            raise KeyboardInterrupt
-        return {"ReturnValue": "Level"}
-    comps["CurbController"].handlers["GetPhase"] = phase
+    def interrupt_once_held():
+        if fake.sets or time.monotonic() > deadline:
+            raise KeyboardInterrupt               # Ctrl+C in the waiting loop, once the stick is held
+        return False
     with pytest.raises(KeyboardInterrupt):
-        c.wait_until_done(poll=0.05, hold_forward=0.5)
-    assert ("drive.forward", 0.5, "Remote") in comps["ControlSurface"].sets and comps["ControlSurface"].latched() == {}
+        c.wait_until_done(poll=0.05, hold_forward=0.5, should_stop=interrupt_once_held)
+    assert ("drive.forward", 0.5, "Remote") in fake.sets and fake.latched() == {}
 
 
 def test_seat_out_parameters():

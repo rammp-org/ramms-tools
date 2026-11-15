@@ -13,13 +13,15 @@ control surface, drive modes, curb crossing, seat and sensors.
 
     curb = robot.curb                           # Gen1Curb or Gen2Curb (None when the robot has no curb controller)
     print(curb.phase(), curb.status_line())     # "Idle", StatusText(text='Ready', severity='Info')
-    run = curb.cross(forward=0.5, on_event=print)   # start (the controller selects the curb mode), hold the stick
+    run = curb.cross(on_event=print)            # start (the controller selects the curb mode), hold the stick
     print(run.succeeded, run.stats)             # forward while the crossing runs, release, CurbRun
 
 A crossing moves only while the rider's stick (drive.forward) is held forward;
-``cross()`` holds it for you, only while the crossing is under way. Do not
-select the ``curb`` drive mode by hand to start one: selecting it starts (or,
-with nothing to cross, refuses and hands back) a crossing by itself.
+``cross()`` holds it for you (full stick by default), only while the crossing
+is under way and the robot is in the curb drive mode. It does not take over a
+crossing it did not start unless ``join=True``. Do not select the ``curb``
+drive mode by hand to start one: selecting it starts (or, with nothing to
+cross, refuses and hands back) a crossing by itself.
 
     if robot.seat:                              # RAMMP Gen2 only
         robot.seat.set_tilt(-5)
@@ -123,7 +125,8 @@ class Robot:
 
     def find_component(self, class_name: str, instance: str = "") -> Optional[str]:
         """
-        The object path of the pawn's component of a class (a Blueprint subclass counts), else one named
+        The object path of the pawn's component of a class (the C++ class name: a Blueprint subclass, "..._C", is
+        not matched, and Remote Control's allow-list does not take child classes either), else one named
         `instance`. Looks on the pawn first, then in the world for one whose actor is this pawn -- or, when the
         world holds exactly one, that one (a controller on an actor the pawn carries).
         """
@@ -192,7 +195,7 @@ class Robot:
             for cls in CURB_CLASSES:
                 path = self.find_component(cls.CLASS)
                 if path:
-                    self._curb = cls(self.surface, path)
+                    self._curb = cls(self.surface, path, selector_path=self.drive_modes.selector_path)
                     break
         return self._curb
 

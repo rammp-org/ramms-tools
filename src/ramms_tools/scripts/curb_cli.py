@@ -18,12 +18,17 @@ curb controller or the RAMMP Gen2 (lift-drive) curb negotiation.
     ramms-curb seat --reset
 
 A crossing moves only while the rider's stick (drive.forward) is held forward.
-`go --wait` holds it at --forward (default 0.5) while the crossing is under way
-and releases it the moment the crossing is not (done, stopped, faulted) --
-before the drive mode the robot is handed back to could drive on it. Without
---wait, `go` only starts the crossing: it then waits, paused, for a stick.
-Ctrl+C / SIGTERM / SIGHUP during `go --wait` releases the stick and aborts the
-crossing (--on-interrupt pause: leave it paused; `go --wait` again goes on).
+`go --wait` holds it at --forward (default 1.0, full; 0.25..1.0 -- a RAMMP Gen2
+crossing goes at the stick's share of its planned speed) while the crossing is
+under way and the robot is in the curb drive mode. The sender reads both in
+the same request as each send, so it lets go in the round that sees the
+crossing done, stopped or faulted: at most one send lands after it ends, none
+after that. Without --wait, `go` only starts the crossing: it then waits,
+paused, for a stick. A crossing already under way that this did not start (the
+rider's, curb assist's, another client's) is not taken over -- a Remote stick
+outranks the rider's -- unless --join (--no-hold only watches it). Ctrl+C /
+SIGTERM / SIGHUP during `go --wait` releases the stick and aborts the crossing
+(--on-interrupt pause: leave it paused; `go --wait --join` goes on).
 
 --robot NAME picks a robot when the world has several. The RAMMP Gen2
 (lift-drive) robot is only in levels built with the private assets.
@@ -38,7 +43,7 @@ import time
 
 from ramms_tools.control import ControlError, release_all
 from ramms_tools.robot import CurbError, Gen1Curb, Gen2Curb, ModeError, Robot, RobotNotFound
-from ramms_tools.robot.curb import DEFAULT_CROSSING_STICK
+from ramms_tools.robot.curb import CROSSING_STICK_ENGAGE, DEFAULT_CROSSING_STICK, check_crossing_stick
 from ramms_tools.unreal_remote import UnrealRemoteError
 
 from ._common import (Interrupted, Ticker, add_common, connect, dump_json, exit_signals, finish_parser, fmt_num,
@@ -49,6 +54,13 @@ GENERATIONS = {"gen1": "RAMMP Gen1", "gen2": "RAMMP Gen2 (lift-drive)"}
 
 def _sev(sev: str) -> str:
     return "" if sev == "Info" else f" [{sev}]"
+
+
+def _stick(text: str) -> float:
+    try:
+        return check_crossing_stick(float(text))
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def status_dict(robot: Robot) -> dict:
@@ -122,13 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("go", help="start a crossing (the controller selects the curb drive mode itself)")
     s.add_argument("--wait", action="store_true", help="hold the stick while it runs; print the phase log and stats")
     s.add_argument("--wait-timeout", type=float, default=180.0, help="seconds to wait with --wait")
-    s.add_argument("--forward", type=float, default=DEFAULT_CROSSING_STICK,
-                   help="with --wait: the stick (drive.forward, 0..1) held while the crossing is under way, and only "
-                        "then. A Gen2 crossing goes at this share of its planned speed; Gen1 at its planned speeds. "
-                        f"Default {DEFAULT_CROSSING_STICK}: twice the controllers' engage threshold (0.25), and only a "
-                        "half stick reaches the mode the robot is handed back to before it is released")
+    s.add_argument("--forward", type=_stick, default=DEFAULT_CROSSING_STICK,
+                   help=f"with --wait: the stick (drive.forward, {CROSSING_STICK_ENGAGE:g}..1.0) held while the crossing "
+                        "is under way and the robot is in the curb mode, and only then. A Gen2 crossing goes at this "
+                        "share of its planned speed; Gen1 at its planned speeds. Default "
+                        f"{DEFAULT_CROSSING_STICK:g} (full); under {CROSSING_STICK_ENGAGE:g} a crossing never engages")
     s.add_argument("--no-hold", action="store_true",
-                   help="with --wait: do not hold drive.forward (someone else holds the stick)")
+                   help="with --wait: do not hold drive.forward (someone else holds the stick); just watch")
+    s.add_argument("--join", action="store_true",
+                   help="hold the stick for a crossing already under way that this did not start (the rider's, curb "
+                        "assist's, another client's): a Remote stick outranks the rider's own")
     s.add_argument("--on-interrupt", choices=["abort", "pause"], default="abort",
                    help="Ctrl+C / SIGTERM / SIGHUP during --wait: release the stick, then abort the crossing (default) "
                         "or leave it paused")
@@ -176,27 +191,37 @@ def _go(a: argparse.Namespace, robot: Robot, curb) -> int:
     # Start the crossing and let the controller select the curb drive mode: selecting that mode by hand is
     # not how either robot starts one (Gen2 drops back to its previous mode at once when there is "no
     # crossing to run"; RAMMP Gen1 starts one, but its refusal is then only in its status line).
-    if curb.is_active():
-        print(f"crossing under way ({curb.phase_label()}): {curb.status_line().text}")
+    holding = a.wait and not a.no_hold and robot.surface.has("drive.forward")
+    not_ours = ("that this did not start (the rider, curb assist or another client): holding its stick from here would "
+                "outrank the rider's own. --join to hold it anyway, --no-hold to only watch it")
+    ph, st = curb.poll_state()
+    if curb.is_active(ph) or curb.is_starting(st):
+        if holding and not a.join:
+            print(f"error: a crossing is already under way ({curb.phase_label(ph)}: {st.text}) {not_ours}", file=sys.stderr)
+            return 1
+        print(f"crossing under way ({curb.phase_label(ph)}): {st.text}" + ("; joining it" if holding else ""))
     else:
         ok, reason = curb.start()
         if not ok:
-            time.sleep(0.3)
-            if not curb.is_active():
-                why = curb.status_line()
-                print(f"not started: {reason or why.text}{_sev(why.severity)}", file=sys.stderr)
+            time.sleep(0.3)                     # a refusal can mean one was started meanwhile
+            ph, st = curb.poll_state()
+            if not (curb.is_active(ph) or curb.is_starting(st)):
+                print(f"not started: {reason or st.text}{_sev(st.severity)}", file=sys.stderr)
                 return 1
-            print(f"crossing under way ({curb.phase_label()}): {curb.status_line().text}")
+            if holding and not a.join:
+                print(f"error: not started ({reason}): a crossing is already under way ({curb.phase_label(ph)}: "
+                      f"{st.text}) {not_ours}", file=sys.stderr)
+                return 1
+            print(f"crossing under way ({curb.phase_label(ph)}): {st.text}")
         else:
             print(f"crossing started (drive mode {robot.mode})" + (f": {reason}" if reason else ""))
     if not a.wait:
         print("it moves only while the stick (drive.forward) is held forward: `ramms-curb go --wait` holds it")
         return 0
-    hold = None
-    if not a.no_hold and a.forward != 0.0 and robot.surface.has("drive.forward"):
-        hold = a.forward
-        print(f"holding drive.forward {a.forward:+.2f} while the crossing is under way (Ctrl+C: release and "
-              f"{'abort' if a.on_interrupt == 'abort' else 'pause'})")
+    hold = a.forward if holding else None
+    if hold is not None:
+        print(f"holding drive.forward {hold:+.2f} while the crossing is under way in the curb mode (Ctrl+C: release "
+              f"and {'abort' if a.on_interrupt == 'abort' else 'pause'})")
     try:
         run = curb.wait_until_done(timeout=a.wait_timeout, on_event=lambda e: print(f"  {e}", flush=True),
                                    hold_forward=hold)
@@ -209,8 +234,8 @@ def _go(a: argparse.Namespace, robot: Robot, curb) -> int:
                 print(interrupted_message(e, f"stick released, crossing aborted: {curb.phase_label()}: {st.text}"),
                       file=sys.stderr)
             else:
-                print(interrupted_message(e, "stick released, the crossing is paused (`ramms-curb go --wait` goes on, "
-                                             "`ramms-curb abort` stops it)"), file=sys.stderr)
+                print(interrupted_message(e, "stick released, the crossing is paused (`ramms-curb go --wait --join` "
+                                             "goes on, `ramms-curb abort` stops it)"), file=sys.stderr)
         except UnrealRemoteError as err:
             print(interrupted_message(e, f"stick released; could not abort the crossing: {err}"), file=sys.stderr)
         return 130

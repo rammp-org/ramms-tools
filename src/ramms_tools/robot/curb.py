@@ -20,13 +20,21 @@ adds its own:
 A crossing moves only while the rider's stick -- ``drive.forward``, which the
 curb mode takes while it has the robot -- is held forward (both controllers'
 ``Stick.bRequired``, on by default); let go, it pauses. ``cross()`` starts one
-and holds the stick for it, only while it is under way: the moment a poll sees
-it Idle, Done, Aborted or Faulted the stick is released (the drive mode the
-robot is handed back to takes the stick as it is held), and held again if it
-starts once more (a Gen2 retry). A Gen2 crossing goes at the stick's share of
-its planned speed; a Gen1 crossing at its planned speeds whatever the share.
-Starting one selects the ``curb`` drive mode by itself: do not select it by
-hand first (selecting it starts a crossing, or hands straight back).
+and holds the stick for it (default full stick, 1.0), only while it is under
+way and the robot is in the ``curb`` drive mode. The sender itself reads the
+crossing's phase and the active drive mode in the same request as each send
+(a ``SendGate``), so the round that sees the crossing Idle, Done, Aborted or
+Faulted -- or the robot not (yet) in the curb mode -- releases the stick: at
+most one send lands after the crossing ends, and none reaches the drive mode
+the robot is handed back to after that, however long the caller's own
+callbacks take. It holds again if the crossing starts once more (a Gen2
+retry). A Gen2 crossing goes at the stick's share of its planned speed; a
+Gen1 crossing at its planned speeds once the stick is past the engage
+threshold (0.25). Starting one selects the ``curb`` drive mode by itself: do
+not select it by hand first (selecting it starts a crossing, or hands straight
+back). ``cross()`` does not take over a crossing it did not start (the rider's,
+curb assist's, another client's: a Remote stick outranks the rider's) unless
+asked to (``join=True``).
 
 Phases are the controllers' enum names (``"Idle"``, ``"FrontUp"``, ``"Lift"``,
 ``"Done"`` ...); ``phase_label()`` gives what the ``curb.phase`` control shows
@@ -39,15 +47,32 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional
 
-from ramms_tools._rc import as_bool, as_float, enum_name, return_value, vec2, vec3
-from ramms_tools.control import ControlError, ControlSurface, KeepAlive, StatusText, severity_name
-from ramms_tools.unreal_remote import RemoteObjectProxy
+from ramms_tools._rc import as_bool, as_float, enum_name, name as _fname, return_value, vec2, vec3
+from ramms_tools.control import ControlError, ControlSurface, KeepAlive, SendGate, StatusText, severity_name
+from ramms_tools.unreal_remote import RemoteObjectProxy, UnrealRemoteError
 
-# The stick a crossing is driven with. 0.5 is twice the controllers' engage threshold (FRammsCurbStick
-# EngageFraction 0.25) and well clear of their release threshold (0.15), so it engages reliably; a Gen2 crossing then
-# runs at half its planned speed, and whatever reaches the mode the robot is handed back to before the stick is
-# released is a half-stick command, not a full one.
-DEFAULT_CROSSING_STICK = 0.5
+# The stick a crossing is driven with: full forward. A Gen2 crossing goes at the stick's share of its planned speed
+# (so less than 1.0 slows it); a Gen1 one only needs it past the engage threshold.
+DEFAULT_CROSSING_STICK = 1.0
+# FRammsCurbStick::EngageFraction (both controllers): a stick under it never engages a crossing; it would wait, paused.
+CROSSING_STICK_ENGAGE = 0.25
+# The drive mode a crossing runs in (both controllers' GetDriveModeId).
+CURB_MODE_ID = "curb"
+# What a status line says while a start is made but not begun (RAMMP Gen1: the curb mode is being selected) and
+# while a Gen2 fault is about to be retried by itself.
+STARTING_PREFIX = "Starting:"
+RETRYING_PREFIX = "Faulted, trying again"
+
+
+def check_crossing_stick(forward: float) -> float:
+    """The stick a crossing is held at: CROSSING_STICK_ENGAGE (0.25) .. 1.0, else ValueError (below the engage
+    threshold a crossing never moves; above 1.0 is not a stick)."""
+    f = float(forward)
+    if not (CROSSING_STICK_ENGAGE <= f <= 1.0):
+        raise ValueError(f"crossing stick {f:g} is out of range: {CROSSING_STICK_ENGAGE:g}..1.0 (under "
+                         f"{CROSSING_STICK_ENGAGE:g} a crossing never engages; a Gen2 crossing goes at the stick's share "
+                         "of its planned speed)")
+    return f
 
 
 class CurbError(ControlError):
@@ -86,6 +111,7 @@ class CurbRun:
     timed_out: bool = False
     reason: str = ""                 # cross(): why the start was refused
     stick_refused: int = 0           # sends of the held stick the robot refused (another source held it)
+    already_running: bool = False    # cross(): not started -- one was under way that this did not start (join=True)
 
     @property
     def succeeded(self) -> bool:
@@ -102,10 +128,13 @@ class CurbBase:
     TERMINAL = frozenset({"Done", "Aborted"})
     STATS_FUNCTION = ""
 
-    def __init__(self, surface: ControlSurface, component_path: str):
+    def __init__(self, surface: ControlSurface, component_path: str, selector_path: Optional[str] = None):
         self.surface = surface
         self.component_path = component_path
         self.proxy = RemoteObjectProxy(surface.ue, component_path)
+        # The robot's drive-mode selector (Robot.curb sets it): the stick is held only while the curb mode is the
+        # active one. None: no selector (the controller switches modes itself, at once).
+        self.selector_path = selector_path
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.component_path!r})"
@@ -146,6 +175,37 @@ class CurbBase:
         """A crossing is under way (not Idle and not finished)."""
         ph = self.phase() if phase is None else phase
         return ph != "Idle" and ph not in self.TERMINAL
+
+    def poll_state(self) -> tuple[str, StatusText]:
+        """The phase and the status line, read in one request (one engine frame)."""
+        ph, st = self.surface.ue.call_many([(self.component_path, "GetPhase", None),
+                                            (self.component_path, "GetStatusLine", None)], full=True)
+        for r in (ph, st):
+            if isinstance(r, Exception):
+                raise r
+        st = st if isinstance(st, dict) else {"ReturnValue": st}
+        return (enum_name(return_value(ph)),
+                StatusText(str(st.get("ReturnValue", "") or ""), severity_name(st.get("OutSeverity", "Info"))))
+
+    def is_starting(self, status: Optional[StatusText] = None) -> bool:
+        """A start was made and has not begun yet (RAMMP Gen1 while the curb drive mode is being selected: the
+        phase is still Idle and the status line says "Starting: ...")."""
+        st = self.status_line() if status is None else status
+        return st.text.startswith(STARTING_PREFIX)
+
+    def send_gate(self) -> SendGate:
+        """What the stick's sender reads with every send: the phase, and (with a selector) the active drive mode.
+        It sends only while the crossing is under way and the robot is in the curb mode -- not while the selector
+        still waits to hand over to it, when the stick would drive the outgoing mode."""
+        calls = [(self.component_path, "GetPhase", None)]
+        if self.selector_path:
+            calls.append((self.selector_path, "GetActiveModeId", None))
+
+        def allows(results: list) -> bool:
+            if not self.is_active(enum_name(results[0])):
+                return False
+            return len(results) < 2 or _fname(results[1]).lower() == CURB_MODE_ID
+        return SendGate(calls, allows, what="the crossing's phase and drive mode")
 
     # ── assist ──────────────────────────────────────────────────────
 
@@ -193,7 +253,8 @@ class CurbBase:
 
     # ── waiting ─────────────────────────────────────────────────────
 
-    def _retry_grace(self, phase: str) -> float:
+    def _retry_grace(self, phase: str, status: Optional[StatusText] = None) -> float:
+        """How long to keep waiting once a crossing is seen ended in `phase` (a fault it retries by itself)."""
         return 0.0
 
     def wait_until_done(self, timeout: float = 180.0, poll: float = 0.2, start_grace: float = 3.0,
@@ -202,17 +263,22 @@ class CurbBase:
                         hold_forward: Optional[float] = None, source: Optional[str] = None) -> CurbRun:
         """
         Poll until the crossing ends (Done, Aborted, Faulted -- for Gen2, a fault it retries by itself is waited
-        out), or it never starts within start_grace seconds, or `timeout`. on_event(CurbEvent) is called for
-        every change of phase or status line. Returns a CurbRun with the log and the final stats.
+        out), or it never starts within start_grace seconds (a start still being made -- "Starting: ..." -- is
+        waited for), or `timeout`. on_event(CurbEvent) is called for every change of phase or status line. Returns
+        a CurbRun with the log and the final stats. Each poll reads the phase and the status line in one request.
 
-        hold_forward: hold the rider's stick (drive.forward) at this value at 10 Hz while -- and only while -- the
-        crossing is under way: released the moment a poll sees it not active (Idle, Done, Aborted, Faulted), and
-        held again when it is active again (a Gen2 retry). Polls at <= 0.1 s while holding. Released at the end,
-        on an error and on an interrupt. `source` is the ERammsControlSource of the hold (the surface's default).
+        hold_forward: hold the rider's stick (drive.forward) at this value (CROSSING_STICK_ENGAGE..1.0) at 10 Hz
+        while -- and only while -- the crossing is under way and the robot is in the curb drive mode. The sender
+        reads both itself in each send's request (send_gate()), so it lets go in the round that sees the crossing
+        end whatever this loop or its callbacks are doing; the loop also pauses it when a poll sees the crossing
+        not under way, and resumes it when it is again (a Gen2 retry). Polls at <= 0.1 s while holding. Released
+        at the end, on an error and on an interrupt. `source` is the ERammsControlSource of the hold (the
+        surface's default).
         """
         ka: Optional[KeepAlive] = None
         if hold_forward is not None:
-            ka = self.surface.keep_alive({"drive.forward": float(hold_forward)}, source=source)
+            ka = KeepAlive(self.surface, {"drive.forward": check_crossing_stick(hold_forward)}, source=source,
+                           gate=self.send_gate())
             ka.pause(release=False)          # held from the first poll that sees the crossing under way
             ka.start()
             poll = min(poll, 0.1)
@@ -225,14 +291,13 @@ class CurbBase:
         try:
             while True:
                 now = time.monotonic() - t0
-                ph = self.phase()
+                ph, st = self.poll_state()
                 active = self.is_active(ph)
                 if ka is not None:
                     if active and ka.paused:
                         ka.resume()
                     elif not active and not ka.paused:
-                        ka.pause(release=True)       # before anything else: the robot may be handed back now
-                st = self.status_line()
+                        ka.pause(release=True)       # the sender's own gate has let go already, or does now
                 key = (ph, st.text, st.severity)
                 if key != last:
                     last = key
@@ -246,9 +311,9 @@ class CurbBase:
                     # Finished (or back to Idle). A Gen2 fault before any wheel crossed is retried by itself once it
                     # stands at rest: give it the time to.
                     settled_at = now if settled_at is None else settled_at
-                    if now - settled_at >= self._retry_grace(ph):
+                    if now - settled_at >= self._retry_grace(ph, st):
                         break
-                elif now > start_grace:
+                elif now > start_grace and not self.is_starting(st):
                     break           # never started (still Idle, or the last crossing's Done)
                 if now > timeout:
                     timed_out = True
@@ -269,21 +334,42 @@ class CurbBase:
 
     def cross(self, forward: float = DEFAULT_CROSSING_STICK, timeout: float = 180.0, poll: float = 0.2,
               start_grace: float = 3.0, on_event: Optional[Callable[[CurbEvent], None]] = None,
-              should_stop: Optional[Callable[[], bool]] = None, source: Optional[str] = None) -> CurbRun:
+              should_stop: Optional[Callable[[], bool]] = None, source: Optional[str] = None,
+              join: bool = False) -> CurbRun:
         """
         Cross the curb ahead: start() (the controller selects the curb drive mode itself), then wait_until_done()
-        holding the stick forward at `forward` only while the crossing is under way. A start refused is a CurbRun
-        with started False and the reason. A crossing already under way is joined rather than started again.
+        holding the stick forward at `forward` (CROSSING_STICK_ENGAGE..1.0, default full) only while the crossing is
+        under way. A start refused is a CurbRun with started False and the reason.
+
+        A crossing this did not start -- the rider's, curb assist's, another client's, already under way or being
+        started -- is not taken over: holding the stick as Remote would outrank the rider's own stick, so they could
+        no longer pause or cancel it by letting go. That is a CurbRun with started False and already_running True,
+        unless join=True, which holds the stick for it.
         """
-        if not self.is_active():
+        forward = check_crossing_stick(forward)
+        ph, st = self.poll_state()
+        if self.is_active(ph) or self.is_starting(st):
+            if not join:
+                return self._not_joined(ph, st)
+        else:
             ok, reason = self.start()
             if not ok:
-                time.sleep(0.3)             # a refusal can be the start already made by a mode switch
-                if not self.is_active():
-                    st = self.status_line()
-                    return CurbRun(False, self.phase(), st, 0.0, reason=reason or st.text)
+                time.sleep(0.3)             # a refusal can mean one was started meanwhile (curb assist, a mode switch)
+                ph, st = self.poll_state()
+                if self.is_active(ph) or self.is_starting(st):
+                    if not join:
+                        return self._not_joined(ph, st, refused=reason)
+                else:
+                    return CurbRun(False, ph, st, 0.0, reason=reason or st.text)
         return self.wait_until_done(timeout=timeout, poll=poll, start_grace=start_grace, on_event=on_event,
                                     should_stop=should_stop, hold_forward=forward, source=source)
+
+    def _not_joined(self, phase: str, status: StatusText, refused: str = "") -> CurbRun:
+        why = (f"a crossing is already under way ({self.phase_label(phase)}: {status.text}) that this did not start "
+               "(the rider, curb assist or another client): not taking its stick over (join=True to hold it)")
+        if refused:
+            why = f"not started ({refused}); {why}"
+        return CurbRun(False, phase, status, 0.0, reason=why, already_running=True)
 
 
 # ── RAMMP Gen1 ─────────────────────────────────────────────────────────
@@ -479,11 +565,19 @@ class Gen2Curb(CurbBase):
     PHASE_NAMES = ("Idle", "Approach", "Prepare", "Lift", "Shift", "Advance", "Plant", "Settle", "Done", "Aborted",
                    "Faulted", "Cross", "Hold", "Paused")
     TERMINAL = frozenset({"Done", "Aborted", "Faulted"})
-    # A fault before any wheel crossed is retried once by itself after half a second at rest.
-    RETRY_GRACE_SECONDS = 3.0
+    # A fault before any wheel crossed is retried once by itself, after half a second at rest (simulation time; it
+    # gives up when not at rest within 10 s). Its status line says so meanwhile ("Faulted, trying again: ..."):
+    # waited for up to RETRY_WAIT_SECONDS. RETRY_GRACE_SECONDS covers a poll that read the phase just before the
+    # retry began (or a sim that does not say it is retrying).
+    RETRY_WAIT_SECONDS = 15.0
+    RETRY_GRACE_SECONDS = 1.0
 
-    def _retry_grace(self, phase: str) -> float:
-        return self.RETRY_GRACE_SECONDS if phase == "Faulted" else 0.0
+    def _retry_grace(self, phase: str, status: Optional[StatusText] = None) -> float:
+        if phase != "Faulted":
+            return 0.0
+        if status is not None and status.text.startswith(RETRYING_PREFIX):
+            return self.RETRY_WAIT_SECONDS
+        return self.RETRY_GRACE_SECONDS
 
     def is_negotiating(self) -> bool:
         return as_bool(self._call("IsNegotiating"))
