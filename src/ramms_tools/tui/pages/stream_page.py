@@ -146,13 +146,15 @@ class StreamPage(Static):
         try:
             client = StreamClient(host, port, auto_decompress=True)
             client.connect(timeout=3.0)
+            # The server sends a connection nothing until it subscribes: every channel, from the start.
+            client.subscribe(channels=None, compression="none")
             client.start()
             self._client = client
 
             def _update():
                 self._stream_connected = True
                 self.query_one("#stream-status", Label).update(
-                    f"✅ Connected to {host}:{port}"
+                    f"✅ Connected to {host}:{port}, subscribed to all channels"
                 )
                 self.query_one("#stream-connect-btn", Button).disabled = True
                 self.query_one("#stream-disconnect-btn", Button).disabled = False

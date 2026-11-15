@@ -51,6 +51,7 @@ def _run_receive(args: argparse.Namespace) -> None:
     client.connect()
 
     channels = [int(c) for c in args.channels.split(",")] if args.channels else None
+    # Always explicit: the server sends a connection nothing until it subscribes (channels None: every channel).
     client.subscribe(channels=channels, compression=args.compression)
     client.start()
 
@@ -239,7 +240,7 @@ def _run_ping(args: argparse.Namespace) -> None:
 
     client = StreamClient(args.host, args.port)
     client.connect()
-    client.start()
+    client.start()          # no SUBSCRIBE: a PING is answered without one, and no frames are wanted here
 
     try:
         for i in range(args.ping_count):

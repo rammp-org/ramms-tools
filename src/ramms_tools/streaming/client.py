@@ -1,5 +1,11 @@
 """RMSS StreamClient — connects to the UE streaming server and receives frames.
 
+The server sends a connection no frames until it has sent SUBSCRIBE:
+``subscribe(channels)`` for those channels, ``subscribe()`` (no channels) for
+every channel. A connection that never subscribes receives nothing (a PING
+still answers). ``poll()`` / ``iter_messages()`` warn once when used without a
+subscription.
+
 Usage::
 
     from ramms_tools.streaming import StreamClient
@@ -164,6 +170,10 @@ class StreamClient:
         # Codecs already warned about as missing (once each, not per frame)
         self._missing_codecs_warned: set[str] = set()
 
+        # Whether this connection has sent SUBSCRIBE: the server sends no frames until it has.
+        self.subscribed = False
+        self._warned_unsubscribed = False
+
     # ── Connection ────────────────────────────────────────────────────
 
     def connect(self, timeout: float = 5.0) -> None:
@@ -177,6 +187,8 @@ class StreamClient:
         # Set large receive buffer
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._recv_buffer_size)
         self._sock = sock
+        self.subscribed = False
+        self._warned_unsubscribed = False
         self._connected.set()
         self._connect_time = time.monotonic()
         logger.info("Connected to RMSS server at %s:%d", self.host, self.port)
@@ -211,7 +223,8 @@ class StreamClient:
 
     def subscribe(self, channels: list[int] | None = None,
                   compression: str = "none") -> None:
-        """Send a SUBSCRIBE message to the server."""
+        """Send a SUBSCRIBE message to the server: these channels, or every channel (channels None). Until a
+        connection has subscribed the server sends it no frames."""
         meta = {}
         if channels is not None:
             meta["channels"] = channels
@@ -223,6 +236,7 @@ class StreamClient:
         msg.header.timestamp = StreamHeader.now_timestamp()
         msg.set_metadata_string(json.dumps(meta))
         self._send(msg)
+        self.subscribed = True
         logger.info("Subscribed to channels=%s compression=%s", channels, compression)
 
     def unsubscribe(self, channels: list[int] | None = None) -> None:
@@ -400,8 +414,15 @@ class StreamClient:
 
     # ── Polling API ───────────────────────────────────────────────────
 
+    def _check_subscribed(self) -> None:
+        if not self.subscribed and not self._warned_unsubscribed:
+            self._warned_unsubscribed = True
+            logger.warning("RMSS: receiving on a connection that has not subscribed: the server sends it no frames "
+                           "(subscribe() for every channel)")
+
     def poll(self, timeout: float = 0.0) -> Optional[StreamMessage]:
         """Dequeue one inbound message. Returns None if empty."""
+        self._check_subscribed()
         if timeout > 0:
             self._queue_event.wait(timeout)
         with self._queue_lock:
@@ -414,6 +435,7 @@ class StreamClient:
 
     def iter_messages(self, timeout: float = 1.0) -> Iterable[StreamMessage]:
         """Yield messages as they arrive.  Blocks up to *timeout* between messages."""
+        self._check_subscribed()
         self.start()
         try:
             while not self._stopping.is_set():
