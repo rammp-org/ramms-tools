@@ -90,6 +90,28 @@ def test_robot_page_gen1_style_and_no_sensing():
     run(scenario())
 
 
+def test_robot_page_refills_its_selectors_after_a_rebuild():
+    """A drive-mode change (or Refresh) rebuilds the control selectors blank: the next polls must fill them again,
+    and an unreadable value (NaN) must not stop the poll."""
+    ue, path, comps = robot_world("gen2")
+
+    async def scenario():
+        app = PageApp(ue)
+        async with app.run_test(size=(180, 60)) as pilot:
+            page = app.query_one(RobotPage)
+            page.activate()
+            await _until(pilot, lambda: page.robot is not None and page._buttons)
+            sel = lambda: app.query_one("#sel-curb_view_labels", Select)        # noqa: E731
+            await _until(pilot, lambda: sel().value == 1)
+            app.query_one("#robot-mode", Select).value = "holonomic"           # rebuilds the controls
+            await _until(pilot, lambda: comps["DriveModeSelector"].active == "holonomic")
+            await _until(pilot, lambda: sel().value == 1, timeout=10.0)
+            comps["ControlSurface"].values["curb.view.sensing"] = float("nan")  # an unreadable answer
+            await _until(pilot, lambda: page._tick > 6, timeout=10.0)
+            assert "poll:" not in str(app.query_one("#robot-status-bar", Static).render())
+    run(scenario())
+
+
 def test_robot_page_polls_one_at_a_time_on_a_slow_engine():
     """A thread worker cannot be cancelled: with the engine slower than the poll interval, pollers must not pile up."""
     import threading

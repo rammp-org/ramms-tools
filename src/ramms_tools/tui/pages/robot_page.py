@@ -3,6 +3,7 @@ readback -- and its sensors' latest readings."""
 
 from __future__ import annotations
 
+import math
 import re
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -24,6 +25,15 @@ _GENERATIONS = {"gen1": "RAMMP Gen1", "gen2": "RAMMP Gen2 (lift-drive)"}
 
 def _wid(prefix: str, control_id: str) -> str:
     return f"{prefix}-" + re.sub(r"[^A-Za-z0-9_-]", "_", control_id)
+
+
+def _index(value: Any) -> Optional[int]:
+    """An Enum control's value as an index; None for an unreadable one (NaN)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(round(f)) if math.isfinite(f) else None
 
 
 def _show(axis: ControlAxis, value: Any) -> str:
@@ -278,6 +288,12 @@ class RobotPage(Container):
         panel.display = curb is not None
         style = self.query_one("#curb-style", Select)
         style.set_options([(lab, i) for i, lab in enumerate(style_labels)])
+        # Rebuilt (another robot, a mode change, Refresh): the selectors are blank now, so the next poll must fill
+        # them whatever they showed before.
+        self._known.pop("curb-style", None)
+        for sid in list(self._known):
+            if sid.startswith("sel-"):
+                self._known.pop(sid, None)
         style.display = bool(style_labels)
         self.query_one("#curb-detect", Button).display = robot.generation == "gen2"
 
@@ -360,10 +376,10 @@ class RobotPage(Container):
                 state["status"] = curb.status_line()
                 state["assist"] = curb.assist
                 if cs.has("curb.style"):
-                    state["style"] = int(round(cs.get("curb.style")))
+                    state["style"] = _index(cs.get("curb.style"))
             state["readback"] = [(a, cs.read(a.id)) for a in self._readback]
             if self._tick % 3 == 1:
-                state["enums"] = {a.id: int(round(cs.get(a.id))) for a in self._enums}
+                state["enums"] = {a.id: _index(cs.get(a.id)) for a in self._enums}
                 if robot.drive_modes.available:
                     state["mode"] = robot.mode
                     state["switch"] = robot.drive_modes.switch_status()
@@ -410,7 +426,9 @@ class RobotPage(Container):
                     self._sensor_rows.add(r.name)
 
     def _set_quiet(self, widget_id: str, value: Any) -> None:
-        """Show a value read from the robot without sending it back as a command."""
+        """Show a value read from the robot without sending it back as a command (None: unreadable, left as is)."""
+        if value is None:
+            return
         try:
             w = self.query_one(f"#{widget_id}")
         except Exception:
