@@ -44,6 +44,10 @@ Usage:
 
     # Duck-typed method calls (auto-translated to remote calls)
     actor.SetActorLocation(NewLocation={"X": 100, "Y": 0, "Z": 50})
+
+    # Out parameters come back beside ReturnValue: ask for the full response
+    curb = ue.actor(curb_controller_path)
+    curb.call_full("GetStatusLine")   # {"OutSeverity": "Info", "ReturnValue": "Ready"}
 """
 
 from __future__ import annotations
@@ -100,6 +104,11 @@ class RemoteObjectProxy:
         """Call a function on this object with keyword arguments as parameters."""
         client = object.__getattribute__(self, '_client')
         return client._call_function(self.object_path, function_name, kwargs)
+
+    def call_full(self, function_name: str, **kwargs) -> dict:
+        """Like call(), but return the whole response: ReturnValue plus every out parameter."""
+        client = object.__getattribute__(self, '_client')
+        return client.call_full(self.object_path, function_name, kwargs)
 
     def get_components(self, class_filter: Optional[str] = None) -> list[RemoteObjectProxy]:
         """Get components of this actor, optionally filtered by class name."""
@@ -264,7 +273,7 @@ class UnrealRemote:
             logger.warning(f"FindRammsWidgets failed: {e}")
             return []
 
-    def find_actors_by_component(self, component_class_filter: str
+    def find_actors_by_component(self, component_class_filter: str, strict: bool = False
                                 ) -> list[dict]:
         """
         Find actors that have a component matching a class name substring.
@@ -272,6 +281,9 @@ class UnrealRemote:
         Returns list of dicts with 'actor_path', 'actor_proxy',
         'component_name', 'component_class', and 'component_path' keys.
         Single server-side call — much faster than iterating all actors.
+        A failed call answers [] (logged at debug level); strict=True raises
+        the UnrealRemoteError instead, so "nothing found" and "could not ask"
+        can be told apart.
         """
         try:
             result = self._call_function(
@@ -299,6 +311,8 @@ class UnrealRemote:
             return entries
         except UnrealRemoteError as e:
             logger.debug(f"FindActorsByComponent failed: {e}")
+            if strict:
+                raise
             return []
 
     def find_components(self, actor_path: str,
@@ -547,9 +561,32 @@ class UnrealRemote:
         }
         return self._request("PUT", "/remote/object/property", body)
 
+    def call_full(self, object_path: str, function_name: str,
+                  parameters: Optional[dict] = None) -> dict:
+        """
+        Call a function and return the whole response as a dict.
+
+        Unreal returns a function's out parameters beside its ReturnValue
+        (``{"OutSeverity": "Info", "ReturnValue": "Ready"}``), and a void
+        function with only out parameters has no ReturnValue at all
+        (``{"OutStepCm": 0, "OutCrossingHeightCm": 0}``). ``_call_function``
+        keeps only the ReturnValue; this keeps everything. A response that is
+        not an object comes back as ``{"ReturnValue": <it>}``, an empty one
+        as ``{}``.
+        """
+        result = self._call_function(object_path, function_name, parameters, full=True)
+        if isinstance(result, dict):
+            return result
+        return {"ReturnValue": result}
+
     def _call_function(self, object_path: str, function_name: str,
-                       parameters: Optional[dict] = None) -> Any:
-        """Call a function on a remote object."""
+                       parameters: Optional[dict] = None, full: bool = False) -> Any:
+        """Call a function on a remote object.
+
+        Returns the ReturnValue when the response has one (else the response
+        as it came); with full=True the response as it came, out parameters
+        and all (see call_full).
+        """
         body: dict[str, Any] = {
             "objectPath": object_path,
             "functionName": function_name,
@@ -558,6 +595,8 @@ class UnrealRemote:
             body["parameters"] = parameters
 
         result = self._request("PUT", "/remote/object/call", body)
+        if full:
+            return result
 
         # Extract return value if present
         if isinstance(result, dict) and "ReturnValue" in result:

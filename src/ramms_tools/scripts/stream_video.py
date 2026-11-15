@@ -2,8 +2,10 @@
 """ramms-stream — CLI tool for RMSS binary streaming.
 
 Connects to the UE RMSS server, subscribes to camera channels, and either:
-  - Prints stats (default)
-  - Saves frames to disk in CameraCapture-compatible format (--save)
+  - Prints stats (default), with each channel's stream id and role
+  - Saves frames to disk in CameraCapture-compatible format (--save); motion
+    vectors are saved as .npy (float32, H x W x 2) and segmentation masks as
+    .png (with Pillow, else .npy)
   - Replays captured frames back to UE (--replay)
 """
 
@@ -53,6 +55,7 @@ def _run_receive(args: argparse.Namespace) -> None:
     client.start()
 
     frame_counts: dict[int, int] = {}
+    channel_info: dict[int, tuple[str, str]] = {}   # channel -> (stream_id, role), as first seen
     total_bytes = 0
     t_start = time.monotonic()
 
@@ -81,13 +84,12 @@ def _run_receive(args: argparse.Namespace) -> None:
             mt = msg.header.message_type
             frame_counts[ch] = frame_counts.get(ch, 0) + 1
             total_bytes += len(msg.payload) + len(msg.metadata)
+            meta = _metadata(msg)
+            if ch not in channel_info:
+                channel_info[ch] = _stream_label(msg, meta)
 
             # Save to disk
-            if save_dir and mt in (
-                MessageType.FRAME_RGB, MessageType.FRAME_DEPTH,
-                MessageType.FRAME_RGBD, MessageType.FRAME_DATA,
-                MessageType.IMAGE_DATA
-            ):
+            if save_dir and mt in _SAVED_TYPES:
                 _save_frame(save_dir, ch, msg, frame_counts[ch])
 
             # Stats output
@@ -95,11 +97,11 @@ def _run_receive(args: argparse.Namespace) -> None:
             if frame_counts[ch] % max(1, args.stats_interval) == 0:
                 fps = frame_counts[ch] / elapsed if elapsed > 0 else 0
                 bw = total_bytes / elapsed / 1024 / 1024 if elapsed > 0 else 0
-                meta = msg.get_metadata_json() if msg.metadata else {}
                 w = meta.get("w", "?")
                 h = meta.get("h", "?")
+                sid, role = channel_info[ch]
                 print(
-                    f"  Ch{ch:02d} | {MessageType(mt).name:14s} | "
+                    f"  Ch{ch:02d} | {_type_name(mt):14s} | {role or '-':6s} | {sid or '-':28s} | "
                     f"#{frame_counts[ch]:6d} | {w}x{h} | "
                     f"{fps:5.1f} fps | {bw:6.1f} MB/s | "
                     f"payload={len(msg.payload)} bytes"
@@ -113,12 +115,43 @@ def _run_receive(args: argparse.Namespace) -> None:
         print(f"\n--- Summary ---")
         print(f"Duration: {elapsed:.1f}s")
         for ch, count in sorted(frame_counts.items()):
-            print(f"  Channel {ch}: {count} frames ({count/elapsed:.1f} fps)")
+            sid, role = channel_info.get(ch, ("", ""))
+            label = f"  {sid} ({role})" if sid else (f"  ({role})" if role else "")
+            print(f"  Channel {ch}: {count} frames ({count/elapsed:.1f} fps){label}")
         print(f"Total data: {total_bytes / 1024 / 1024:.1f} MB")
 
 
+def _metadata(msg) -> dict:
+    try:
+        return msg.get_metadata_json() if msg.metadata else {}
+    except ValueError:
+        return {}
+
+
+def _type_name(mt) -> str:
+    from ramms_tools.streaming.protocol import MessageType
+    try:
+        return MessageType(mt).name
+    except ValueError:
+        return f"0x{int(mt):02X}"
+
+
+def _stream_label(msg, meta: dict) -> tuple[str, str]:
+    """(stream_id, role) of a frame: its metadata's, the role inferred when the metadata has none."""
+    from ramms_tools.streaming.frames import message_role
+    return str(meta.get("stream_id", "") or ""), message_role(msg, meta)
+
+
 def _save_frame(save_dir: Path, channel: int, msg, frame_num: int) -> None:
-    """Save a received frame in CameraCapture-compatible format."""
+    """Save a received frame in CameraCapture-compatible format.
+
+    Motion vectors are saved decoded, as .npy (float32, H x W x 2),
+    segmentation masks as .png (Pillow) or .npy (uint8 class values), and IMU
+    stream messages as .npy (float64, n x 18, IMU_FIELDS order); every other
+    frame as its raw payload.
+    """
+    from ramms_tools.streaming.frames import decode_message, message_role
+    from ramms_tools.streaming.protocol import MessageType
     ch_dir = save_dir / f"channel_{channel:02d}"
     ch_dir.mkdir(exist_ok=True)
 
@@ -134,6 +167,22 @@ def _save_frame(save_dir: Path, channel: int, msg, frame_num: int) -> None:
     with open(json_path, "w") as f:
         json.dump(meta, f, indent=2)
 
+    role = message_role(msg, meta)
+    if role in ("motion", "mask", "imu") and msg.header.message_type in (MessageType.FRAME_MOTION, MessageType.FRAME_DATA):
+        try:
+            frame = decode_message(msg, role=role)
+        except ValueError as e:
+            logger.warning("channel %d: could not decode the %s frame (%s); saving it raw", channel, role, e)
+        else:
+            stem = ch_dir / f"frame_{frame_num:07d}"
+            if role == "mask" and frame.array.dtype.name == "uint8" and _has_pillow():
+                from PIL import Image
+                Image.fromarray(frame.array).save(stem.with_suffix(".png"))
+            else:
+                import numpy as np
+                np.save(stem.with_suffix(".npy"), frame.array)
+            return
+
     # Save binary payload
     fmt = meta.get("fmt", "raw")
     if fmt == "exr":
@@ -148,6 +197,14 @@ def _save_frame(save_dir: Path, channel: int, msg, frame_num: int) -> None:
     bin_path = ch_dir / f"frame_{frame_num:07d}{ext}"
     with open(bin_path, "wb") as f:
         f.write(msg.payload)
+
+
+def _has_pillow() -> bool:
+    try:
+        import PIL.Image  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +257,16 @@ def _run_ping(args: argparse.Namespace) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def _saved_types():
+    from ramms_tools.streaming.protocol import MessageType
+    return frozenset({MessageType.FRAME_RGB, MessageType.FRAME_DEPTH, MessageType.FRAME_RGBD, MessageType.FRAME_MOTION,
+                      MessageType.FRAME_DATA, MessageType.IMAGE_DATA})
+
+
+_SAVED_TYPES = _saved_types()
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="ramms-stream",
         description="RMSS binary streaming client — receive, record, or replay camera data",
@@ -239,7 +305,7 @@ def main() -> None:
     parser.add_argument("--ping-count", type=int, default=5,
                         help="Number of pings (default: 5)")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     _setup_logging(args.verbose)
 
     try:

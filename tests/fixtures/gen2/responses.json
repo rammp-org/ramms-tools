@@ -1,0 +1,432 @@
+{
+ "DriveModeSelector": {
+  "_class": "RammsDriveModeSelector",
+  "GetAvailableModeIds": {
+   "ReturnValue": [
+    "curb",
+    "differential",
+    "holonomic",
+    "low_level"
+   ]
+  },
+  "GetActiveModeId": {
+   "ReturnValue": "differential"
+  },
+  "IsSwitchingMode": {
+   "ReturnValue": false
+  },
+  "GetSwitchStatus": {
+   "ReturnValue": "differential again"
+  },
+  "GetMeasuredMotion": {
+   "ReturnValue": {
+    "ForwardCmPerSecond": -0.003,
+    "RightCmPerSecond": 0.002,
+    "YawRateDegPerSecond": -0.001
+   }
+  }
+ },
+ "CurbNegotiation": {
+  "_class": "RammsCurbNegotiationController",
+  "GetPhase": {
+   "ReturnValue": "Idle"
+  },
+  "GetPhaseAxle": {
+   "ReturnValue": "Front"
+  },
+  "GetStatusText": {
+   "ReturnValue": "Idle"
+  },
+  "GetStatusLine": {
+   "OutSeverity": "Info",
+   "ReturnValue": "Ready"
+  },
+  "GetDetectionText": {
+   "ReturnValue": "+12.0 cm step (+11.8..+12.2 across the footprint) 80.0 cm ahead, +15.0 deg off square (edge residual 0.01 cm over 7 lanes); near slope 0.0 deg, far slope 0.0 deg; far side 120 cm deep (to the end of view), the robot needs 100"
+  },
+  "DetectStepAhead": {
+   "OutProfile": {
+    "StepHeightCm": 12.0,
+    "EdgeDistanceCm": 80.0,
+    "EdgeSkewCm": 10.0,
+    "ApproachAngleDeg": 15.0,
+    "Terrain": {
+     "bValid": true,
+     "EdgePoint": {
+      "X": 500.0,
+      "Y": 300.0,
+      "Z": -100.0
+     },
+     "EdgeDirection": {
+      "X": -0.258819,
+      "Y": 0.965926
+     },
+     "EdgeNormal": {
+      "X": 0.965926,
+      "Y": 0.258819
+     },
+     "ApproachAngleDeg": 15.0,
+     "EdgeFitResidualCm": 0.01,
+     "Near": {
+      "Origin": {
+       "X": 420.0,
+       "Y": 280.0,
+       "Z": -100.0
+      },
+      "Gradient": {
+       "X": 0,
+       "Y": 0
+      },
+      "FitRmsCm": 0.0,
+      "FitMaxCm": 0.0,
+      "Samples": 400
+     },
+     "Far": {
+      "Origin": {
+       "X": 560.0,
+       "Y": 315.0,
+       "Z": -88.0
+      },
+      "Gradient": {
+       "X": 0,
+       "Y": 0
+      },
+      "FitRmsCm": 0.001,
+      "FitMaxCm": 0.001,
+      "Samples": 250
+     },
+     "StepHeightCm": 12.0,
+     "StepHeightRangeCm": {
+      "X": 11.8,
+      "Y": 12.2
+     },
+     "FarDepthCm": 120.0,
+     "bFarDepthObserved": false
+    }
+   },
+   "OutReason": "+12.0 cm step (+11.8..+12.2 across the footprint) 80.0 cm ahead, +15.0 deg off square (edge residual 0.01 cm over 7 lanes); near slope 0.0 deg, far slope 0.0 deg; far side 120 cm deep (to the end of view), the robot needs 100",
+   "ReturnValue": true
+  },
+  "DetectTerrainAhead": {
+   "OutTerrain": {
+    "bValid": true,
+    "EdgePoint": {
+     "X": 500.5,
+     "Y": 300.2,
+     "Z": -100.0
+    },
+    "EdgeDirection": {
+     "X": -0.258819,
+     "Y": 0.965926
+    },
+    "EdgeNormal": {
+     "X": 0.965926,
+     "Y": 0.258819
+    },
+    "ApproachAngleDeg": 15.0,
+    "EdgeFitResidualCm": 0.01,
+    "Near": {
+     "Origin": {
+      "X": 421.0,
+      "Y": 280.5,
+      "Z": -100.0
+     },
+     "Gradient": {
+      "X": 0,
+      "Y": 0
+     },
+     "FitRmsCm": 0.0,
+     "FitMaxCm": 0.0,
+     "Samples": 390
+    },
+    "Far": {
+     "Origin": {
+      "X": 560.5,
+      "Y": 315.5,
+      "Z": -88.0
+     },
+     "Gradient": {
+      "X": 0,
+      "Y": 0
+     },
+     "FitRmsCm": 0.001,
+     "FitMaxCm": 0.001,
+     "Samples": 240
+    },
+    "StepHeightCm": 12.0,
+    "StepHeightRangeCm": {
+     "X": 11.8,
+     "Y": 12.2
+    },
+    "FarDepthCm": 120.0,
+    "bFarDepthObserved": false
+   },
+   "OutReason": "+12.0 cm step (+11.8..+12.2 across the footprint) 80.0 cm ahead, +15.0 deg off square (edge residual 0.01 cm over 7 lanes); near slope 0.0 deg, far slope 0.0 deg; far side 120 cm deep (to the end of view), the robot needs 100",
+   "ReturnValue": true
+  },
+  "GetActiveTerrain": {
+   "ReturnValue": {
+    "bValid": false,
+    "EdgePoint": {
+     "X": 0,
+     "Y": 0,
+     "Z": 0
+    },
+    "EdgeDirection": {
+     "X": 0,
+     "Y": 1
+    },
+    "EdgeNormal": {
+     "X": 1,
+     "Y": 0
+    },
+    "ApproachAngleDeg": 0,
+    "EdgeFitResidualCm": 0,
+    "Near": {
+     "Origin": {
+      "X": 0,
+      "Y": 0,
+      "Z": 0
+     },
+     "Gradient": {
+      "X": 0,
+      "Y": 0
+     },
+     "FitRmsCm": 0,
+     "FitMaxCm": 0,
+     "Samples": 0
+    },
+    "Far": {
+     "Origin": {
+      "X": 0,
+      "Y": 0,
+      "Z": 0
+     },
+     "Gradient": {
+      "X": 0,
+      "Y": 0
+     },
+     "FitRmsCm": 0,
+     "FitMaxCm": 0,
+     "Samples": 0
+    },
+    "StepHeightCm": 0,
+    "StepHeightRangeCm": {
+     "X": 0,
+     "Y": 0
+    },
+    "FarDepthCm": 0,
+    "bFarDepthObserved": false
+   }
+  },
+  "GetActiveProfile": {
+   "ReturnValue": {
+    "StepHeightCm": 12.0,
+    "EdgeDistanceCm": 50,
+    "EdgeSkewCm": 0,
+    "ApproachAngleDeg": 0,
+    "Terrain": {
+     "bValid": false,
+     "EdgePoint": {
+      "X": 0,
+      "Y": 0,
+      "Z": 0
+     },
+     "EdgeDirection": {
+      "X": 0,
+      "Y": 1
+     },
+     "EdgeNormal": {
+      "X": 1,
+      "Y": 0
+     },
+     "ApproachAngleDeg": 0,
+     "EdgeFitResidualCm": 0,
+     "Near": {
+      "Origin": {
+       "X": 0,
+       "Y": 0,
+       "Z": 0
+      },
+      "Gradient": {
+       "X": 0,
+       "Y": 0
+      },
+      "FitRmsCm": 0,
+      "FitMaxCm": 0,
+      "Samples": 0
+     },
+     "Far": {
+      "Origin": {
+       "X": 0,
+       "Y": 0,
+       "Z": 0
+      },
+      "Gradient": {
+       "X": 0,
+       "Y": 0
+      },
+      "FitRmsCm": 0,
+      "FitMaxCm": 0,
+      "Samples": 0
+     },
+     "StepHeightCm": 0,
+     "StepHeightRangeCm": {
+      "X": 0,
+      "Y": 0
+     },
+     "FarDepthCm": 0,
+     "bFarDepthObserved": false
+    }
+   }
+  },
+  "GetMeasuredTiltDeg": {
+   "ReturnValue": {
+    "X": 0,
+    "Y": 0
+   }
+  },
+  "GetBaseHeight": {
+   "ReturnValue": {
+    "X": 0,
+    "Y": 0
+   }
+  },
+  "GetWheelProgress": {
+   "ReturnValue": []
+  },
+  "GetLegHeights": {
+   "ReturnValue": []
+  },
+  "GetWheelClearance": {
+   "ReturnValue": []
+  },
+  "GetRunStats": {
+   "ReturnValue": {
+    "MinCommandedSpeed": 0,
+    "MinMeasuredSpeed": 0,
+    "SecondsBelowStopSpeed": 0,
+    "Stops": 0,
+    "PlannedStops": 0,
+    "Holds": 0,
+    "MaxAbsPitchDeg": 0,
+    "MaxAbsRollDeg": 0,
+    "MaxInclinationDeg": 0,
+    "MaxAttitudeErrorDeg": 0,
+    "FinalPitchDeg": 0,
+    "FinalRollDeg": 0,
+    "MinPlannedMarginCm": 0,
+    "MinMeasuredMarginCm": 0,
+    "MinSwingClearanceCm": 0,
+    "MaxLegErrorCm": 0,
+    "PlannedMinSpeed": 0,
+    "PlannedMaxTiltDeg": 0,
+    "PlannedCrossingSeconds": 0,
+    "CrossingSeconds": 0,
+    "Replans": 0,
+    "LateralDriftCm": 0,
+    "YawChangeDeg": 0
+   }
+  },
+  "GetDriveSpeed": {
+   "ReturnValue": {
+    "X": 0,
+    "Y": 0.002
+   }
+  },
+  "GetWheelStatus": {
+   "ReturnValue": []
+  },
+  "GetStabilityMargin": {
+   "ReturnValue": 0
+  },
+  "GetPlanDescription": {
+   "ReturnValue": []
+  },
+  "GetStepLog": {
+   "ReturnValue": []
+  },
+  "GetScheduleLines": {
+   "ReturnValue": []
+  },
+  "GetPlannedTiltDeg": {
+   "ReturnValue": {
+    "X": 0,
+    "Y": 0
+   }
+  },
+  "GetElapsedSeconds": {
+   "ReturnValue": 0
+  },
+  "IsNegotiating": {
+   "ReturnValue": false
+  }
+ },
+ "Seat": {
+  "_class": "RammsSeatMechanismController",
+  "GetPivot": {
+   "bValid": true,
+   "ReturnValue": {
+    "X": -10.0,
+    "Y": 40.0
+   }
+  },
+  "GetTiltDeg": {
+   "bValid": true,
+   "ReturnValue": 2.0
+  },
+  "GetReachableOutline": {
+   "bValid": true,
+   "ReturnValue": [
+    {
+     "X": 10.0,
+     "Y": 25.0
+    },
+    {
+     "X": 5.0,
+     "Y": 25.0
+    },
+    {
+     "X": 0.0,
+     "Y": 25.0
+    },
+    {
+     "X": -6.0,
+     "Y": 27.0
+    },
+    {
+     "X": -12.0,
+     "Y": 30.0
+    },
+    {
+     "X": -15.0,
+     "Y": 40.0
+    },
+    {
+     "X": -12.0,
+     "Y": 50.0
+    },
+    {
+     "X": -6.0,
+     "Y": 53.0
+    },
+    {
+     "X": 0.0,
+     "Y": 55.0
+    },
+    {
+     "X": 6.0,
+     "Y": 53.0
+    },
+    {
+     "X": 10.0,
+     "Y": 50.0
+    },
+    {
+     "X": 12.0,
+     "Y": 35.0
+    }
+   ]
+  }
+ }
+}

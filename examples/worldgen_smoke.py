@@ -7,7 +7,9 @@ or a packaged / -game build with Remote Control enabled.
     python examples/worldgen_smoke.py --host 10.0.0.5 --map Map_Gen_Store
 
 Checks discovery, generation, determinism (same seed -> same manifest), parameter
-overrides (numbers and text), palettes (switching to another one and back, e.g. the
+overrides (numbers and text), graded streets (the terrain parameters set, Grade and Curb
+records within them; skipped on an indoor scene or a plugin without them, --no-graded to skip),
+palettes (switching to another one and back, e.g. the
 UrbanVerse-100K palette when it is imported), per-placement glass variation, the assets recorded in the manifest,
 manifest export / reload, a small batch, and map travel. Exits non-zero on the first failure.
 """
@@ -55,6 +57,7 @@ def main() -> int:
     ap.add_argument("--map", default="Map_Gen_Store", help="map to travel to at the end ('' to skip)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--palette", default="PAL_UrbanVerse", help="second palette to switch to ('' to skip; skipped if not imported)")
+    ap.add_argument("--no-graded", action="store_true", help="skip the graded-streets check")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -113,6 +116,32 @@ def main() -> int:
         gen.clear_overrides()
         gen.generate(seed=args.seed, wait=True)
         _check(_key(gen.manifest()) == _key(a), "overrides cleared")
+
+    # Graded streets: the terrain parameters switch the ground model on; every sidewalk side then has Grade
+    # records (running grade, cross slope) and Curb records within the ranges asked for.
+    graded_params = {"MaxStreetGrade", "RoadCrown", "SidewalkCrossSlope", "CurbHeightMin", "CurbHeightMax"}
+    street = bool(a.features_of("Crosswalk") or a.features_of("CurbRamp"))
+    if args.no_graded:
+        print("        (graded check skipped: --no-graded)")
+    elif not graded_params <= set(params):
+        print(f"        (graded check skipped: this RammsWorldGen has no {', '.join(sorted(graded_params - set(params)))})")
+    elif not street:
+        print(f"        (graded check skipped: {a.preset} is not a street scene)")
+    else:
+        res = gen.set_terrain(max_grade=0.06, crown=0.02, cross_slope=0.02, curb_min=10, curb_max=18)
+        _check(not res.get("unknown"), f"terrain parameters applied {res.get('applied')}")
+        gen.generate(seed=args.seed, wait=True)
+        g = gen.manifest()
+        ts = g.terrain_summary()
+        print(f"        graded: {_brief(g)}; {ts}")
+        _check(ts["graded"] and ts["grades"] > 0, f"{ts['grades']} Grade records (running and cross per side)")
+        _check(0.0 < ts["max_running_grade"] <= 0.06 + 1e-3, f"steepest running grade {ts['max_running_grade']:.3f} <= 0.06")
+        lo, hi = ts["curb_height_range"]
+        _check(ts["curbs"] > 0 and 10.0 - 0.5 <= lo and hi <= 18.0 + 0.5, f"{ts['curbs']} Curb records, {lo}..{hi} cm in 10..18")
+        gen.clear_overrides()
+        gen.generate(seed=args.seed, wait=True)
+        flat = gen.manifest()
+        _check(_key(flat) == _key(a) and not flat.grades(), "overrides cleared: the flat world again")
 
     # Text parameters go through set_params as strings.
     if "FacadeStyles" in params:

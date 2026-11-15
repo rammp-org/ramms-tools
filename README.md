@@ -33,6 +33,11 @@ pip install -e '.[exr]'
     `Config/DefaultRemoteControl.ini` listing the bridges, robot components and engine getters
     these tools call. Add an entry there when you call something new.
 - For robot control: the **RammsCore** plugin with `URammsCoreBridge`
+- For any robot's controls, drive modes and curb crossing (`ramms_tools.control`, `ramms_tools.robot`,
+  `ramms-control`, `ramms-curb`): a pawn with a `URammsRobotControlSurfaceComponent` (RammsCore)
+- For robot sensing (`ramms_tools.sensing`, `ramms-sensors`): RammsCore's `URammsSensingBridge`, and
+  **RammsStreaming** for the camera frames
+- For moving traffic (`ramms-worldgen traffic`): the **RammsCrowd** plugin on a traffic level
 - For skeletal pose control: the **RammsCore** plugin with `URammsSkeletalPoseComponent`
 - For UI features: the **RammsUI** plugin with `URammsRemoteBridge`
 - For binary streaming: the **RammsStreaming** plugin (TCP port 30030)
@@ -64,6 +69,197 @@ angles = comp.call("GetAllJointAngles")
 ue = UnrealRemote(ui_bridge="/Script/RammsUI.Default__RammsRemoteBridge")
 ue.ui_bridge.ShowNotification(Message="Hello!", Level="ERammsNotificationLevel::Info")
 ```
+
+### Robots: control surface, drive modes, curb crossing, seat
+
+Every robot pawn carries a `URammsRobotControlSurfaceComponent` that lists all
+its controls under dotted ids (`drive.forward`, `drive.mode`, `curb.assist`,
+`curb.status`, `seat.height`, `camera.next` ...). `ramms_tools.control` drives
+any of them without robot-specific code; `ramms_tools.robot` adds the drive
+modes, the curb crossing and the seat on top.
+
+```python
+from ramms_tools.robot import Robot
+
+robot = Robot.find()                          # first robot in the world (or Robot.find("PoweredFront"): a unique part of its name)
+cs = robot.surface                            # ramms_tools.control.ControlSurface
+for a in cs.axes("Curb"):                     # ControlAxis: kind, units, range, enum_labels, read_only, paired_axis
+    print(a.id, a.kind, a.enum_labels)
+cs.set_enum("curb.assist", "On")              # Enum by label or index
+print(cs.status("curb.status"))               # StatusText(text='Ready', severity='Info')
+cs.trigger("camera.next")                     # Action
+robot.drive(forward=0.3, turn=0.0, seconds=2) # re-sent at 10 Hz for 2 s, then released (see "Held commands")
+with cs.keep_alive({"drive.forward": 0.2}) as ka:   # or keep commands alive in the background; released on exit
+    ...
+
+print(robot.modes(), robot.mode)              # [DriveMode(id='curb', ...), ...], 'differential'
+robot.set_mode("holonomic")                   # waits for the hand-over; ModeError (with the reason) if refused
+robot.drive(forward=0.2, strafe=0.3, seconds=2)     # drive.strafe exists in holonomic modes
+
+curb = robot.curb                             # Gen1Curb or Gen2Curb, chosen by component class
+print(curb.phase(), curb.status_line())       # 'Idle', StatusText('Ready', 'Info')
+run = curb.cross(forward=0.5, on_event=print) # start, hold the stick while it runs; run.succeeded, run.reason, run.stats
+if robot.generation == "gen2":
+    d = curb.detect_step_ahead()              # Detection(found, reason, profile=CurbProfile(step_height_cm, ...))
+    print(curb.plan(), curb.measured_tilt(), curb.stability_margin())
+    robot.seat.set_pivot(0.0, 45.0)           # seat pivot (fore/aft, height cm); set_tilt, reset, outline
+```
+
+A crossing moves only while the rider's stick (`drive.forward`) is held
+forward; let go, it pauses. `cross()` starts it -- the controller selects the
+`curb` drive mode itself; do not select that mode by hand first, which starts
+(or, with nothing to cross, refuses and hands back) a crossing by itself -- and
+holds the stick at `forward` only while a poll sees the crossing under way. The
+moment it is Done, Aborted or Faulted the stick is released, before the drive
+mode the robot is handed back to could drive on it, and held again if a Gen2
+crossing retries a fault by itself. A Gen2 crossing goes at the stick's share
+of its planned speed, a Gen1 one at its planned speeds; 0.5 is twice the
+controllers' engage threshold. `wait_until_done(hold_forward=...)` does the
+waiting part on a crossing started otherwise. `CurbProfile` / `CurbTerrain`
+edits are sent as edited (`begin`, `check_feasibility`, `begin_on_terrain`).
+
+#### Held commands: the deadman, and older sims that latch
+
+A `Remote` / `Autonomy` command outranks local input (keyboard, gamepad,
+touch) for 0.3 s after each send. A **Continuous** control (`drive.forward`,
+`drive.turn`, `drive.strafe`, jog axes ...) that is not sent again:
+
+| Sim | What the robot does |
+|---|---|
+| with the control-surface deadman (RammsCore from 2026-11-15) | springs back to its default 0.3 s after the last Remote / Autonomy send |
+| older | **keeps doing the last command** until it is released, set again, or local input moves that control |
+
+So re-send held commands at >= 10 Hz -- `hold()`, `keep_alive()`,
+`drive(seconds=)` do -- and release them at the end. ramms-tools releases what
+it holds when a hold ends, raises or is interrupted; at interpreter exit it
+stops every running `KeepAlive` and releases every Continuous control set once
+(`ControlSurface.set`, `drive(once=True)`) that was not released
+(`ramms_tools.control.release_all()`); the CLIs also do it on SIGINT, SIGTERM
+and SIGHUP. `drive()` without `seconds` raises: `once=True` sends a single
+command explicitly (an older sim keeps it until `stop()`). Nothing can release
+after a hard kill (SIGKILL, power or network loss): on an older sim the last
+command then stays. Position / Velocity / Enum controls hold their target until
+released on every sim. `ramms-control set` takes a Continuous control only with
+`--hold SECONDS`.
+
+Out parameters come back beside `ReturnValue` in Remote Control's responses;
+`UnrealRemote.call_full()` / `RemoteObjectProxy.call_full()` return the whole
+response (`{"OutSeverity": "Info", "ReturnValue": "Ready"}`) where `call()`
+keeps only the return value.
+
+RAMMP Gen1 (the curb pawn and the Chaos chair) is in the public project. The
+**RAMMP Gen2 (lift-drive)** robot is only in levels built with the private
+assets; everything here works on whichever robot
+is in the world, and Gen2-only calls say so on a Gen1.
+
+### Sensing: ToF, sonar, IMU and cameras
+
+`ramms_tools.sensing` adds sensors to a robot at runtime through the
+`URammsSensingBridge`, reads them, and decodes its cameras' RMSS streams:
+
+```python
+from ramms_tools.sensing import CameraStreams, Sensing, SensorMount
+
+robot.sensors.apply_rig("rammp_gen1")         # preset: front ToF, sonar, IMU, RGB-D camera ("chair" for the Chaos chair)
+robot.sensors.add(SensorMount("left_sonar", "Sonar", parent="chassis", location=(30, 30, 25), rotation=(0, 60, 0)))
+tof = robot.sensors.read("front_tof", measure=True)
+print(tof.min_distance_cm, tof.grid())        # (rows, columns) cm, NaN = no hit
+imu = robot.sensors.read("imu")
+print(imu.linear_acceleration, imu.units, imu.linear_acceleration_ms2())   # raw cm/s^2, converted
+
+sensing = Sensing()
+status = sensing.start_streams()              # RMSS server + capture (needs PIE or a game)
+cam = next(s for s in robot.sensors.list() if s.name == "front_camera")
+with CameraStreams.from_sensor(cam, port=status.port) as streams:   # this robot's camera: its actor and channel
+    f = streams.grab()                        # one capture: {"color": (H,W,3) RGB, "depth": (h,w) float32 cm,
+                                              #  "motion": (h,w,2) float32 px/frame, "mask": (H,W) uint8}
+    print(f["mask"].classes)                  # {3: "Car", ...}; sensing.segmentation_classes() for the table
+```
+
+Stream ids carry only the camera's name, and the Gen1 / Gen2 rigs and the
+`chair` preset all name theirs `front_camera`: pick a robot's camera by its
+actor (and channel), never by name alone -- `CameraStreams.from_sensor`, or
+`actor=` on `CameraStreams` / `CameraStreams.from_status` (which refuses a name
+several actors stream). Every camera frame's metadata names its `actor` and its
+capture `frame` number; `grab()` returns the newest complete capture.
+`StreamStatus.port` is None while the RMSS server is not running.
+
+Adding / removing sensors and starting streams need a play world (PIE or a
+game) on sims from the fix round; older sims keep a mount added in the editor
+world and build it at BeginPlay (`"built": false`). A parent component the
+actor does not have is an error. Sensor names are 1..64 characters of
+`A-Z a-z 0-9 _ - .`, not ending in `_depth`, `_dmv`, `_seg` or `_stream`.
+
+Every sensor looks along its local +X; mount locations are cm from the parent
+component (a MuJoCo body such as `chassis`, or `""` for the root), rotations
+(pitch, yaw, roll) degrees; a sonar's `sonar_cone_deg` is a half-angle. A
+camera with base channel C streams colour on C (`camera/<name>/color`, FrameRGB
+bgra8), depth on C+100 (`camera/<name>/depth`, float32 cm), motion on C+200
+(`motion/<name>`, FrameMotion rg32f) and its mask on C+300 (`mask/<name>`,
+FrameData mono8, with the class table in the metadata);
+`ramms_tools.streaming.frames` decodes any of them to numpy. The RAMMP Gen1 and
+Gen2 curb pawns ship with a rig baked in (`imu`, `front_tof`, `front_sonar`,
+`front_camera`); the presets (`ramms_tools/sensing/rigs.py`) put the same sensors
+on robots without one: `rammp_gen1` (that rig) and `chair` (the Chaos chair on the
+generated levels). The mounts are plausible front-of-robot positions, not measured
+from the hardware. `apply_rig` also takes a JSON file of mounts.
+
+**IMU from the physics engine, no component needed.** An IMU reading for any body
+comes straight from the engine that simulates it:
+
+```python
+print(robot.sensors.imu_bodies())             # [{"name": "chassis", "engine": "mujoco", ...}, ...]
+r = robot.sensors.body_imu("chassis", offset=(50, 0, 15), wait=2.0)   # a point on the chassis, cm
+print(r.source, r.linear_acceleration, r.angular_velocity, r.linear_velocity, r.sim_time)
+```
+
+The reading takes its body by name: a MuJoCo body, a component, or a Chaos
+skeletal bone. MuJoCo and Chaos bodies are sampled every physics step at the
+sensor's point, so lever-arm and centripetal terms are included. The
+acceleration is what an accelerometer reads: +g up at rest, about 0 in free
+fall. The IMU components use the same engines: an IMU sensor reports
+`source` `mujoco`, `chaos` or `kinematic`, the last being transform differencing
+for bodies no engine simulates. A point's first read starts tracking it, so it
+has no sample yet; `wait=` re-reads until one arrives. `sim_time` is None until
+there is a sample.
+
+**Every physics-step sample.** The sim keeps about 2 s of each tracked point's
+samples (1024 at MuJoCo's 500 Hz). Read them all over Remote Control with a
+cursor, or have the sim stream them over RMSS:
+
+```python
+from ramms_tools.sensing import ImuStream
+
+for s in sensing.follow_imu_samples(robot.actor_path, "chassis", period=0.1, duration=5.0):   # ReadImuSamplesJson
+    print(s.seq, s.sim_time, s.linear_acceleration, s.angular_velocity)    # cm/s^2 (gravity in), deg/s, sensor frame
+
+info = sensing.start_imu_stream(robot.actor_path, "imu")       # an IMU sensor or a body; channel >= 1000
+with ImuStream.from_info(info) as stream:                      # FrameData imu_f64x18: the samples of each game tick
+    for s in stream.samples(duration=5.0):
+        ...
+sensing.stop_imu_stream(robot.actor_path, "imu")
+```
+
+`read_imu_samples(since=...)` is one call (`next` is the cursor to pass back,
+`dropped` the samples lost before the oldest kept); the follower's and the
+stream's `dropped` count what was lost. Each sample has seq, sim_time,
+acceleration, angular velocity and angular acceleration (sensor frame), velocity
+and orientation (world).
+
+### Remote Control allow-list
+
+UE 5.6+ refuses calls to classes that are not allow-listed. Besides the
+bridges already listed in the RAMMS project's `Config/DefaultRemoteControl.ini`,
+these modules call:
+
+| Class | Used by |
+|---|---|
+| `/Script/RammsCore.RammsRobotControlSurfaceComponent` | `control`, `robot`, `ramms-control`, `ramms-curb`, TUI Robot page |
+| `/Script/RammsCore.RammsDriveModeSelector` | drive modes |
+| `/Script/RammsCore.RammsRammpGen1CurbController`, `RammsCurbNegotiationController`, `RammsSeatMechanismController` | curb crossing (Gen1, Gen2), Gen2 seat |
+| `/Script/RammsCore.RammsSensingBridge` (no child classes) | `sensing`, `ramms-sensors` |
+| `/Script/RammsCore.RammsIMUSensorComponent`, `RammsSonarSensorComponent`, `RammsToFSensorComponent` | sensor components |
+| `/Script/RammsCrowd.RammsTrafficSpawner`, `RammsTrafficSignalClock` | `ramms-worldgen traffic` (car poses use the allow-listed `K2_GetActorLocation` / `K2_GetActorRotation`) |
 
 ### Coordinate Frame Transforms
 
@@ -136,6 +332,33 @@ for seed, path in wg.batch("PRE_Downtown", range(20), out_dir="data/dt_uv", pale
     print(seed, path)                        # PRE_Downtown_PAL_UrbanVerse_<seed>.json
 ```
 
+Graded streets, curb heights and rough ground (the RammsWorldGen README's
+"Graded streets and rough ground"), and the traffic on them:
+
+```python
+gen.set_terrain(max_grade=0.08, crown=0.02, cross_slope=0.02, noncompliant_cross_slope=0.2,
+                curb_min=10, curb_max=20, roughness=0.5, potholes=2, humps=0.3)   # range-checked
+gen.generate(seed=7)
+m = gen.manifest()
+print(m.terrain_summary())    # max_running_grade, cross_slope_range, curb_height_range, curb ramps, roughness counts
+print(m.grades_by_side(), m.curb_heights(), m.roughness_counts())
+print(m.traffic_summary())    # roads, length, intersections by subtype, signals, crosswalks
+
+from ramms_tools.worldgen import Traffic
+t = Traffic()                 # a traffic level, in PIE or a game
+print(t.count(), t.signal_state())
+t.despawn(); t.spawn()
+for car in t.cars(limit=5):
+    print(car.name, car.location, car.yaw)
+```
+
+The friendly names map to `MaxStreetGrade`, `RoadCrown`, `SidewalkCrossSlope`,
+`NonCompliantCrossSlopeChance`, `CurbHeight`, `CurbHeightMin`, `CurbHeightMax`,
+`SurfaceRoughness`, `PanelLength`, `HeaveDensity`, `CrackDensity`,
+`CoverDensity`, `PavingPatchDensity`, `PotholeDensity`, `SpeedHumpChance` and
+`RootHeaveChance` (`TERRAIN_PARAMS` / `ROUGHNESS_PARAMS`); the parameter names
+work too, and `flat=True` zeroes them first.
+
 `Manifest` also loads exported files (`Manifest.load("x.json")`) and offers
 `features_of(kind)`, `features_near(point, radius)`, `features_on_route(route)`,
 `routes_narrower_than(width)`, `crosswalks(step_free)`, `assets(kind)`,
@@ -170,7 +393,8 @@ one is running, and the editor world otherwise.
   a game; actor paths change afterwards, so call `generators()` again.
 
 `examples/worldgen_smoke.py` runs discovery, generation, determinism,
-parameter overrides, a palette switch and back (`--palette`, default
+parameter overrides, graded streets (skipped on an indoor scene or a plugin
+without the terrain parameters; `--no-graded`), a palette switch and back (`--palette`, default
 `PAL_UrbanVerse`, skipped when it is not imported) with its glass variation
 (which must leave the layout unchanged), the recorded assets,
 manifest export, a small batch and a map travel against
@@ -188,8 +412,8 @@ All tools are installed as console scripts when you `pip install` the package.
 ### `ramms-tui` — Interactive Dashboard
 
 A rich terminal UI (built with [Textual](https://textual.textualize.io/)) for
-monitoring and controlling the RAMMP Gen1, Kinova arm, gripper, and IMU data in
-real-time.
+monitoring and controlling the RAMMP Gen1, Kinova arm, gripper, IMU data and
+any robot's control surface in real-time.
 
 ```bash
 ramms-tui                          # Launch the TUI (auto-connects to UE)
@@ -205,6 +429,7 @@ ramms-tui --host 192.168.1.10      # Connect to a remote UE instance
 | RAMMP Gen1 | Dynamic motor controls (angular & linear) |
 | IMU | Real-time streaming with target selection and coordinate frame toggle |
 | Stream | RMSS stream monitor — connect to streaming server, subscribe to channels, view per-channel FPS/bandwidth/dropped frames |
+| Robot | Any robot's control surface: robot and drive-mode selectors, curb panel (phase, status coloured by severity, assist / style, cross / stop, Gen2 detection), enum selectors and action buttons per group, live readback, sensors with their latest readings |
 
 The IMU page supports **World**, **Local**, or **Both** coordinate frames.
 In Local mode, linear velocity, angular velocity, and linear acceleration are
@@ -338,12 +563,15 @@ ramms-status --discover                          # List widgets and actors
 ### `ramms-stream` — Binary Data Streaming
 
 Connects to the RMSS streaming server (default port 30030) to receive and
-monitor camera frames and other binary data.
+monitor camera frames and other binary data. The stats show each channel's
+stream id and role; `--save` writes motion vectors as `.npy` (float32,
+H x W x 2), segmentation masks as `.png` (Pillow) or `.npy`, and IMU stream
+messages (FrameData `imu_f64x18`) as `.npy` (float64, n x 18).
 
 ```bash
 # Receive and display stats
 ramms-stream                                     # Subscribe to all channels
-ramms-stream -c 0,1                              # Subscribe to channels 0 and 1
+ramms-stream -c 0,100,200,300                    # One camera's colour, depth, motion and mask
 ramms-stream --save ./captures                   # Save frames to disk
 
 # Test connectivity
@@ -570,6 +798,87 @@ containing `RammsBridgeReceiver`. What a panel *looks* like still needs eyes:
 no panel/world-state/camera state is readable back, so each scenario prints
 what you should see, and the tap round-trip is what gets asserted.
 
+### `ramms-control` — Any Robot's Controls
+
+```bash
+ramms-control robots                                # robots in the world, generation, drive mode
+ramms-control describe --group Curb                 # controls: kind, units, range, choices
+ramms-control get drive.mode curb.status --target   # Enum labels, Text with severity, numbers
+ramms-control set curb.assist On                    # Enum by label or index
+ramms-control set seat.height 45                    # Position: holds until `release`
+ramms-control set drive.forward 0.3 --hold 2        # Continuous: only with --hold (re-sent at 10 Hz, then released)
+ramms-control trigger camera.next
+ramms-control release seat.height
+ramms-control watch curb.phase curb.status --rate 5 # or --group Seat; --json for JSON lines
+ramms-control drive --forward 0.4 --turn 0.1 --seconds 3   # --strafe in holonomic modes
+ramms-control mode                                  # list; `mode holonomic` switches (waits); `mode --cycle`
+```
+
+`--source` sets the `ERammsControlSource` (default `Remote`; a Remote command
+outranks local input for 0.3 s after each send). Ctrl+C, SIGTERM and SIGHUP
+release whatever is held before exiting (exit code 130); see "Held commands"
+for what the sim does with a command that is not re-sent.
+
+### `ramms-curb` — Curb Crossing
+
+Works on whichever robot is in the world: the RAMMP Gen1 curb controller or
+the RAMMP Gen2 (lift-drive) curb negotiation (private assets only).
+
+```bash
+ramms-curb status                          # phase, status line + severity, assist, drive mode, key sensing
+ramms-curb watch --rate 5 --changes        # tilt, base height, speed, margin (Gen2); step (Gen1)
+ramms-curb assist on
+ramms-curb style rolling                   # Gen1: "Stop and step" or "Rolling"
+ramms-curb detect                          # Gen2: step and terrain ahead (Gen1 has no look-ahead)
+ramms-curb drive --speed 0.3 --seconds 4   # approach
+ramms-curb go --wait                       # start a crossing, hold the stick while it runs, phase log + stats; exit 1 unless Done
+ramms-curb go --wait --forward 0.8 --on-interrupt pause
+ramms-curb abort
+ramms-curb stats
+ramms-curb plan                            # Gen2: plan, schedule, step log, planned tilt
+ramms-curb seat --pivot 0,45 --tilt -5     # Gen2 seat (--pivot=-10,45 for a negative fore/aft), --reset, --outline
+```
+
+`go` starts the crossing; the controller selects the curb drive mode itself.
+A crossing moves only while the stick (`drive.forward`) is held forward:
+`go --wait` holds it at `--forward` (default 0.5) only while the crossing is
+under way, and releases it the moment it is done, stopped or faulted -- before
+the drive mode the robot is handed back to could drive on it -- holding it again
+if a Gen2 crossing retries. Without `--wait`, the crossing waits, paused, for a
+stick. Ctrl+C / SIGTERM / SIGHUP during `go --wait` release the stick and abort
+the crossing (`--on-interrupt pause` leaves it paused: `go --wait` again goes on).
+
+### `ramms-sensors` — Robot Sensing
+
+```bash
+ramms-sensors rig list                                 # presets (rammp_gen1, chair)
+ramms-sensors rig apply rammp_gen1 [--replace]         # or a .json file of mounts
+ramms-sensors add left_sonar --kind sonar --parent chassis --at 30,30,25 --rot 0,60,0 --cone 10
+ramms-sensors add cam2 --json '{"kind": "camera", "width": 320, "height": 240}' --no-motion
+ramms-sensors list                                     # --all: every actor
+ramms-sensors read front_tof --measure --grid
+ramms-sensors watch --rate 5 --format csv              # table | json | csv
+ramms-sensors bodies                                   # bodies an IMU can be read from, and their engine
+ramms-sensors imu --body chassis --offset 50,0,15 --rate 20 --format csv   # physics-engine IMU, no component
+ramms-sensors imu --body chassis --samples --format csv > imu.csv   # every physics-step sample (Remote Control)
+ramms-sensors imu --sensor imu --stream --duration 10              # every sample over RMSS (an IMU stream)
+ramms-sensors remove left_sonar                        # rig sensors only
+ramms-sensors streams start --every 2 --no-motion      # needs PIE or a game
+ramms-sensors streams status | stop
+ramms-sensors classes                                  # segmentation classes (mask values)
+ramms-sensors camera front_camera --save shots --frames 10      # --robot / --actor: whose front_camera
+```
+
+`camera` takes the camera on the robot `--robot` / `--actor` names (the first
+robot by default): several robots can have a camera of the same name. It
+writes colour `.png` (else `.npy`), depth (float32 cm) and motion `.npy`, masks
+`.png` (else `.npy`), a `.json` of each frame's metadata and `classes.json`;
+each set is one capture. `imu --samples` / `--stream` print every physics-step
+sample (table, `--format json` lines or CSV; the summary goes to stderr);
+`--stream` stops the IMU stream at the end unless `--keep-stream`. A negative first value in `--at` / `--rot` needs the `=` form
+(`--rot=-20,0,0`). Sonar cones are half-angles; IMU readings are in the
+component's units (cm/s^2, deg/s).
+
 ### `ramms-worldgen` — World Generation
 
 Drive RammsWorldGen from the shell: list presets and example maps, open a map,
@@ -601,6 +910,15 @@ ramms-worldgen batch --preset PRE_Park --seeds 1-50 --out data/park
 ramms-worldgen batch --preset PRE_Downtown --seeds 1-20 --palette PAL_UrbanVerse --out data/dt_uv
 ramms-worldgen inspect data/park/PRE_Park_3.json --issues   # offline
 ramms-worldgen cleanup
+ramms-worldgen terrain                             # graded-street / roughness parameters now
+ramms-worldgen terrain --max-grade 0.08 --crown 0.02 --cross-slope 0.02 --noncompliant-cross-slope 0.2 \
+                       --curb-min 10 --curb-max 20 --generate --seed 7
+ramms-worldgen terrain --flat --roughness 0.5 --heaves 2 --cracks 3 --covers 1 --paving 1 --potholes 2 \
+                       --humps 0.3 --root-heaves 0.5
+ramms-worldgen manifest --terrain --traffic        # grades, cross slopes, curb heights, ramps, roughness; roads, signals
+ramms-worldgen inspect data/x.json --terrain       # the same offline
+ramms-worldgen traffic status                      # spawners, cars, signal phase (traffic level, PIE or game)
+ramms-worldgen traffic spawn | despawn | cars --limit 10 | signals
 ```
 
 `--generator NAME` picks a generator by actor path, name or label when a level
