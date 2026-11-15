@@ -4,7 +4,7 @@ pivot around a reachable region in the chassis' fore/aft-height plane, and a
 tilt actuator (URammsSeatMechanismController, "Seat").
 
     seat = robot.seat
-    print(seat.pivot(), seat.tilt())          # (-18.0, 39.5) cm, 1.1 deg
+    print(seat.pivot(), seat.tilt())          # e.g. (-10.0, 40.0) cm, 2.0 deg
     if seat.contains(0.0, 45.0):
         seat.set_pivot(0.0, 45.0)              # fore/aft, height (cm, chassis x-z)
     seat.set_tilt(-5.0)                         # nose down 5 deg
