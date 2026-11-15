@@ -34,10 +34,17 @@ again depends on the sim:
   released, set again, or local input moves that control.
 
 So keep re-sending a held command at >= 10 Hz -- ``hold()``, ``keep_alive()``
-or ``drive(seconds=)`` do -- and release it at the end. This module releases
+or ``drive(seconds=)`` do -- and release it at the end. Each round of a hold
+goes out as ONE Remote Control request (``/remote/batch``; one request per
+control only when the engine has no batch route): the engine serves requests
+about one per frame, so N controls sent one at a time would each be refreshed
+only every N frames -- past the deadman's window at a low frame rate.
+
+This module releases
 what it holds when a hold ends, raises or is interrupted, and at interpreter
 exit it stops every running ``KeepAlive`` and releases every Continuous
-control set once (``set()``, ``drive(once=True)``) that was not released
+control set once (``set()``, ``drive(once=True)``, ``hold(release=False)``,
+``KeepAlive.stop(release=False)``) that was not released
 (``release_all()``; the CLIs also do it on SIGINT / SIGTERM / SIGHUP). Nothing
 can release after a hard kill (SIGKILL, a crash of the interpreter, power or
 network loss): a latching sim then keeps the last command, a sim with the
@@ -67,7 +74,7 @@ from ramms_tools.unreal_remote import RemoteObjectProxy, UnrealRemote, UnrealRem
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "ControlSurface", "ControlAxis", "SurfaceDescription", "StatusText", "KeepAlive", "ControlError",
+    "ControlSurface", "ControlAxis", "SurfaceDescription", "StatusText", "KeepAlive", "SendGate", "ControlError",
     "COMPONENT_CLASS", "KINDS", "SOURCES", "SEVERITIES", "EXTERNAL_HOLD_SECONDS", "severity_name", "release_all",
 ]
 
@@ -340,9 +347,10 @@ class ControlSurface:
     @classmethod
     def find_by_robot(cls, ue: UnrealRemote, robot: str, source: str = "Remote") -> Optional["ControlSurface"]:
         """
-        The surface whose actor or robotName matches `robot`: an exact actor path / name or robotName first (case
-        ignored), then a substring of the actor path or robotName. None when nothing matches; ControlError when a
-        substring matches more than one robot (name one exactly).
+        The surface whose actor or robotName matches `robot`: an exact actor path / name first, then an exact
+        robotName, then a substring of the actor path or robotName (case ignored throughout). None when nothing
+        matches; ControlError when the name is ambiguous -- a robotName two robots share, or a substring of several
+        (name one by its actor).
         """
         surfaces = cls.find(ue, source=source)
         key = robot.strip().lower()
@@ -355,9 +363,19 @@ class ControlSurface:
             return s.actor_path.lower(), short_name(s.actor_path).lower(), rn
 
         table = [(s, names(s)) for s in surfaces]
-        exact = [s for s, (p, n, rn) in table if key in (p, n, rn)]
-        if exact:
-            return exact[0]
+
+        def one(found: list["ControlSurface"], what: str) -> Optional["ControlSurface"]:
+            if len(found) > 1:
+                raise ControlError(f"{robot!r} is the {what} of {len(found)} robots "
+                                   f"({', '.join(short_name(s.actor_path) for s in found)}): name one by its actor")
+            return found[0] if found else None
+
+        # An actor path / name first (unique in a world), then a robotName (two robots can share one).
+        hit = one([s for s, (p, n, rn) in table if key in (p, n)], "actor name")
+        if hit is None:
+            hit = one([s for s, (p, n, rn) in table if rn and key == rn], "robotName")
+        if hit is not None:
+            return hit
         hits = [s for s, (p, n, rn) in table if key in p or key in rn]
         if len(hits) > 1:
             raise ControlError(f"{robot!r} matches {len(hits)} robots ({', '.join(short_name(s.actor_path) for s in hits)}): "
@@ -410,6 +428,14 @@ class ControlSurface:
     def _set_raw(self, control_id: str, value: float, source: Optional[str] = None) -> bool:
         return as_bool(self._proxy.call("SetControl", Id=control_id, Value=float(value), Source=self._src(source)))
 
+    def _set_call(self, control_id: str, value: float, source: Optional[str] = None) -> tuple[str, str, dict]:
+        return (self.component_path, "SetControl", {"Id": control_id, "Value": float(value), "Source": self._src(source)})
+
+    def _forget_once(self, control_id: str) -> None:
+        key = control_id.lower()                 # FNames compare case-insensitively
+        for cid in [c for c in self._once if c.lower() == key]:
+            self._once.pop(cid, None)
+
     def set(self, control_id: str, value: Union[float, str], source: Optional[str] = None) -> bool:
         """
         Command a Continuous / Position / Velocity control (the surface clamps it to its range), or an Enum by
@@ -454,25 +480,36 @@ class ControlSurface:
         """Let go: a Continuous control springs back to its default, a Position control stops holding. False when
         there was nothing to release (or the robot has no such control in this mode)."""
         ok = as_bool(self._proxy.call("ReleaseControl", Id=control_id, Source=self._src(source)))
-        self._once.pop(control_id, None)
+        self._forget_once(control_id)
         return ok
 
-    def release_many(self, ids: Iterable[str], source: Optional[str] = None) -> None:
-        for cid in ids:
-            try:
-                self.release(cid, source)
-            except UnrealRemoteError as e:
-                logger.warning("release %s failed: %s", cid, e)
+    def release_many(self, ids: Iterable[str], source: Optional[str] = None) -> dict[str, bool]:
+        """Release several controls in one request (one per control without a batch route); never raises: a
+        release that failed is logged. Returns {id: released}."""
+        ids = list(dict.fromkeys(ids))
+        if not ids:
+            return {}
+        src = self._src(source)
+        results = self.ue.call_many([(self.component_path, "ReleaseControl", {"Id": cid, "Source": src}) for cid in ids])
+        out: dict[str, bool] = {}
+        for cid, r in zip(ids, results):
+            self._forget_once(cid)
+            if isinstance(r, Exception):
+                logger.warning("release %s failed: %s", cid, r)
+                out[cid] = False
+            else:
+                out[cid] = as_bool(r)
+        return out
 
     def release_once(self) -> list[str]:
-        """Release every Continuous control set once (set(), drive(once=True)) and not released since. Returns
-        their ids."""
+        """Release every Continuous control set once and not released since (set(), drive(once=True),
+        hold(release=False), KeepAlive.stop(release=False)). Returns their ids."""
         held = dict(self._once)
+        by_source: dict[str, list[str]] = {}
         for cid, source in held.items():
-            try:
-                self.release(cid, source)
-            except UnrealRemoteError as e:
-                logger.warning("release %s failed: %s", cid, e)
+            by_source.setdefault(source, []).append(cid)
+        for source, ids in by_source.items():
+            self.release_many(ids, source)
         return list(held)
 
     # ── reads ───────────────────────────────────────────────────────
@@ -544,6 +581,10 @@ class ControlSurface:
         control keeps acting, so it is remembered for release_once() / exit. Returns how many times they were sent;
         sends the robot refused (another source holds the control, or this drive mode does not take it) are
         counted in last_hold_refused ({id: n}) and logged. Enum values may be labels.
+
+        Each round is one request (``UnrealRemote.call_many``), so every control is refreshed every round however
+        many there are. A round slower than the 0.3 s a command holds -- an engine at a low frame rate, or a sim
+        without the batch route sending one request per control -- is warned about (once), with its request count.
         """
         if rate <= 0:
             raise ValueError("rate must be > 0")
@@ -552,14 +593,20 @@ class ControlSurface:
         resolved = self._resolve(values)
         refused: dict[str, int] = {}
         self.last_hold_refused = refused
+        warned = _RoundWarnings(self.robot_name)
         period, n, t0 = 1.0 / rate, 0, time.monotonic()
         try:
             while True:
                 elapsed = time.monotonic() - t0
                 if elapsed >= seconds or (should_stop is not None and should_stop()):
                     break
-                for cid, v in resolved.items():
-                    if not self._set_raw(cid, v, source):
+                t_round = time.monotonic()
+                results = self.ue.call_many([self._set_call(cid, v, source) for cid, v in resolved.items()])
+                warned.check(len(resolved), self.ue, time.monotonic() - t_round)
+                for cid, r in zip(resolved, results):
+                    if isinstance(r, Exception):
+                        raise r
+                    if not as_bool(r):
                         refused[cid] = refused.get(cid, 0) + 1
                 n += 1
                 if on_tick is not None:
@@ -571,10 +618,7 @@ class ControlSurface:
             if release:
                 self.release_many(resolved, source)
             else:
-                for cid in resolved:
-                    a = self.describe().axis(cid)
-                    if a is not None and a.is_continuous:
-                        self._once[cid] = self._src(source)
+                self._remember_once(resolved, source)
             if refused:
                 logger.warning("%s refused %s", self.robot_name,
                                ", ".join(f"{cid} {k} of {n} sends" for cid, k in refused.items()))
@@ -588,6 +632,13 @@ class ControlSurface:
                 time.sleep(2); ka.update({"drive.turn": 0.5}); time.sleep(1)
         """
         return KeepAlive(self, values or {}, rate=rate, source=source)
+
+    def _remember_once(self, ids: Iterable[str], source: Optional[str] = None) -> None:
+        """Left acting: the Continuous ones among `ids` are released by release_once() / at exit."""
+        for cid in ids:
+            a = self.describe().axis(cid)
+            if a is not None and a.is_continuous:
+                self._once[a.id] = self._src(source)
 
     def _resolve(self, values: dict[str, Union[float, str]]) -> dict[str, float]:
         out: dict[str, float] = {}
@@ -631,8 +682,11 @@ class ControlSurface:
                 raise ValueError("drive() needs seconds= (held, then released) or once=True (a single command: it "
                                  "springs back after 0.3 s on a sim with the deadman, older sims keep it until stop())")
             ok = False
-            for cid, v in values.items():
-                if self._set_raw(cid, v, source):
+            results = self.ue.call_many([self._set_call(cid, v, source) for cid, v in values.items()])
+            for cid, r in zip(values, results):
+                if isinstance(r, Exception):
+                    raise r
+                if as_bool(r):
                     ok = True
                     self._once[cid] = self._src(source)
             return ok
@@ -642,41 +696,82 @@ class ControlSurface:
     def stop(self, source: Optional[str] = None) -> None:
         """Release the drive controls (the robot comes to rest under local input, if any). drive.strafe is released
         too whether or not the cached description has it: another client may have switched to a holonomic mode."""
-        ids = [cid for cid in DRIVE_IDS]
-        for cid in ids:
-            try:
-                self.release(cid, source)
-            except UnrealRemoteError as e:
-                logger.warning("release %s failed: %s", cid, e)
+        self.release_many(DRIVE_IDS, source)
+
+
+class _RoundWarnings:
+    """Says once per hold / keep-alive when its rounds are too slow for the 0.3 s a command holds."""
+
+    def __init__(self, who: str):
+        self.who = who
+        self.slow = False
+        self.unbatched = False
+
+    def check(self, controls: int, ue: UnrealRemote, seconds: float, reads: int = 0) -> None:
+        requests = 1 if (controls + reads) <= 1 or getattr(ue, "batch_supported", None) is not False else controls + reads
+        if requests > 1 and controls > 1 and not self.unbatched:
+            self.unbatched = True
+            logger.warning("%s: the engine has no usable Remote Control batch: %d controls go out as %d requests a "
+                           "round, so each is refreshed only every %d engine frames -- past the %.1f s a command holds "
+                           "at a low frame rate", self.who, controls, requests, requests, EXTERNAL_HOLD_SECONDS)
+        if seconds > EXTERNAL_HOLD_SECONDS and not self.slow:
+            self.slow = True
+            logger.warning("%s: a round of %d request(s) for %d control(s) took %.2f s, longer than the %.1f s a "
+                           "command holds: the controls lapse between rounds (a slow engine frame rate?)",
+                           self.who, requests, controls, seconds, EXTERNAL_HOLD_SECONDS)
+
+
+@dataclass
+class SendGate:
+    """
+    A condition a KeepAlive's sender checks itself, in the same request as each round of sends -- read in the same
+    engine frame as the sends land -- instead of relying on another thread to pause it in time.
+
+    calls: (object_path, function, params) read every round; allows(results) gets their ReturnValues in order (an
+    UnrealRemoteError for a read that failed never reaches it: a failed read says no) and returns whether sending
+    is allowed. A round whose reads say no releases what the keep-alive holds at once and sends nothing more until a
+    later round's reads say yes; the round after that sends again. So at most one round of sends lands after the
+    condition turns false, and it is released in the next request.
+    """
+    calls: list[tuple[str, str, Optional[dict]]]
+    allows: Callable[[list[Any]], bool]
+    what: str = ""
 
 
 class KeepAlive:
     """
     Re-sends a set of control values at a fixed rate on a background thread (see ControlSurface.keep_alive), and
-    releases them when stopped. The sender releases them itself as its last act, so a release can never be
-    followed by a late send; pause() releases and stops sending until resume(). Every started KeepAlive is stopped
-    at interpreter exit (release_all). Sends the robot refused are counted in `refused` ({id: n}).
+    releases them when stopped. Each round is one request (UnrealRemote.call_many). The sender releases them itself
+    as its last act, so a release can never be followed by a late send; pause() releases and stops sending until
+    resume(). With a `gate` (SendGate) the sender also reads a condition in each round's request and stops sending
+    -- releasing at once -- the moment it is false. Every started KeepAlive is stopped at interpreter exit
+    (release_all). Sends the robot refused are counted in `refused` ({id: n}).
     """
 
     def __init__(self, surface: ControlSurface, values: dict[str, float], rate: float = DEFAULT_HOLD_RATE,
-                 source: Optional[str] = None):
+                 source: Optional[str] = None, gate: Optional[SendGate] = None):
         if rate <= 0:
             raise ValueError("rate must be > 0")
         self.surface = surface
         self.rate = rate
         self.source = source
+        self.gate = gate
         self.sends = 0
         self.errors = 0
         self.refused: dict[str, int] = {}
+        self.gate_closed = 0                    # rounds whose gate reads said no
         self._values = surface._resolve(values)
         self._touched: set[str] = set(self._values)
         self._lock = threading.Lock()           # the values
         self._send = threading.RLock()          # one send round, release or update at a time
         self._stop = threading.Event()
         self._paused = False
+        self._gate_open = gate is None          # a gated sender sends only after a round's reads said yes
+        self._holding = False                   # sent something not released since
         self._release_on_stop = True
         self._released = False
         self._thread: Optional[threading.Thread] = None
+        self._warnings = _RoundWarnings(f"keep-alive on {surface.component_path.rsplit('.', 1)[-1]}")
         # Long enough for a send already in flight to come back (the HTTP timeout), so stop() normally returns
         # with the release done.
         self.join_timeout = max(5.0, float(getattr(surface.ue, "timeout", 5.0)) + 1.0)
@@ -698,6 +793,11 @@ class KeepAlive:
     @property
     def paused(self) -> bool:
         return self._paused
+
+    @property
+    def gate_open(self) -> bool:
+        """The last round's gate reads allowed sending (always True without a gate)."""
+        return self._gate_open
 
     def update(self, values: dict[str, float], replace: bool = False) -> None:
         """Change what is sent (merged into the current values, or replacing them). Controls dropped by
@@ -723,30 +823,78 @@ class KeepAlive:
         with self._send:
             self._paused = True
             if release:
-                self.surface.release_many(sorted(self._touched), self.source)
+                self._release_now()
 
     def resume(self) -> None:
         with self._send:
             self._paused = False
 
+    def _release_now(self) -> None:
+        self.surface.release_many(sorted(self._touched), self.source)
+        self._holding = False
+
+    def _judge(self, got: list[Any]) -> bool:
+        if any(isinstance(r, Exception) for r in got):
+            for r in got:
+                if isinstance(r, Exception):
+                    logger.warning("keep-alive: %s could not be read (%s): not sending", self.gate.what or "its gate", r)
+            return False
+        try:
+            return bool(self.gate.allows(got))
+        except Exception as e:                  # a gate that cannot judge says no
+            logger.warning("keep-alive: %s: %s: not sending", self.gate.what or "its gate", e)
+            return False
+
+    def _count(self, values: dict[str, float], sent: list[Any]) -> None:
+        for cid, r in zip(values, sent):
+            if isinstance(r, Exception):
+                self.errors += 1
+                logger.warning("keep-alive %s: %s", cid, r)
+            elif not as_bool(r):
+                n = self.refused.get(cid, 0) + 1
+                self.refused[cid] = n
+                if n == 1:
+                    logger.warning("keep-alive %s: refused by the robot (another source holds it, or this "
+                                   "drive mode does not take it)", cid)
+
     def _round(self) -> None:
         with self._send:
-            if self._paused:
+            if self._paused or self._stop.is_set():
                 return
-            for cid, v in self.values.items():
-                if self._stop.is_set() or self._paused:
+            ue = self.surface.ue
+            values = self.values
+            sets = [self.surface._set_call(cid, v, self.source) for cid, v in values.items()]
+            gate = self.gate
+            t = time.monotonic()
+            if gate is None:
+                if not sets:
                     return
-                try:
-                    if not self.surface._set_raw(cid, v, self.source):
-                        n = self.refused.get(cid, 0) + 1
-                        self.refused[cid] = n
-                        if n == 1:
-                            logger.warning("keep-alive %s: refused by the robot (another source holds it, or this "
-                                           "drive mode does not take it)", cid)
-                except UnrealRemoteError as e:
-                    self.errors += 1
-                    logger.warning("keep-alive %s: %s", cid, e)
-            self.sends += 1
+                sent = ue.call_many(sets)
+                reads = 0
+            else:
+                reads = len(gate.calls)
+                sending = self._gate_open and bool(sets)
+                if ue.batch_supported is True:
+                    # The reads and the sends in one request: one engine frame.
+                    results = ue.call_many(list(gate.calls) + (sets if sending else []))
+                    got, sent = results[:reads], results[reads:]
+                    ok = self._judge(got)
+                else:
+                    # Not known to batch: read first, send only on a yes (and learn whether batches work).
+                    got = ue.call_many(list(gate.calls), force_batch=True)
+                    ok = self._judge(got)
+                    sent = ue.call_many(sets) if sending and ok else []
+            self._warnings.check(len(sent), ue, time.monotonic() - t, reads=reads)
+            if sent:
+                self._holding = True
+                self._count(values, sent)
+                self.sends += 1
+            if gate is not None:
+                if not ok:
+                    self.gate_closed += 1
+                    if self._holding:
+                        self._release_now()
+                self._gate_open = ok
 
     def _run(self) -> None:
         period = 1.0 / self.rate
@@ -762,12 +910,14 @@ class KeepAlive:
     def _release(self) -> None:
         with self._send:
             if not self._released:
-                self.surface.release_many(sorted(self._touched), self.source)
+                self._release_now()
                 self._released = True
 
     def stop(self, release: bool = True) -> None:
         """Stop sending and (release=True) release every control this keep-alive sent. Waits up to join_timeout
-        for a send in flight; if the engine is slower than that, the sender releases when its call returns."""
+        for a send in flight; if the engine is slower than that, the sender releases when its call returns.
+        release=False leaves them as they are; the Continuous ones it was holding are then released by
+        ControlSurface.release_once() / at interpreter exit, as a single set() is."""
         self._release_on_stop = release
         self._stop.set()
         t = self._thread
@@ -780,6 +930,8 @@ class KeepAlive:
                 self._thread = None
         elif t is None and release:
             self._release()
+        if not release and self._holding:
+            self.surface._remember_once(sorted(self._touched), self.source)
         _LIVE_KEEPALIVES.discard(self)
 
     def __enter__(self) -> "KeepAlive":

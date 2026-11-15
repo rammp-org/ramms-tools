@@ -127,13 +127,17 @@ class FakeComponent:
     def __init__(self, responses: dict, handlers: dict[str, Callable[[dict], dict]] | None = None):
         self.responses = copy.deepcopy(responses)
         self.handlers = dict(handlers or {})
+        self.last: dict[str, Any] = {}       # function -> its last answer (the curb's phase, for the selector)
 
     def __call__(self, func: str, p: dict) -> dict:
         if func in self.handlers:
-            return self.handlers[func](p)
-        if func in self.responses:
-            return copy.deepcopy(self.responses[func])
-        raise UnrealRemoteError(f"HTTP 400: Function {func} not found")
+            out = self.handlers[func](p)
+        elif func in self.responses:
+            out = copy.deepcopy(self.responses[func])
+        else:
+            raise UnrealRemoteError(f"HTTP 400: Function {func} not found")
+        self.last[func] = out
+        return out
 
 
 class FakeRemote(UnrealRemote):
@@ -145,7 +149,9 @@ class FakeRemote(UnrealRemote):
         self.actor_classes: dict[str, str] = {}
         self.objects: dict[str, Callable] = {}      # bridge CDOs / any object path -> handler
         self.calls: list[tuple[str, str, dict]] = []
+        self.requests: list[tuple[str, int]] = []   # (endpoint, calls in it) per HTTP request, in order
         self.bridge_down = False                    # RammsCoreBridge refuses (not allow-listed / not loaded)
+        self.batch_route = True                     # False: /remote/batch answers 404, as an engine without it
 
     def add_actor(self, name: str, components: dict[str, tuple[str, Callable]] | None = None, cls: str = "",
                   handler: Callable | None = None) -> str:
@@ -164,9 +170,32 @@ class FakeRemote(UnrealRemote):
 
     def _request(self, method: str, endpoint: str, body: dict | None = None) -> Any:
         if endpoint == "/remote/info":
+            self.requests.append((endpoint, 0))
             return {"HttpRoutes": []}
+        if endpoint == "/remote/batch" and self.batch_route:
+            return self._batch(body)
         if endpoint != "/remote/object/call":
             raise UnrealRemoteError(f"HTTP 404 on {method} {endpoint}")
+        self.requests.append((endpoint, 1))
+        return self._object_call(body)
+
+    def _batch(self, body: dict) -> dict:
+        """/remote/batch as the engine answers it: each wrapped request run in order, its HTTP code and body."""
+        reqs = body["Requests"]
+        self.requests.append(("/remote/batch", len(reqs)))
+        out = []
+        for r in reqs:
+            assert r["URL"] == "/remote/object/call" and r["Verb"] == "PUT", r
+            try:
+                out.append({"RequestId": r["RequestId"], "ResponseCode": 200, "ResponseBody": self._object_call(r["Body"])})
+            except UnrealRemoteError as e:
+                out.append({"RequestId": r["RequestId"], "ResponseCode": 400, "ResponseBody": {"errorMessage": str(e)}})
+        return {"Responses": out}
+
+    def requests_since(self, n: int) -> list[tuple[str, int]]:
+        return self.requests[n:]
+
+    def _object_call(self, body: dict) -> Any:
         path, func, params = body["objectPath"], body["functionName"], body.get("parameters", {})
         self.calls.append((path, func, params))
         if path == CORE_BRIDGE:
@@ -184,9 +213,14 @@ class FakeRemote(UnrealRemote):
 
     def _core_bridge(self, func: str, p: dict) -> dict:
         if func == "FindActorsByComponent":
+            # As URammsCoreBridge: the FIRST component per actor whose class or name contains the filter.
             f = p["ComponentFilter"].lower()
-            return {"ReturnValue": [f"{a}|{n}:{cls}" for a, comps in self.actors.items()
-                                    for n, (cls, _) in comps.items() if f in cls.lower() or f in n.lower()]}
+            out = []
+            for a, comps in self.actors.items():
+                hit = next(((n, cls) for n, (cls, _) in comps.items() if f in cls.lower() or f in n.lower()), None)
+                if hit is not None:
+                    out.append(f"{a}|{hit[0]}:{hit[1]}")
+            return {"ReturnValue": out}
         if func == "FindComponents":
             comps = self.actors.get(p["ActorPath"], {})
             f = p.get("ClassNameFilter", "").lower()
@@ -199,8 +233,17 @@ class FakeRemote(UnrealRemote):
         raise UnrealRemoteError(f"HTTP 400: no bridge function {func}")
 
 
+_NOT_CROSSING = {"Idle", "Done", "Aborted", "Faulted"}
+
+
 class ModeSelector(FakeComponent):
-    """The drive-mode selector, switching at once (or after `switch_polls` polls of IsSwitchingMode)."""
+    """
+    The drive-mode selector, switching at once (or after `switch_polls` polls of IsSwitchingMode).
+
+    As on the robot, a curb crossing runs in the "curb" mode: while the curb controller's last answered phase is a
+    crossing under way, the active mode is "curb" (the controller selected it when it started), unless
+    `curb_pending` -- the selector still waiting to hand over to it, the robot still in its previous mode.
+    """
 
     def __init__(self, responses: dict, switch_polls: int = 0, refuse: set[str] | None = None):
         super().__init__(responses)
@@ -211,9 +254,20 @@ class ModeSelector(FakeComponent):
         self.switch_polls = switch_polls
         self.refuse = refuse or set()
         self.status = responses["GetSwitchStatus"]["ReturnValue"]
-        self.handlers.update(SetActiveMode=self._set, GetActiveModeId=lambda p: {"ReturnValue": self.active},
+        self.curb: FakeComponent | None = None      # the curb controller (robot_world links it)
+        self.curb_pending = False
+        self.handlers.update(SetActiveMode=self._set, GetActiveModeId=lambda p: {"ReturnValue": self.active_now()},
                              IsSwitchingMode=self._switching, GetSwitchStatus=lambda p: {"ReturnValue": self.status},
                              CycleMode=self._cycle)
+
+    def crossing(self) -> bool:
+        if self.curb is None or "GetPhase" not in self.curb.last:
+            return False
+        ph = str(self.curb.last["GetPhase"].get("ReturnValue", "Idle")).rsplit("::", 1)[-1]
+        return ph not in _NOT_CROSSING
+
+    def active_now(self) -> str:
+        return "curb" if self.crossing() and not self.curb_pending and "curb" in self.ids else self.active
 
     def _set(self, p):
         m = p["ModeId"]
@@ -269,5 +323,9 @@ def robot_world(gen: str = "gen1", name: str | None = None, deadman: bool = True
         if "GetPhase" in table:
             handler.responses.setdefault("Abort", {})          # void: an empty response
         comps[comp] = (cls, handler)
+    handlers = {n: h for n, (_, h) in comps.items()}
+    selector = handlers.get("DriveModeSelector")
+    if isinstance(selector, ModeSelector):
+        selector.curb = next((h for h in handlers.values() if isinstance(h, FakeComponent) and "GetPhase" in h.responses), None)
     path = ue.add_actor(name or surface["robotName"], comps)
-    return ue, path, {n: h for n, (_, h) in comps.items()}
+    return ue, path, handlers

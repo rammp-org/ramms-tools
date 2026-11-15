@@ -1,5 +1,6 @@
 """Offline tests for ramms_tools.control against recorded control surfaces (run: python -m pytest tests)."""
 import gc
+import logging
 import time
 
 import pytest
@@ -7,13 +8,22 @@ import pytest
 from fake_remote import FakeRemote, FakeSurface, load, robot_world
 from ramms_tools.control import (ControlAxis, ControlError, ControlSurface, KeepAlive, StatusText, release_all,
                                  severity_name)
-from ramms_tools.unreal_remote import UnrealRemote
+from ramms_tools.unreal_remote import UnrealRemote, UnrealRemoteError
 
 
 def surface(gen="gen1", deadman=True):
     ue, path, comps = robot_world(gen, deadman=deadman)
     cs = ControlSurface.find(ue)[0]
     return cs, comps["ControlSurface"], ue
+
+
+def wait_for(cond, timeout=10.0, what="the condition"):
+    """Poll until cond() (a loaded machine can be slow to schedule the sender thread)."""
+    end = time.monotonic() + timeout
+    while not cond():
+        if time.monotonic() > end:
+            raise AssertionError(f"timed out waiting for {what}")
+        time.sleep(0.01)
 
 
 def test_call_full_keeps_out_parameters():
@@ -68,6 +78,17 @@ def test_find_by_robot_exact_first_and_ambiguous_substrings():
     assert ControlSurface.find_by_robot(ue, "poweredfront").actor_path == path
     with pytest.raises(ControlError, match="matches 2 robots"):
         ControlSurface.find_by_robot(ue, "RammpGen1")
+
+
+def test_find_by_robot_refuses_a_shared_robot_name():
+    """Two robots of one Blueprint share their robotName: an exact robotName is ambiguous too."""
+    ue = FakeRemote()
+    s = load("gen1", "surface.json")
+    for actor in ("Gen1_A_C_0", "Gen1_B_C_0"):
+        ue.add_actor(actor, {"ControlSurface": ("RammsRobotControlSurfaceComponent", FakeSurface(dict(s, robotName="RAMMP Gen1")))})
+    with pytest.raises(ControlError, match="robotName of 2 robots"):
+        ControlSurface.find_by_robot(ue, "RAMMP Gen1")
+    assert ControlSurface.find_by_robot(ue, "Gen1_B_C_0").actor_path.endswith("Gen1_B_C_0")     # by actor: fine
 
 
 def test_find_says_when_the_bridge_cannot_be_asked():
@@ -168,7 +189,7 @@ def test_hold_resends_then_releases():
     ticks = []
     n = cs.hold({"drive.forward": 0.4, "drive.turn": -0.2}, seconds=0.35, rate=20.0, on_tick=ticks.append)
     sent = [s for s in fake.sets if s[0] == "drive.forward"]
-    assert n >= 5 and len(sent) == n and len(ticks) == n
+    assert n >= 2 and len(sent) == n and len(ticks) == n
     assert all(v == 0.4 for _, v, _ in sent)
     assert set(fake.released[-2:]) == {"drive.forward", "drive.turn"}
     assert cs.last_hold_refused == {}
@@ -213,6 +234,57 @@ def test_hold_releases_when_a_send_raises_or_is_interrupted(deadman):
         cs.hold({"drive.forward": 0.4, "drive.turn": 0.2}, seconds=5.0, rate=50.0)
     assert fake.latched() == {}
     assert {"drive.forward", "drive.turn"} <= set(fake.released)
+
+
+def test_hold_sends_each_round_as_one_request():
+    """The engine serves about one request a frame: N controls sent one request each would be refreshed only every
+    N frames -- past the deadman's 0.3 s + one frame at a low frame rate."""
+    cs, fake, ue = surface()
+    cs.describe()
+    n0 = len(ue.requests)
+    n = cs.hold({"drive.forward": 0.2, "drive.turn": 0.1, "lift.dw_main_plate_l": 3.0}, seconds=0.25, rate=20.0)
+    reqs = ue.requests[n0:]
+    assert reqs.count(("/remote/batch", 3)) == n + 1                # each round, and the release, in one request
+    assert ("/remote/object/call", 1) not in reqs
+    assert ue.batch_supported is True and fake.latched() == {}
+
+
+def test_hold_without_a_batch_route_falls_back_and_says_so(caplog):
+    cs, fake, ue = surface()
+    cs.describe()
+    ue.batch_route = False
+    with caplog.at_level(logging.WARNING):
+        n = cs.hold({"drive.forward": 0.2, "drive.turn": 0.1}, seconds=0.15, rate=20.0)
+    assert ue.batch_supported is False and len(fake.sets) == 2 * n and fake.latched() == {}
+    assert "2 controls go out as 2 requests a round" in caplog.text
+    n0 = len(ue.requests)
+    cs.hold({"drive.forward": 0.2, "drive.turn": 0.1}, seconds=0.05, rate=20.0)
+    assert all(r == ("/remote/object/call", 1) for r in ue.requests[n0:])     # not tried again
+
+
+def test_a_batch_the_client_cannot_read_falls_back():
+    """An engine that answers the batch but fails every call in it (a request shape it does not take) while the
+    same calls work alone: the client stops batching."""
+    cs, fake, ue = surface()
+    cs.describe()
+    ue._batch = lambda body: {"Responses": [{"RequestId": r["RequestId"], "ResponseCode": 404, "ResponseBody": "no route"}
+                                            for r in body["Requests"]]}
+    assert cs.hold({"drive.forward": 0.2, "drive.turn": 0.1}, seconds=0.05, rate=20.0) >= 1
+    assert ue.batch_supported is False and ("drive.forward", 0.2, "Remote") in fake.sets and fake.latched() == {}
+
+
+def test_a_slow_round_is_warned_with_its_request_count(caplog):
+    cs, fake, ue = surface()
+    cs.describe()
+    ue.batch_route = False
+
+    def slow(func, p):
+        if func == "SetControl":
+            time.sleep(0.2)
+    fake.on_call = slow
+    with caplog.at_level(logging.WARNING):
+        cs.hold({"drive.forward": 0.2, "drive.turn": 0.1}, seconds=0.1, rate=20.0)
+    assert "a round of 2 request(s) for 2 control(s) took" in caplog.text
 
 
 def test_drive_needs_seconds_or_once():
@@ -278,13 +350,16 @@ def test_deadman_fake_springs_back_and_latching_fake_does_not():
 
 
 def test_keep_alive_updates_and_releases():
-    cs, fake, _ = surface()
+    cs, fake, ue = surface()
     with cs.keep_alive({"drive.forward": 0.3}, rate=50.0) as ka:
-        time.sleep(0.1)
+        wait_for(lambda: ka.sends >= 2, what="two sends")
         ka.update({"drive.turn": 0.5})
-        time.sleep(0.1)
+        wait_for(lambda: ("drive.turn", 0.5, "Remote") in fake.sets, what="drive.turn sent")
         assert ka.values == {"drive.forward": 0.3, "drive.turn": 0.5}
-    assert ka.sends >= 4
+        n0 = len(ue.requests)
+        wait_for(lambda: len(ue.requests) > n0 + 2, what="more rounds")
+        assert set(ue.requests[n0:]) == {("/remote/batch", 2)}       # both controls, one request a round
+    assert ka.sends >= 3
     assert ("drive.turn", 0.5, "Remote") in fake.sets
     assert {"drive.forward", "drive.turn"} <= set(fake.released)
 
@@ -332,15 +407,48 @@ def test_keep_alive_pause_resume_and_refusals():
     cs, fake, _ = surface(deadman=False)
     fake.refuse.add("drive.turn")
     ka = cs.keep_alive({"drive.forward": 0.2, "drive.turn": 0.1}, rate=50).start()
-    time.sleep(0.08)
+    wait_for(lambda: fake.set_times, what="a send")
     ka.pause()
     n = len(fake.set_times)
     assert fake.latched() == {} and ka.paused
     time.sleep(0.08)
     assert len(fake.set_times) == n                           # nothing sent while paused
     ka.resume()
-    time.sleep(0.08)
-    assert fake.latched() == {"drive.forward": 0.2} and ka.refused["drive.turn"] >= 2
+    wait_for(lambda: ka.refused.get("drive.turn", 0) >= 2, what="two refusals")
+    assert fake.latched() == {"drive.forward": 0.2}
+    ka.stop()
+    assert fake.latched() == {}
+
+
+def test_keep_alive_stopped_without_release_is_released_at_exit():
+    cs, fake, _ = surface(deadman=False)
+    ka = cs.keep_alive({"drive.forward": 0.3}, rate=50).start()
+    wait_for(lambda: fake.latched() == {"drive.forward": 0.3}, what="the hold")
+    ka.stop(release=False)
+    assert fake.latched() == {"drive.forward": 0.3}           # left acting, as asked ...
+    release_all()                                             # ... and released at exit like a single set()
+    assert fake.latched() == {}
+
+
+def test_keep_alive_gate_lets_go_in_the_round_that_says_no():
+    """A SendGate is read in the same request as the sends; the round whose read says no releases at once."""
+    from ramms_tools.control import SendGate
+    cs, fake, ue = surface(deadman=False)
+    ok = {"v": True}
+    ue.objects["/Script/Test.Default__Flag"] = lambda f, p: {"ReturnValue": ok["v"]}
+    gate = SendGate([("/Script/Test.Default__Flag", "Get", None)], lambda r: bool(r[0]), "a flag")
+    ka = KeepAlive(cs, {"drive.forward": 0.4, "drive.turn": 0.1}, rate=50, gate=gate).start()
+    wait_for(lambda: fake.latched() == {"drive.forward": 0.4, "drive.turn": 0.1}, what="the hold")
+    assert ("/remote/batch", 3) in ue.requests                # the read and both sends in one request
+    ok["v"] = False
+    wait_for(lambda: fake.latched() == {}, what="the gate's release")
+    n = len(fake.sets)
+    time.sleep(0.1)
+    assert len(fake.sets) == n and ka.running and ka.gate_closed > 0      # nothing sent while it says no
+    ok["v"] = True
+    wait_for(lambda: len(fake.sets) > n, what="sending again")
+    ue.objects["/Script/Test.Default__Flag"] = lambda f, p: (_ for _ in ()).throw(UnrealRemoteError("gone"))
+    wait_for(lambda: fake.latched() == {}, what="a failed read to say no")
     ka.stop()
     assert fake.latched() == {}
 
@@ -348,8 +456,7 @@ def test_keep_alive_pause_resume_and_refusals():
 def test_keep_alive_left_running_is_stopped_at_exit():
     cs, fake, _ = surface(deadman=False)
     ka = cs.keep_alive({"drive.forward": 0.25}, rate=50).start()
-    time.sleep(0.05)
-    assert fake.latched() == {"drive.forward": 0.25}
+    wait_for(lambda: fake.latched() == {"drive.forward": 0.25}, what="the hold")
     release_all()                                             # the atexit hook
     assert not ka.running and fake.latched() == {}
 

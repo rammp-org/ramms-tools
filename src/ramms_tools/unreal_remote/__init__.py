@@ -67,6 +67,10 @@ class UnrealRemoteError(Exception):
     pass
 
 
+class _BatchUnreadable(Exception):
+    """The /remote/batch request failed, or came back in a shape call_many does not read."""
+
+
 class RemoteObjectProxy:
     """
     Proxy for a remote UObject. Attribute access and method calls are
@@ -150,6 +154,9 @@ class UnrealRemote:
                  timeout: float = 5.0, ui_bridge: Optional[str] = None):
         self.base_url = f"http://{host}:{http_port}"
         self.timeout = timeout
+        # call_many: None until a batch has been sent, True when the engine answers them, False to send one request
+        # per call (no batch route, or answers this client does not read).
+        self.batch_supported: Optional[bool] = None
         if ui_bridge is not None:
             self.ramms_ui_bridge = ui_bridge
 
@@ -533,6 +540,100 @@ class UnrealRemote:
         if isinstance(result, dict):
             return result.get("Responses", [])
         return result if isinstance(result, list) else []
+
+    def call_many(self, calls: list[tuple[str, str, Optional[dict]]], full: bool = False,
+                  force_batch: bool = False) -> list[Any]:
+        """
+        Several function calls in one ``/remote/batch`` request: the engine
+        runs them in order, in one frame. ``calls`` are ``(object_path,
+        function_name, parameters)``. Returns one entry per call: its
+        ReturnValue (the whole response with full=True, as call_full), or the
+        UnrealRemoteError it failed with -- returned, not raised, so the other
+        calls' results are kept.
+
+        Falls back to one request per call when the engine has no batch route,
+        or answers it in a shape this client does not read (every call failed
+        in the batch but not alone); ``batch_supported`` then stays False and
+        later calls go one at a time without trying again. A single call is
+        sent on its own unless force_batch (which a caller uses to learn
+        whether batches work before it relies on one).
+        """
+        calls = [(p, f, prm or None) for p, f, prm in calls]
+        if not calls:
+            return []
+        if self.batch_supported is False or (len(calls) == 1 and not (force_batch and self.batch_supported is None)):
+            return self._call_each(calls, full)
+        try:
+            results = self._batch_calls(calls, full)
+        except _BatchUnreadable as e:
+            results = None
+            why = str(e)
+        if results is not None and not all(isinstance(r, UnrealRemoteError) for r in results):
+            self.batch_supported = True
+            return results
+        if results is not None:
+            why = f"every call failed in the batch ({results[0]})"
+        singles = self._call_each(calls, full)
+        if not all(isinstance(r, UnrealRemoteError) for r in singles):
+            if self.batch_supported is not False:
+                logger.warning("Remote Control batch not usable (%s): sending calls one request each", why)
+            self.batch_supported = False
+        return singles
+
+    def _call_each(self, calls: list[tuple[str, str, Optional[dict]]], full: bool) -> list[Any]:
+        out: list[Any] = []
+        for path, func, params in calls:
+            try:
+                out.append(self._call_function(path, func, params, full=full))
+            except UnrealRemoteError as e:
+                out.append(e)
+        return out
+
+    def _batch_calls(self, calls: list[tuple[str, str, Optional[dict]]], full: bool) -> list[Any]:
+        requests = []
+        for i, (path, func, params) in enumerate(calls):
+            body: dict[str, Any] = {"objectPath": path, "functionName": func}
+            if params:
+                body["parameters"] = params
+            requests.append({"RequestId": i, "URL": "/remote/object/call", "Verb": "PUT", "Body": body})
+        try:
+            result = self._request("PUT", "/remote/batch", {"Requests": requests})
+        except UnrealRemoteError as e:
+            raise _BatchUnreadable(str(e)) from e
+        responses = result.get("Responses") if isinstance(result, dict) else None
+        if not isinstance(responses, list):
+            raise _BatchUnreadable(f"no Responses in {str(result)[:200]}")
+        by_id: dict[int, dict] = {}
+        for r in responses:
+            if isinstance(r, dict):
+                try:
+                    by_id[int(r.get("RequestId", -1))] = r
+                except (TypeError, ValueError):
+                    pass
+        out: list[Any] = []
+        for i, (path, func, _) in enumerate(calls):
+            r = by_id.get(i)
+            if r is None:
+                raise _BatchUnreadable(f"no response for request {i}")
+            body = r.get("ResponseBody")
+            if isinstance(body, str):
+                try:
+                    body = json.loads(body) if body.strip() else {}
+                except ValueError:
+                    pass
+            try:
+                code = int(r.get("ResponseCode", 200))
+            except (TypeError, ValueError):
+                code = 200
+            if not 200 <= code < 300:
+                out.append(UnrealRemoteError(f"HTTP {code} on PUT /remote/object/call ({func} on {path}): {body}"))
+            elif full:
+                out.append(body if body is not None else {})
+            elif isinstance(body, dict) and "ReturnValue" in body:
+                out.append(body["ReturnValue"])
+            else:
+                out.append(body if body is not None else {})
+        return out
 
     # ── Low-level operations ────────────────────────────────────────
 
