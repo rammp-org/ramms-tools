@@ -30,8 +30,9 @@ pip install -e '.[exr]'
   and used on development machines; nothing here requires it.
 - Unreal Engine running with the **Remote Control API** plugin enabled (default port 30010)
   - UE 5.6+ refuses remote function calls that are not allow-listed; the RAMMS project ships
-    `Config/DefaultRemoteControl.ini` listing the bridges, robot components and engine getters
-    these tools call. Add an entry there when you call something new.
+    `Config/DefaultRemoteControl.ini` listing the bridges, robot-component functions and engine
+    getters these tools call (see [Remote Control allow-list](#remote-control-allow-list)). Add an
+    entry there when you call something new.
 - For robot control: the **RammsCore** plugin with `URammsCoreBridge`
 - For any robot's controls, drive modes and curb crossing (`ramms_tools.control`, `ramms_tools.robot`,
   `ramms-control`, `ramms-curb`): a pawn with a `URammsRobotControlSurfaceComponent` (RammsCore)
@@ -98,7 +99,7 @@ robot.drive(forward=0.2, strafe=0.3, seconds=2)     # drive.strafe exists in hol
 
 curb = robot.curb                             # Gen1Curb or Gen2Curb, chosen by component class
 print(curb.phase(), curb.status_line())       # 'Idle', StatusText('Ready', 'Info')
-run = curb.cross(forward=0.5, on_event=print) # start, hold the stick while it runs; run.succeeded, run.reason, run.stats
+run = curb.cross(on_event=print)              # start, hold the stick (full) while it runs; run.succeeded, run.reason, run.stats
 if robot.generation == "gen2":
     d = curb.detect_step_ahead()              # Detection(found, reason, profile=CurbProfile(step_height_cm, ...))
     print(curb.plan(), curb.measured_tilt(), curb.stability_margin())
@@ -109,14 +110,25 @@ A crossing moves only while the rider's stick (`drive.forward`) is held
 forward; let go, it pauses. `cross()` starts it -- the controller selects the
 `curb` drive mode itself; do not select that mode by hand first, which starts
 (or, with nothing to cross, refuses and hands back) a crossing by itself -- and
-holds the stick at `forward` only while a poll sees the crossing under way. The
-moment it is Done, Aborted or Faulted the stick is released, before the drive
-mode the robot is handed back to could drive on it, and held again if a Gen2
-crossing retries a fault by itself. A Gen2 crossing goes at the stick's share
-of its planned speed, a Gen1 one at its planned speeds; 0.5 is twice the
-controllers' engage threshold. `wait_until_done(hold_forward=...)` does the
-waiting part on a crossing started otherwise. `CurbProfile` / `CurbTerrain`
-edits are sent as edited (`begin`, `check_feasibility`, `begin_on_terrain`).
+holds the stick at `forward` (default 1.0, full; 0.25..1.0, anything else is
+refused) only while the crossing is under way and the robot is in the `curb`
+drive mode. The stick's sender reads the phase and the drive mode in the same
+request as each send, so it lets go in the round that sees the crossing Done,
+Aborted or Faulted -- at most one send lands after the end, and it is released
+in the next request -- however long your `on_event` / `should_stop` callbacks
+take, and it does not drive the previous mode while the robot is still being
+handed over to the curb mode. It holds again if a Gen2 crossing retries a fault
+by itself (waited for while its status line says "Faulted, trying again"). A
+Gen2 crossing goes at the stick's share of its planned speed, a Gen1 one at its
+planned speeds once the stick is past the engage threshold (0.25).
+
+`cross()` does not take over a crossing it did not start -- the rider's, curb
+assist's or another client's: a Remote stick outranks the rider's own, who
+could then no longer pause or cancel it by letting go -- it returns a `CurbRun`
+with `already_running` set, unless `join=True`. `wait_until_done(hold_forward=...)`
+does the waiting part on a crossing started otherwise. `CurbProfile` /
+`CurbTerrain` edits are sent as edited (`begin`, `check_feasibility`,
+`begin_on_terrain`).
 
 #### Held commands: the deadman, and older sims that latch
 
@@ -130,10 +142,19 @@ touch) for 0.3 s after each send. A **Continuous** control (`drive.forward`,
 | older | **keeps doing the last command** until it is released, set again, or local input moves that control |
 
 So re-send held commands at >= 10 Hz -- `hold()`, `keep_alive()`,
-`drive(seconds=)` do -- and release them at the end. ramms-tools releases what
+`drive(seconds=)` do -- and release them at the end. Each round goes out as one
+Remote Control request (`/remote/batch`, via `UnrealRemote.call_many`): the
+engine serves about one request a frame, so N controls sent one request each
+would each be refreshed only every N frames, past the deadman's window at a low
+frame rate (an unfocused editor runs at a few frames a second). Without a batch
+route the client falls back to one request per control and says so; a round
+slower than 0.3 s is warned about with its request count. A `KeepAlive` can
+also read a condition with each round (`SendGate`) and let go the moment it is
+false. ramms-tools releases what
 it holds when a hold ends, raises or is interrupted; at interpreter exit it
 stops every running `KeepAlive` and releases every Continuous control set once
-(`ControlSurface.set`, `drive(once=True)`) that was not released
+(`ControlSurface.set`, `drive(once=True)`, `hold(release=False)`,
+`KeepAlive.stop(release=False)`) that was not released
 (`ramms_tools.control.release_all()`); the CLIs also do it on SIGINT, SIGTERM
 and SIGHUP. `drive()` without `seconds` raises: `once=True` sends a single
 command explicitly (an older sim keeps it until `stop()`). Nothing can release
@@ -180,9 +201,15 @@ Stream ids carry only the camera's name, and the Gen1 / Gen2 rigs and the
 `chair` preset all name theirs `front_camera`: pick a robot's camera by its
 actor (and channel), never by name alone -- `CameraStreams.from_sensor`, or
 `actor=` on `CameraStreams` / `CameraStreams.from_status` (which refuses a name
-several actors stream). Every camera frame's metadata names its `actor` and its
-capture `frame` number; `grab()` returns the newest complete capture.
-`StreamStatus.port` is None while the RMSS server is not running.
+several actors stream). A camera placed by hand can stream under its stream
+source's name: `from_sensor` / `from_status` take the stream ids the sim
+reports. Every camera frame's metadata names its `actor` and its capture
+`frame` number; `grab()` returns a `FrameSet` of one capture -- the newest
+complete one, or at the timeout the newest with the most roles, with
+`complete` False and `missing` naming the rest (never frames of two captures
+passed off as one set). `StreamStatus.port` is None while the RMSS server is
+not running. The server sends a connection no frames until it subscribes;
+`CameraStreams` and `ImuStream` subscribe on connect.
 
 Adding / removing sensors and starting streams need a play world (PIE or a
 game) on sims from the fix round; older sims keep a mount added in the editor
@@ -244,22 +271,36 @@ sensing.stop_imu_stream(robot.actor_path, "imu")
 `dropped` the samples lost before the oldest kept); the follower's and the
 stream's `dropped` count what was lost. Each sample has seq, sim_time,
 acceleration, angular velocity and angular acceleration (sensor frame), velocity
-and orientation (world).
+and orientation (world). An IMU stream's id is `imu/<actor name>/<target>` (the
+body's name for target `""`). Subscribe to a stream promptly (`ImuStream` does on
+connect): the sim stops one that no RMSS client has subscribed to for 30 s and
+frees its point. Sim limits: Remote Control callers get 32 of a world's 64
+tracked IMU points, a world runs at most 8 IMU streams, body / target names are
+at most 256 characters, a stream's port is clamped to 1..65535, and
+`ReadImuSamplesJson` returns complete samples only.
 
 ### Remote Control allow-list
 
-UE 5.6+ refuses calls to classes that are not allow-listed. Besides the
-bridges already listed in the RAMMS project's `Config/DefaultRemoteControl.ini`,
-these modules call:
+UE 5.6+ refuses remote function calls that are not allow-listed. The source of
+truth is the RAMMS project's `Config/DefaultRemoteControl.ini`: it allows the
+static bridges as whole classes, and on components and actors **only the
+functions** these tools call -- never a whole component class, which would also
+expose everything it inherits (`K2_DestroyComponent` ...) to anyone on the
+network -- and no Blueprint child classes. A project of its own needs the same
+entries (`+CustomAllowedRemoteFunctionCalls=(ClassPath=...,FunctionName=...,bAllowChildClasses=False)`).
+A `/remote/batch` request is checked call by call: it needs nothing more.
 
-| Class | Used by |
-|---|---|
-| `/Script/RammsCore.RammsRobotControlSurfaceComponent` | `control`, `robot`, `ramms-control`, `ramms-curb`, TUI Robot page |
-| `/Script/RammsCore.RammsDriveModeSelector` | drive modes |
-| `/Script/RammsCore.RammsRammpGen1CurbController`, `RammsCurbNegotiationController`, `RammsSeatMechanismController` | curb crossing (Gen1, Gen2), Gen2 seat |
-| `/Script/RammsCore.RammsSensingBridge` (no child classes) | `sensing`, `ramms-sensors` |
-| `/Script/RammsCore.RammsIMUSensorComponent`, `RammsSonarSensorComponent`, `RammsToFSensorComponent` | sensor components |
-| `/Script/RammsCrowd.RammsTrafficSpawner`, `RammsTrafficSignalClock` | `ramms-worldgen traffic` (car poses use the allow-listed `K2_GetActorLocation` / `K2_GetActorRotation`) |
+| Class | Functions ramms-tools calls | Used by |
+|---|---|---|
+| `/Script/RammsCore.RammsCoreBridge`, `/Script/RammsCore.RammsSensingBridge` | the whole (static) bridge | discovery; `sensing`, `ramms-sensors` |
+| `/Script/RammsCore.RammsRobotControlSurfaceComponent` | `GetControlSurfaceJson`, `SetControl`, `TriggerControl`, `ReleaseControl`, `GetControlValue`, `GetControlTarget`, `GetControlText` | `control`, `robot`, `ramms-control`, `ramms-curb`, TUI Robot page |
+| `/Script/RammsCore.RammsDriveModeSelector` | `GetAvailableModeIds`, `GetActiveModeId`, `SetActiveMode`, `CycleMode`, `IsSwitchingMode`, `GetSwitchStatus`, `GetMeasuredMotion` | drive modes; the curb stick's gate |
+| `/Script/RammsCore.RammsRammpGen1CurbController` | `StartCrossing`, `Abort`, `GetPhase`, `GetStatus`, `GetStatusLine`, `GetStats`, `GetCrossing` | RAMMP Gen1 curb crossing |
+| `/Script/RammsCore.RammsCurbNegotiationController` | `CheckFeasibility`, `BeginNegotiation`, `BeginNegotiationOnTerrain`, `NegotiateStepAhead`, `DetectStepAhead`, `DetectTerrainAhead`, `Abort`, `IsNegotiating`, `GetPhase`, `GetPhaseAxle`, `GetStatusText`, `GetStatusLine`, `GetDetectionText`, `GetActiveTerrain`, `GetActiveProfile`, `GetElapsedSeconds`, `GetMeasuredTiltDeg`, `GetPlannedTiltDeg`, `GetBaseHeight`, `GetDriveSpeed`, `GetWheelProgress`, `GetLegHeights`, `GetWheelClearance`, `GetWheelStatus`, `GetStabilityMargin`, `GetPlanDescription`, `GetStepLog`, `GetScheduleLines`, `GetRunStats` | RAMMP Gen2 curb crossing |
+| `/Script/RammsCore.RammsSeatMechanismController` | `SetPivotTarget`, `SetTiltDeg`, `ResetSeat`, `GetPivot`, `GetTiltDeg`, `GetReachableOutline` | RAMMP Gen2 seat |
+| `/Script/RammsCrowd.RammsTrafficSpawner` | `SpawnTraffic`, `DespawnTraffic`, `GetSpawnedCount` | `ramms-worldgen traffic` |
+| `/Script/RammsCrowd.RammsTrafficSignalClock` | `GetSignalState`, `GetControlledCrossingCount` | `ramms-worldgen traffic` |
+| `/Script/Engine.Actor` (child classes allowed) | `K2_GetActorLocation`, `K2_GetActorRotation` | traffic car poses, `ramms-imu` |
 
 ### Coordinate Frame Transforms
 
@@ -428,7 +469,7 @@ ramms-tui --host 192.168.1.10      # Connect to a remote UE instance
 | Arm | 7 joint controls with ±buttons, input fields, Home/Refresh; gripper state, Open/Close/Toggle, finger angle controls |
 | RAMMP Gen1 | Dynamic motor controls (angular & linear) |
 | IMU | Real-time streaming with target selection and coordinate frame toggle |
-| Stream | RMSS stream monitor — connect to streaming server, subscribe to channels, view per-channel FPS/bandwidth/dropped frames |
+| Stream | RMSS stream monitor — connect to streaming server (subscribes to every channel on connect; the server sends nothing before a subscribe), view per-channel FPS/bandwidth/dropped frames |
 | Robot | Any robot's control surface: robot and drive-mode selectors, curb panel (phase, status coloured by severity, assist / style, cross / stop, Gen2 detection), enum selectors and action buttons per group, live readback, sensors with their latest readings |
 
 The IMU page supports **World**, **Local**, or **Both** coordinate frames.
@@ -611,6 +652,11 @@ print(f"JPEG: {has_jpeg()}, LZ4: {has_lz4()}")
 ```
 
 #### Python streaming library
+
+The server sends a connection no frames until it has subscribed:
+`subscribe(channels)` for those channels, `subscribe()` for every channel.
+`StreamClient` warns once when it is polled without a subscription
+(`StreamSender`, which only sends, needs none).
 
 ```python
 from ramms_tools.streaming import StreamClient, StreamSender
@@ -832,7 +878,8 @@ ramms-curb style rolling                   # Gen1: "Stop and step" or "Rolling"
 ramms-curb detect                          # Gen2: step and terrain ahead (Gen1 has no look-ahead)
 ramms-curb drive --speed 0.3 --seconds 4   # approach
 ramms-curb go --wait                       # start a crossing, hold the stick while it runs, phase log + stats; exit 1 unless Done
-ramms-curb go --wait --forward 0.8 --on-interrupt pause
+ramms-curb go --wait --forward 0.8 --on-interrupt pause    # a Gen2 crossing at 80 % of its planned speed
+ramms-curb go --wait --join                # hold the stick for a crossing already under way (the rider's ...)
 ramms-curb abort
 ramms-curb stats
 ramms-curb plan                            # Gen2: plan, schedule, step log, planned tilt
@@ -841,12 +888,17 @@ ramms-curb seat --pivot 0,45 --tilt -5     # Gen2 seat (--pivot=-10,45 for a neg
 
 `go` starts the crossing; the controller selects the curb drive mode itself.
 A crossing moves only while the stick (`drive.forward`) is held forward:
-`go --wait` holds it at `--forward` (default 0.5) only while the crossing is
-under way, and releases it the moment it is done, stopped or faulted -- before
-the drive mode the robot is handed back to could drive on it -- holding it again
-if a Gen2 crossing retries. Without `--wait`, the crossing waits, paused, for a
-stick. Ctrl+C / SIGTERM / SIGHUP during `go --wait` release the stick and abort
-the crossing (`--on-interrupt pause` leaves it paused: `go --wait` again goes on).
+`go --wait` holds it at `--forward` (default 1.0, full; 0.25..1.0 -- below the
+engage threshold a crossing never moves, and anything else is refused) only
+while the crossing is under way in the curb drive mode. The sender reads both
+with each send and lets go in the round that sees the crossing done, stopped or
+faulted (at most one send after it, released at once), holding it again if a
+Gen2 crossing retries. Without `--wait`, the crossing waits, paused, for a
+stick. A crossing already under way that `go` did not start (the rider's, curb
+assist's, another client's) is not taken over unless `--join`; `--no-hold`
+only watches it. Ctrl+C / SIGTERM / SIGHUP during `go --wait` release the stick
+and abort the crossing (`--on-interrupt pause` leaves it paused:
+`go --wait --join` goes on).
 
 ### `ramms-sensors` — Robot Sensing
 
