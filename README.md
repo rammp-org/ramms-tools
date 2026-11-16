@@ -826,7 +826,16 @@ ramms-ui-bridge-test events --follow          # watch button presses and object 
 ramms-ui-bridge-test walkthrough              # guided pass over every surface
 ```
 
-Two things it guards, both of which fail silently against a real editor:
+Three things it guards, all of which fail silently against a real editor:
+
+- **A preset entry bound to nothing** — Remote Control answers HTTP 200 for a
+  call that reaches no object at all, so every push looks like it worked and
+  the UI never changes. This happens whenever the level holding
+  `RammsBridgeReceiver` is moved or replaced: the preset keeps a binding to the
+  old path. `discover` prints what each function is bound to and exits non-zero
+  when any is orphaned, `selftest` asserts it before running checks that would
+  otherwise all "pass", and any call to an unbound function is refused.
+
 
 - **Preset functions are called by their exposed label, not their C++ name** —
   `Poll UIEvents`, not `PollUIEvents`, which returns

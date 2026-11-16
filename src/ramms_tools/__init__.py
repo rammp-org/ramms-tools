@@ -7,4 +7,4 @@ controlling robots (``ramms_tools.control``, ``ramms_tools.robot``), sensing
 (``ramms_tools.worldgen``) and managing UI via the UE Remote Control HTTP API.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

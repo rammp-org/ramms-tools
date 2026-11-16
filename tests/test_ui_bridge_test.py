@@ -362,3 +362,97 @@ def test_stream_sends_synchronously_so_failures_surface(monkeypatch):
 
     assert module.cmd_stream(client, args) == 0
     assert recorded["queue_size"] == 0
+
+
+# ── binding checks ───────────────────────────────────────────────────
+
+def _preset_json(entries):
+    """entries: [(cpp_name, label, [owner_paths])]"""
+    return {"Preset": {"Groups": [{
+        "Name": "All",
+        "ExposedProperties": [],
+        "ExposedFunctions": [
+            {"DisplayName": label,
+             "UnderlyingFunction": {"Name": name,
+                                    "Arguments": [{"Name": "PanelJSON"}]},
+             "OwnerObjects": [{"Path": p} for p in owners]}
+            for name, label, owners in entries
+        ],
+    }]}}
+
+
+def _client_with_preset_json(payload, monkeypatch):
+    client = BridgeClient()
+    monkeypatch.setattr(client, "_request",
+                        lambda method, endpoint, p=None:
+                        payload if method == "GET" else {"ReturnedValues": [{}]})
+    return client
+
+
+def test_unbound_function_is_refused_rather_than_silently_succeeding(monkeypatch):
+    """Remote Control answers HTTP 200 for a call that reaches no object.
+
+    That is how a moved level turns every push into a no-op that reports
+    success, so the client has to catch it rather than trust the status.
+    """
+    client = _client_with_preset_json(
+        _preset_json([("UpdatePanel", "Update Panel", [])]), monkeypatch)
+    with pytest.raises(BridgeError) as excinfo:
+        client.call("UpdatePanel", PanelJSON="{}")
+    message = str(excinfo.value)
+    assert "bound to no object" in message
+    assert "Rebind" in message
+
+
+def test_bound_function_is_allowed(monkeypatch):
+    client = _client_with_preset_json(
+        _preset_json([("UpdatePanel", "Update Panel", ["/Game/Maps/M.M:X.Recv_1"])]),
+        monkeypatch)
+    assert client.call("UpdatePanel", PanelJSON="{}") == {}
+
+
+def test_unbound_functions_lists_every_orphan(monkeypatch):
+    client = _client_with_preset_json(_preset_json([
+        ("UpdatePanel", "Update Panel", []),
+        ("PollUIEvents", "Poll UIEvents", []),
+        ("OpenCameraFeed", "Open Camera Feed", ["/Game/Maps/M.M:X.Recv_1"]),
+    ]), monkeypatch)
+    assert client.unbound_functions() == ["PollUIEvents", "UpdatePanel"]
+
+
+def test_a_duplicate_exposure_prefers_the_bound_entry(monkeypatch):
+    """Re-exposing after a level move leaves the stale entry and adds "Name (1)".
+
+    Last-wins would pick whichever was serialised last, which may be the dead
+    one; the bound entry is the only one worth calling.
+    """
+    client = _client_with_preset_json(_preset_json([
+        ("UpdatePanel", "Update Panel", []),                       # stale
+        ("UpdatePanel", "Update Panel (1)", ["/Game/M.M:X.Recv_1"]),  # live
+    ]), monkeypatch)
+    client.load_preset()
+    assert client.label_for("UpdatePanel") == "Update Panel (1)"
+    assert client._duplicates["UpdatePanel"] == ["Update Panel", "Update Panel (1)"]
+    assert client.unbound_functions() == []
+
+
+def test_a_duplicate_in_the_other_order_still_prefers_the_bound_entry(monkeypatch):
+    client = _client_with_preset_json(_preset_json([
+        ("UpdatePanel", "Update Panel (1)", ["/Game/M.M:X.Recv_1"]),
+        ("UpdatePanel", "Update Panel", []),
+    ]), monkeypatch)
+    client.load_preset()
+    assert client.label_for("UpdatePanel") == "Update Panel (1)"
+
+
+def test_binding_check_does_not_block_when_the_preset_is_unreadable(monkeypatch):
+    """No preset data is not evidence of a broken binding."""
+    client = BridgeClient()
+
+    def fake_request(method, endpoint, payload=None):
+        if method == "GET":
+            raise BridgeError("preset unreadable")
+        return {"ReturnedValues": [{}]}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    assert client.call("UpdatePanel", PanelJSON="{}") == {}

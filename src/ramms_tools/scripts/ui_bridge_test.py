@@ -75,6 +75,8 @@ class BridgeClient:
         self.verbose = verbose
         self._labels = {}    # C++ name -> exposed label
         self._arguments = {}  # C++ name -> [argument names]
+        self._owners = {}    # C++ name -> [bound object paths]
+        self._duplicates = {}  # C++ name -> [every label exposing it]
 
     # ── transport ────────────────────────────────────────────────────
 
@@ -111,8 +113,19 @@ class BridgeClient:
                 name = underlying.get("Name")
                 if not name:
                     continue
-                self._labels[name] = fn.get("DisplayName") or name
+                label = fn.get("DisplayName") or name
+                owners = [o.get("Path", "") for o in (fn.get("OwnerObjects") or [])]
+                self._duplicates.setdefault(name, []).append(label)
+                # A preset can expose the same function more than once, under
+                # different labels and bindings -- re-exposing after a level
+                # move leaves the stale entry in place and adds "Name (1)".
+                # Prefer an entry that is actually bound; a blind last-wins
+                # would pick whichever happened to be serialised last.
+                if name in self._labels and not owners:
+                    continue
+                self._labels[name] = label
                 self._arguments[name] = [a.get("Name") for a in underlying.get("Arguments", [])]
+                self._owners[name] = owners
         if not self._labels:
             raise BridgeError(f"preset {self.preset} exposes no functions")
         return preset
@@ -153,6 +166,7 @@ class BridgeClient:
                     "UE would accept the call with HTTP 200 and receive an empty "
                     "value for the real parameter."
                 )
+        self.check_bound(function)
         label = urllib.parse.quote(self.label_for(function))
         payload = {"Parameters": parameters, "GenerateTransaction": False}
         if self.verbose:
@@ -160,6 +174,42 @@ class BridgeClient:
         result = self._request("PUT", f"/remote/preset/{self.preset}/function/{label}", payload)
         returned = (result or {}).get("ReturnedValues") or [{}]
         return returned[0]
+
+    def owners_for(self, function):
+        """Objects the exposed function is bound to, or None if unknown."""
+        if not self._labels:
+            try:
+                self.load_preset()
+            except BridgeError:
+                return None
+        return self._owners.get(function)
+
+    def check_bound(self, function):
+        """Raise if the function is exposed but bound to nothing.
+
+        An unbound entry is the worst failure this interface has: Remote
+        Control answers HTTP 200 with an empty ReturnedValues and the call
+        reaches no object at all, so every push looks like it worked and the UI
+        never changes. It happens whenever the level holding the receiver is
+        moved or replaced -- the preset keeps a binding to the old path.
+        """
+        owners = self.owners_for(function)
+        if owners is not None and not owners:
+            raise BridgeError(
+                f"{function} is exposed on preset {self.preset} but bound to no "
+                "object, so the call would return HTTP 200 and reach nothing. "
+                "Rebind the preset entries to the RammsBridgeReceiver in the "
+                "level that is currently open."
+            )
+
+    def unbound_functions(self):
+        """Every exposed function that is bound to nothing."""
+        if not self._labels:
+            try:
+                self.load_preset()
+            except BridgeError:
+                return []
+        return sorted(name for name, owners in self._owners.items() if not owners)
 
     def get_setting(self, property_name, object_path=SETTINGS_PATH):
         payload = {"objectPath": object_path, "propertyName": property_name,
@@ -354,7 +404,14 @@ def cmd_discover(client, args):
     print("\nexposed functions (call by LABEL, not by C++ name):")
     for name, label in sorted(client._labels.items()):
         argnames = client._arguments.get(name) or []
+        owners = client._owners.get(name) or []
+        bound = owners[0] if owners else "!! BOUND TO NOTHING !!"
         print(f"  {name:<24} label={label!r:<28} args={argnames}")
+        print(f"  {'':<24} bound to: {bound}")
+        labels = client._duplicates.get(name) or []
+        if len(labels) > 1:
+            print(f"  {'':<24} NOTE: exposed {len(labels)} times as {labels}; "
+                  f"using {label!r} because it is the bound one")
     for group in preset.get("Groups", []):
         for prop in group.get("ExposedProperties", []):
             print(f"  property: {prop.get('DisplayName')!r}")
@@ -366,6 +423,18 @@ def cmd_discover(client, args):
             print(f"  {prop:<24} {json.dumps(client.get_setting(prop))}")
         except BridgeError as exc:
             print(f"  {prop:<24} <unreadable: {exc}>")
+
+    unbound = client.unbound_functions()
+    if unbound:
+        print(f"\nPROBLEM: {len(unbound)} exposed function(s) are bound to no object:")
+        for name in unbound:
+            print(f"  {name}")
+        print("  Remote Control answers HTTP 200 for these and the call reaches")
+        print("  nothing, so pushes look like they worked and the UI never changes.")
+        print("  It happens when the level holding RammsBridgeReceiver is moved or")
+        print("  replaced: the preset still points at the old path. Rebind the")
+        print("  preset entries to the receiver in the level that is open now.")
+        return 1
 
     latest, _ = client.poll_events(0)
     print(f"\nUI event sequence is at {latest}")
@@ -689,6 +758,15 @@ def cmd_selftest(client, args):
         check(client._arguments.get("UpdatePanel") == ["PanelJSON"],
               "UpdatePanel declares PanelJSON",
               str(client._arguments.get("UpdatePanel")))
+        unbound = client.unbound_functions()
+        check(not unbound, "every exposed function is bound to an object",
+              f"{unbound} reach nothing -- Remote Control still answers HTTP 200, "
+              "so every push below would be reported as a success. Rebind the "
+              "preset to the receiver in the open level.")
+        if unbound:
+            print("\nFAILED: the preset is not bound; later checks would be "
+                  "meaningless, so they are skipped")
+            return 1
     except BridgeError as exc:
         check(False, "preset readable", str(exc))
         return 1
