@@ -604,6 +604,12 @@ class VideoFeeder:
             self.error = f"no video (RMSS {self.host}:{self.port}): {exc}"
             return
         start = time.monotonic()
+        # Spread the channels across the frame interval instead of bursting them
+        # back-to-back: the receiver keeps only the newest pending frame, so
+        # channels sent in one burst starve each other and only the last one
+        # registers promptly (measured: 13-30s for the others, or never).
+        channels = 3 if self.overlay else 2
+        gap = max(0.0, (1.0 / self.fps) / channels)
         try:
             while not self._stop.is_set():
                 t = time.monotonic() - start
@@ -617,8 +623,10 @@ class VideoFeeder:
                 sender.send_image(0, img.tobytes(), w, h, fmt="bgra8",
                                   group="camera/scene", role="color", stream_id=scene_color)
                 depth = np.linspace(300, 4000, h, dtype=np.uint16)[:, None].repeat(w, axis=1)
+                self._stop.wait(gap)
                 sender.send_depth_uint16(1, depth.tobytes(), w, h, group="camera/scene",
                                          role="depth", stream_id=scene_depth)
+                self._stop.wait(gap)
                 if self.overlay:
                     ov = np.zeros((h, w, 4), dtype=np.uint8)
                     ov[:, :, 2] = 255
@@ -627,7 +635,7 @@ class VideoFeeder:
                     ov[max(0, cy - 40):cy + 40, max(0, cx - 40):cx + 40, 1] = 255
                     sender.send_image(2, ov.tobytes(), w, h, fmt="bgra8", group="overlay",
                                       role="color", stream_id=overlay_color)
-                self._stop.wait(max(0.0, 1.0 / self.fps))
+                self._stop.wait(gap)
         except OSError as exc:
             # Queued sends are reported by the worker, but anything raised here
             # would otherwise end the thread in silence and look like "video is
@@ -700,6 +708,10 @@ def cmd_stream(client, args):
           "ramps front-to-back.")
 
     frames = 0
+    # See VideoFeeder: the receiver keeps only the newest pending frame, so
+    # channels burst back-to-back starve each other. Space them out.
+    channels = 3 if args.overlay else 2
+    gap = max(0.0, (1.0 / args.fps) / channels)
     start = time.monotonic()
     try:
         while time.monotonic() - start < args.seconds:
@@ -714,11 +726,13 @@ def cmd_stream(client, args):
             img[:, max(0, bar - 4):bar + 4, :3] = 255
             sender.send_image(0, img.tobytes(), w, h, fmt="bgra8",
                               group="camera/scene", role="color", stream_id=scene_color)
+            time.sleep(gap)
 
             # uint16 depth in millimetres, near at the top.
             depth = np.linspace(300, 4000, h, dtype=np.uint16)[:, None].repeat(w, axis=1)
             sender.send_depth_uint16(1, depth.tobytes(), w, h,
                                      group="camera/scene", role="depth", stream_id=scene_depth)
+            time.sleep(gap)
 
             if args.overlay:
                 ov = np.zeros((h, w, 4), dtype=np.uint8)
@@ -730,7 +744,7 @@ def cmd_stream(client, args):
                                   group="overlay", role="color", stream_id=overlay_color)
 
             frames += 1
-            time.sleep(max(0.0, 1.0 / args.fps))
+            time.sleep(gap)
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
