@@ -816,7 +816,7 @@ or the bridge itself. Useful for UI work, and for reproducing a bridge problem
 in isolation.
 
 ```bash
-ramms-ui-bridge-test discover                 # what RCP_RammsBridge exposes + live stream IDs
+ramms-ui-bridge-test discover                 # what the RCPS preset exposes + live stream IDs
 ramms-ui-bridge-test selftest                 # non-interactive transport checks, exits non-zero on failure
 ramms-ui-bridge-test panel --scenario error   # idle|selection|progress|paused|error|stress|empty
 ramms-ui-bridge-test objects --select cup_1   # tappable boxes, with one highlighted
@@ -854,7 +854,9 @@ rather than bare arrays, which UE's JSON struct converter rejects for
 `FVector4`/`FVector2D`.
 
 Requires the editor running with Remote Control (HTTP on 30010) and a level
-containing `RammsBridgeReceiver`. What a panel *looks* like still needs eyes:
+containing `RammsBridgeReceiver`. Defaults to the project's own `RCPS` preset
+(`--preset` to override): the receiver and its level belong to the project, so
+binding them from a plugin preset breaks whenever the level moves. What a panel *looks* like still needs eyes:
 no panel/world-state/camera state is readable back, so each scenario prints
 what you should see, and the tap round-trip is what gets asserted.
 

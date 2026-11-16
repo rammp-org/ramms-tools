@@ -17,7 +17,7 @@ Usage:
     ramms-ui-bridge-test walkthrough              # guided pass over everything
 
 Requires the UE editor running with Remote Control enabled (HTTP on 30010) and
-the RCP_RammsBridge preset loaded -- i.e. a level containing RammsBridgeReceiver.
+the RCPS preset loaded -- i.e. a level containing RammsBridgeReceiver.
 
 WHAT THIS CAN AND CANNOT CHECK
 ------------------------------
@@ -45,7 +45,10 @@ import urllib.request
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 30010
 DEFAULT_STREAM_PORT = 30030
-PRESET = "RCP_RammsBridge"
+# The project's own preset, not the RammsUI plugin's RCP_RammsBridge: the
+# receiver and the level it sits in belong to the project, so a plugin asset
+# binding to them breaks every time the level moves. Override with --preset.
+PRESET = "RCPS"
 SETTINGS_PATH = "/Script/RammsUI.Default__RammsCameraStreamSettings"
 
 # Fallback only -- the real labels/arguments are discovered from the preset.
