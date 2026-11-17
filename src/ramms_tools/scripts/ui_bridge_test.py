@@ -470,10 +470,39 @@ PIXEL_SAMPLES = [
     ("tap_3", "faucet", (947, 72, 1178, 346), (1126, 302)),
 ]
 
+# A disjoint set: no instance_id here appears in NORMALIZED_SAMPLES. Pushing this
+# after that one is what catches a layer that adds without removing -- the ids have
+# to differ, or reusing a marker and leaking one look the same on screen.
+NORMALIZED_SAMPLES_B = [
+    ("jug_5", "jug", (0.12, 0.40, 0.38, 0.86), None),
+    ("plate_6", "plate", (0.44, 0.52, 0.72, 0.90), None),
+    ("knife_7", "knife", (0.60, 0.08, 0.95, 0.30), (0.78, 0.20)),
+]
 
-def sample_objects(source, pixels=False):
-    """Three tappable objects, normalized unless `pixels` asks otherwise."""
-    samples = PIXEL_SAMPLES if pixels else NORMALIZED_SAMPLES
+# Objects with no instance_id: they draw, but nothing can key a marker on them, so
+# they exercise the unkeyed path (reused in order, surplus removed) and a tap on one
+# has no id to send.
+UNKEYED_SAMPLES = [
+    ("", "unknown", (0.20, 0.20, 0.40, 0.45), None),
+    ("", "unknown", (0.55, 0.55, 0.78, 0.82), None),
+]
+
+SAMPLE_SETS = {
+    "a": NORMALIZED_SAMPLES,
+    "b": NORMALIZED_SAMPLES_B,
+    "unkeyed": UNKEYED_SAMPLES,
+}
+
+
+def sample_objects(source, pixels=False, variant="a", count=None):
+    """Tappable objects from one sample set, normalized unless `pixels` asks otherwise.
+
+    `count` takes only the first N, to check that dropping an object removes its
+    marker rather than leaving it behind.
+    """
+    samples = PIXEL_SAMPLES if pixels else SAMPLE_SETS[variant]
+    if count is not None:
+        samples = samples[:count]
     return [detected_object(iid, cls, box, centroid, source)
             for iid, cls, box, centroid in samples]
 
@@ -545,20 +574,28 @@ def cmd_panel(client, args):
 
 
 def cmd_objects(client, args):
+    if args.pixels and args.set != "a":
+        print("--pixels only has a pixel-space set for --set a", file=sys.stderr)
+        return 2
+    # None means "discover it"; an explicit --stream-id '' is honoured as empty, which
+    # is what the real bridge sends and is not the same request at all.
     stream_id = args.stream_id
-    if not stream_id:
+    if stream_id is None:
         prop = "SceneColorStreamID" if args.source == "scene" else "OverlayColorStreamID"
         try:
             stream_id = client.get_setting(prop) or ""
         except BridgeError:
             stream_id = ""
-    objects = [] if args.clear else sample_objects(args.source, args.pixels)
+    objects = [] if args.clear else sample_objects(
+        args.source, args.pixels, args.set, args.count)
     payload = detected_objects_payload(objects, args.select or "", stream_id)
     since = _current_sequence(client) if args.wait else None
     client.update_detected_objects(payload)
     if args.clear:
         print(f"cleared detected objects on stream_id={stream_id!r}")
-        print("  expect: every box disappears from the view.")
+        print("  expect: every box AND every POI disappears from the view -- an empty")
+        print("          list is the full set, so it clears every stream, whatever")
+        print("          stream_id it carries.")
         return 0
     space = "pixel (1280x720)" if args.pixels else "normalized 0-1"
     print(f"pushed {len(objects)} objects on stream_id={stream_id!r} source={args.source!r} "
@@ -1005,9 +1042,25 @@ def _walkthrough_steps(client, args):
             detected_objects_payload(sample_objects("scene"), "bowl_2",
                                      _scene_stream_id(client))),
          "Same three boxes, highlight moves to bowl_2.", []),
+        ("Objects replaced", lambda: client.update_detected_objects(
+            detected_objects_payload(sample_objects("scene", variant="b"), "jug_5",
+                                     _scene_stream_id(client))),
+         "A DIFFERENT three objects -- jug_5, plate_6, knife_7 -- with jug_5\n"
+         "          highlighted. None of cup_1, bowl_2 or tap_3 may still be on\n"
+         "          screen: six at once means the layer adds without removing.", []),
+        ("One object dropped", lambda: client.update_detected_objects(
+            detected_objects_payload(sample_objects("scene", variant="b", count=1), "",
+                                     _scene_stream_id(client))),
+         "Exactly ONE object, jug_5, nothing highlighted. plate_6 and knife_7 are\n"
+         "          gone -- each push is the full set, so what it leaves out is over.", []),
+        ("Objects without ids", lambda: client.update_detected_objects(
+            detected_objects_payload(sample_objects("scene", variant="unkeyed"), "",
+                                     _scene_stream_id(client))),
+         "Two unlabelled objects, and jug_5 gone. These have no instance_id, so\n"
+         "          nothing can key a marker on them and a tap sends no id.", []),
         ("Objects cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _scene_stream_id(client))),
-         "All boxes disappear from the scene camera.", []),
+         "All boxes and POIs disappear from the scene camera.", []),
         ("Overlay objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("overlay"), "bowl_2",
                                      _overlay_stream_id(client))),
@@ -1017,6 +1070,19 @@ def _walkthrough_steps(client, args):
         ("Overlay cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _overlay_stream_id(client))),
          "The overlay's boxes disappear.", []),
+        ("Both layers at once", lambda: client.update_detected_objects(
+            detected_objects_payload(
+                sample_objects("scene") + sample_objects("overlay", variant="b"),
+                "cup_1", _scene_stream_id(client))),
+         "ONE push, both layers: cup_1/bowl_2/tap_3 on the scene camera and\n"
+         "          jug_5/plate_6/knife_7 on the engine overlay. Each object's own\n"
+         "          `source` decides, not the push's stream_id.", []),
+        ("Cleared the way the bridge clears", lambda: client.update_detected_objects(
+            detected_objects_payload([], "", "")),
+         "EVERYTHING disappears, from both layers at once. This is the real\n"
+         "          bridge's clear: an empty objects list with an EMPTY stream_id.\n"
+         "          stream_id is never consulted on a clear, so it clears every\n"
+         "          stream -- boxes and POIs alike.", []),
         ("Camera feed close", client.close_camera_feed,
          "The camera feed disappears.", []),
     ]
@@ -1144,7 +1210,12 @@ def main():
     p = sub.add_parser("objects", help="push detected objects")
     p.add_argument("--source", choices=("scene", "overlay"), default="scene")
     p.add_argument("--select", default="", help="instance_id to highlight")
-    p.add_argument("--stream-id", default="", help="override the stream_id")
+    p.add_argument("--stream-id", default=None,
+                   help="override the stream_id; pass '' for the empty one the bridge sends")
+    p.add_argument("--set", choices=sorted(SAMPLE_SETS), default="a",
+                   help="which sample set: 'b' is disjoint from 'a', 'unkeyed' has no instance_ids")
+    p.add_argument("--count", type=int, default=None,
+                   help="push only the first N of the set, to check the rest are removed")
     p.add_argument("--clear", action="store_true", help="push an empty list instead")
     p.add_argument("--pixels", action="store_true",
                    help="send pixel-space boxes for a 1280x720 feed instead of normalized 0-1")
