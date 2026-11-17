@@ -1032,12 +1032,14 @@ def _walkthrough_steps(client, args):
          PANEL_SCENARIOS["error"][1], scenario_buttons("error")),
         ("Layout stress", lambda: client.update_panel(PANEL_SCENARIOS["stress"][0]),
          PANEL_SCENARIOS["stress"][1], scenario_buttons("stress")),
-        ("Camera feed open", client.open_camera_feed,
-         "The camera feed appears.", []),
         ("Detected objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "cup_1",
                                      _scene_stream_id(client))),
-         "Three boxes on the scene view, cup_1 highlighted. Coordinates are\n          normalized, so they land the same whether or not a feed is streaming.", []),
+         "Three boxes on the SCENE camera, cup_1 highlighted, and a POI for each\n"
+         "          on the scene camera's POI layer. Nothing on the engine overlay:\n"
+         "          every surface takes only its own camera's objects. Coordinates are\n"
+         "          normalized to that camera's image, so they land the same whether or\n"
+         "          not a feed is streaming.", []),
         ("Selection moves", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "bowl_2",
                                      _scene_stream_id(client))),
@@ -1061,30 +1063,41 @@ def _walkthrough_steps(client, args):
         ("Objects cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _scene_stream_id(client))),
          "All boxes and POIs disappear from the scene camera.", []),
+        ("Overlay camera opened", client.open_camera_feed,
+         "The engine overlay's window appears. OpenCameraFeed drives this, so it\n"
+         "          has to come BEFORE the overlay's objects: boxes and POIs are drawn\n"
+         "          over an image, and until that image is up there is nothing to draw\n"
+         "          them on.", []),
         ("Overlay objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("overlay"), "bowl_2",
                                      _overlay_stream_id(client))),
-         "Boxes now on the ENGINE OVERLAY, not the scene camera, bowl_2\n"
-         "          highlighted. The two layers are independent: each needs its own\n"
-         "          frames and its own objects.", []),
+         "Boxes and POIs now on the ENGINE OVERLAY only, bowl_2 highlighted, and\n"
+         "          the scene camera stays empty. The two cameras are independent\n"
+         "          surfaces: each needs its own frames, its own objects, and its own\n"
+         "          POI layer, because a centroid is normalized to the image it was\n"
+         "          found in.", []),
         ("Overlay cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _overlay_stream_id(client))),
-         "The overlay's boxes disappear.", []),
-        ("Both layers at once", lambda: client.update_detected_objects(
+         "The overlay's boxes and POIs disappear.", []),
+        ("Both cameras at once", lambda: client.update_detected_objects(
             detected_objects_payload(
                 sample_objects("scene") + sample_objects("overlay", variant="b"),
                 "cup_1", _scene_stream_id(client))),
-         "ONE push, both layers: cup_1/bowl_2/tap_3 on the scene camera and\n"
-         "          jug_5/plate_6/knife_7 on the engine overlay. Each object's own\n"
-         "          `source` decides, not the push's stream_id.", []),
+         "ONE push, both cameras: cup_1/bowl_2/tap_3 on the scene camera and\n"
+         "          jug_5/plate_6/knife_7 on the engine overlay, each with its own\n"
+         "          boxes and POIs. Each object's own `source` decides which surface\n"
+         "          takes it, not the push's stream_id. An object must NOT appear on\n"
+         "          both, and must not appear on the wrong one: that would mean a\n"
+         "          surface is accepting every source and placing another camera's\n"
+         "          coordinates against its own rectangle.", []),
         ("Cleared the way the bridge clears", lambda: client.update_detected_objects(
             detected_objects_payload([], "", "")),
          "EVERYTHING disappears, from both layers at once. This is the real\n"
          "          bridge's clear: an empty objects list with an EMPTY stream_id.\n"
          "          stream_id is never consulted on a clear, so it clears every\n"
          "          stream -- boxes and POIs alike.", []),
-        ("Camera feed close", client.close_camera_feed,
-         "The camera feed disappears.", []),
+        ("Overlay camera closed", client.close_camera_feed,
+         "The engine overlay's window disappears. Its POIs and boxes go with it.", []),
     ]
 
     for index, (title, action, expectation, ids) in enumerate(steps, 1):
