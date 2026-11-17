@@ -381,11 +381,27 @@ def _preset_json(entries):
     }]}}
 
 
-def _client_with_preset_json(payload, monkeypatch):
+def _client_with_preset_json(payload, monkeypatch, name="RCPS", presets=None):
+    """A client wired to a fake editor serving one preset.
+
+    Routes /remote/presets and /remote/preset/<name> separately, as the real
+    editor does, so preset discovery is exercised rather than bypassed.
+    """
+    listing = {"Presets": presets if presets is not None else [{"Name": name}]}
+    calls = []
+
+    def fake_request(method, endpoint, p=None):
+        calls.append((method, endpoint))
+        if method == "GET" and endpoint == "/remote/presets":
+            return listing
+        if method == "GET":
+            return payload(endpoint) if callable(payload) else payload
+        return {"ReturnedValues": [{}]}
+
     client = BridgeClient()
-    monkeypatch.setattr(client, "_request",
-                        lambda method, endpoint, p=None:
-                        payload if method == "GET" else {"ReturnedValues": [{}]})
+    client.preset = name  # pinned: these cases are about bindings, not discovery
+    monkeypatch.setattr(client, "_request", fake_request)
+    client.calls = calls
     return client
 
 
@@ -437,12 +453,27 @@ def test_a_duplicate_exposure_prefers_the_bound_entry(monkeypatch):
 
 
 def test_a_duplicate_in_the_other_order_still_prefers_the_bound_entry(monkeypatch):
-    client = _client_with_preset_json(_preset_json([
-        ("UpdatePanel", "Update Panel (1)", ["/Game/M.M:X.Recv_1"]),
-        ("UpdatePanel", "Update Panel", []),
-    ]), monkeypatch)
+    """All three dicts must follow the same entry.
+
+    Assigning _owners/_arguments before the preference guard is a plausible
+    refactor that leaves the label on the live entry and the owners on the dead
+    one, which reports a working function as orphaned and refuses every call.
+    """
+    live = {"DisplayName": "Update Panel (1)",
+            "UnderlyingFunction": {"Name": "UpdatePanel",
+                                   "Arguments": [{"Name": "PanelJSON"}]},
+            "OwnerObjects": [{"Path": "/Game/M.M:X.Recv_1"}]}
+    dead = {"DisplayName": "Update Panel",
+            "UnderlyingFunction": {"Name": "UpdatePanel",
+                                   "Arguments": [{"Name": "StaleArgument"}]},
+            "OwnerObjects": []}
+    client = _client_with_preset_json(
+        {"Preset": {"Groups": [{"ExposedFunctions": [live, dead]}]}}, monkeypatch)
     client.load_preset()
     assert client.label_for("UpdatePanel") == "Update Panel (1)"
+    assert client._arguments["UpdatePanel"] == ["PanelJSON"], "arguments follow the label"
+    assert client._owners["UpdatePanel"] == ["/Game/M.M:X.Recv_1"]
+    assert client.unbound_functions() == [], "the bound entry must not read as orphaned"
 
 
 def test_binding_check_does_not_block_when_the_preset_is_unreadable(monkeypatch):
@@ -456,3 +487,143 @@ def test_binding_check_does_not_block_when_the_preset_is_unreadable(monkeypatch)
 
     monkeypatch.setattr(client, "_request", fake_request)
     assert client.call("UpdatePanel", PanelJSON="{}") == {}
+
+
+# ── preset discovery ─────────────────────────────────────────────────
+
+def _full_preset(name, bound=True, owner="/Game/Maps/M.M:PersistentLevel.Recv_1"):
+    owners = [owner] if bound else []
+    return _preset_json([(f, f.replace("Update", "Update "), owners)
+                         for f in ("UpdatePanel", "UpdateDetectedObjects", "PollUIEvents")])
+
+
+def test_discovery_picks_the_preset_whose_bindings_are_intact(monkeypatch):
+    """Presence is not enough: an orphaned entry is still listed and still
+    answers HTTP 200 while reaching nothing."""
+    def payload(endpoint):
+        return _full_preset("x", bound=endpoint.endswith("Good"))
+
+    client = _client_with_preset_json(
+        payload, monkeypatch, presets=[{"Name": "Dead"}, {"Name": "Good"}])
+    client.preset = "auto"
+    assert client.discover_preset() == "Good"
+
+
+def test_discovery_reports_why_each_candidate_was_rejected(monkeypatch):
+    client = _client_with_preset_json(
+        lambda endpoint: _full_preset("x", bound=False), monkeypatch,
+        presets=[{"Name": "Orphaned"}])
+    client.preset = "auto"
+    with pytest.raises(BridgeError) as excinfo:
+        client.discover_preset()
+    message = str(excinfo.value)
+    assert "Orphaned" in message and "bound to nothing" in message
+    assert "--preset" in message
+
+
+def test_discovery_rejects_a_preset_missing_the_api(monkeypatch):
+    client = _client_with_preset_json(
+        lambda endpoint: _preset_json([("UpdatePanel", "Update Panel", ["/x"])]),
+        monkeypatch, presets=[{"Name": "Partial"}])
+    client.preset = "auto"
+    with pytest.raises(BridgeError, match="missing"):
+        client.discover_preset()
+
+
+def test_a_failed_preset_load_is_not_retried_on_every_call(monkeypatch):
+    """One unreachable editor should not cost three full timeouts per command."""
+    client = BridgeClient()
+    attempts = []
+
+    def fake_request(method, endpoint, p=None):
+        attempts.append(endpoint)
+        raise BridgeError("editor is not answering")
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    for _ in range(3):
+        with pytest.raises(BridgeError):
+            client.load_preset()
+    assert len(attempts) == 1, f"retried {len(attempts)} times: {attempts}"
+
+
+def test_load_preset_is_idempotent(monkeypatch):
+    """Calling it twice must not invent a duplicate that discover would report."""
+    client = _client_with_preset_json(_full_preset("x"), monkeypatch)
+    client.load_preset()
+    client.load_preset()
+    assert client._duplicates["UpdatePanel"] == ["Update Panel"]
+
+
+def test_a_missing_owner_objects_key_is_unknown_not_orphaned(monkeypatch):
+    """Only an empty list means orphaned; an absent key means the preset did
+    not say, and blocking every call on that would be a false positive."""
+    payload = {"Preset": {"Groups": [{"ExposedFunctions": [
+        {"DisplayName": "Update Panel",
+         "UnderlyingFunction": {"Name": "UpdatePanel",
+                                "Arguments": [{"Name": "PanelJSON"}]}},
+    ]}]}}
+    client = _client_with_preset_json(payload, monkeypatch)
+    client.load_preset()
+    assert client.owners_for("UpdatePanel") is None
+    assert client.unbound_functions() == []
+    client.call("UpdatePanel", PanelJSON="{}")  # must not raise
+
+
+def test_unbound_functions_returns_none_when_it_cannot_tell(monkeypatch):
+    """[] is an all-clear; a failed lookup must not look like one."""
+    client = BridgeClient()
+    monkeypatch.setattr(client, "_request",
+                        lambda *a, **k: (_ for _ in ()).throw(BridgeError("nope")))
+    assert client.unbound_functions() is None
+
+
+def test_a_non_dict_response_raises_bridge_error_not_attribute_error(monkeypatch):
+    client = BridgeClient()
+    client.preset = "RCPS"
+    monkeypatch.setattr(client, "_request", lambda *a, **k: None)
+    with pytest.raises(BridgeError):
+        client.load_preset()
+
+
+# ── frame pacing ─────────────────────────────────────────────────────
+
+def test_each_channel_is_sent_once_per_frame_with_one_sleep_each():
+    """The old loop slept three times but sent twice without --overlay, so the
+    stream ran at two thirds of the rate asked for."""
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    for channel_count in (2, 3):
+        sends = [lambda i=i: order.append(i) for i in range(channel_count)]
+        order, slept = [], []
+        module._send_frame_spaced(sends, 0.0, 1.0, lambda d: slept.append(d))
+        assert order == list(range(channel_count))
+        assert len(slept) == channel_count, "one sleep per send, no more"
+        assert slept == [(i + 1) * (1.0 / channel_count) for i in range(channel_count)]
+
+
+def test_frame_deadlines_do_not_drift_with_the_cost_of_sending():
+    """Deadlines are absolute, so time spent building a frame is absorbed
+    rather than added to every interval."""
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    slept = []
+    for frame in range(3):
+        module._send_frame_spaced([lambda: None, lambda: None],
+                                  frame * 1.0, 1.0, lambda d: slept.append(d))
+    assert slept == [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+
+
+def test_a_stop_between_channels_abandons_the_rest_of_the_frame():
+    import ramms_tools.scripts.ui_bridge_test as module
+
+    sent = []
+    stopped = {"now": False}
+
+    def send(i):
+        sent.append(i)
+        stopped["now"] = True
+
+    sends = [lambda i=i: send(i) for i in range(3)]
+    assert module._send_frame_spaced(sends, 0.0, 1.0, lambda d: None,
+                                     stop=lambda: stopped["now"]) is False
+    assert sent == [0], "must not keep sending ~900 KB per channel after a stop"

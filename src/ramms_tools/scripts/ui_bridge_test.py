@@ -17,7 +17,8 @@ Usage:
     ramms-ui-bridge-test walkthrough              # guided pass over everything
 
 Requires the UE editor running with Remote Control enabled (HTTP on 30010) and
-the RCPS preset loaded -- i.e. a level containing RammsBridgeReceiver.
+a bridge preset loaded -- i.e. a level containing RammsBridgeReceiver.
+The preset is discovered automatically; --preset pins one.
 
 WHAT THIS CAN AND CANNOT CHECK
 ------------------------------
@@ -45,10 +46,13 @@ import urllib.request
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 30010
 DEFAULT_STREAM_PORT = 30030
-# The project's own preset, not the RammsUI plugin's RCP_RammsBridge: the
-# receiver and the level it sits in belong to the project, so a plugin asset
-# binding to them breaks every time the level moves. Override with --preset.
-PRESET = "RCPS"
+# Discover the preset rather than naming one. Projects disagree: RammpUI binds
+# the bridge on its own Content/RCPS, while the Ramms project has only
+# RCP_RammsBridge, so any hardcoded default is wrong somewhere. --preset pins it.
+PRESET = "auto"
+
+# What a preset must expose, and have bound, to be worth talking to.
+REQUIRED_FUNCTIONS = ("UpdatePanel", "UpdateDetectedObjects", "PollUIEvents")
 SETTINGS_PATH = "/Script/RammsUI.Default__RammsCameraStreamSettings"
 
 # Fallback only -- the real labels/arguments are discovered from the preset.
@@ -63,12 +67,20 @@ FALLBACK_LABELS = {
 }
 
 
+def _positive_float(text):
+    """argparse type: --fps 0 would divide by zero when spacing the channels."""
+    value = float(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return value
+
+
 class BridgeError(RuntimeError):
     pass
 
 
 class BridgeClient:
-    """Remote Control HTTP client for the RCP_RammsBridge preset."""
+    """Remote Control HTTP client for the bridge preset (discovered, or --preset)."""
 
     def __init__(self, host=DEFAULT_HOST, port=DEFAULT_HTTP_PORT, timeout=8.0,
                  preset=PRESET, verbose=False):
@@ -80,6 +92,7 @@ class BridgeClient:
         self._arguments = {}  # C++ name -> [argument names]
         self._owners = {}    # C++ name -> [bound object paths]
         self._duplicates = {}  # C++ name -> [every label exposing it]
+        self._load_failed = None  # remembered reason, so we stop retrying
 
     # ── transport ────────────────────────────────────────────────────
 
@@ -106,29 +119,88 @@ class BridgeClient:
 
     # ── preset introspection ─────────────────────────────────────────
 
-    def load_preset(self):
-        """Map each C++ function name to its exposed label and argument names."""
-        data = self._request("GET", f"/remote/preset/{self.preset}")
+    def _preset_entries(self, name):
+        """Exposed functions of one preset: {cpp name: [(label, args, owners)]}."""
+        data = self._request("GET", f"/remote/preset/{name}")
+        if not isinstance(data, dict):
+            raise BridgeError(f"preset {name}: unexpected response {data!r:.80}")
         preset = data.get("Preset", data)
+        entries = {}
         for group in preset.get("Groups", []):
             for fn in group.get("ExposedFunctions", []):
                 underlying = fn.get("UnderlyingFunction", {})
-                name = underlying.get("Name")
-                if not name:
+                cpp = underlying.get("Name")
+                if not cpp:
                     continue
-                label = fn.get("DisplayName") or name
-                owners = [o.get("Path", "") for o in (fn.get("OwnerObjects") or [])]
-                self._duplicates.setdefault(name, []).append(label)
-                # A preset can expose the same function more than once, under
-                # different labels and bindings -- re-exposing after a level
-                # move leaves the stale entry in place and adds "Name (1)".
-                # Prefer an entry that is actually bound; a blind last-wins
-                # would pick whichever happened to be serialised last.
-                if name in self._labels and not owners:
-                    continue
-                self._labels[name] = label
-                self._arguments[name] = [a.get("Name") for a in underlying.get("Arguments", [])]
-                self._owners[name] = owners
+                # A missing OwnerObjects key is "unknown", not "bound to
+                # nothing" -- only an empty list means orphaned.
+                owners = (None if "OwnerObjects" not in fn
+                          else [o.get("Path", "") for o in (fn["OwnerObjects"] or [])])
+                entries.setdefault(cpp, []).append((
+                    fn.get("DisplayName") or cpp,
+                    [a.get("Name") for a in underlying.get("Arguments", [])],
+                    owners,
+                ))
+        return preset, entries
+
+    def discover_preset(self):
+        """The preset that actually serves this API, by inspection.
+
+        Presence is not enough: an orphaned entry is still listed, and calling
+        it returns HTTP 200 while reaching nothing. A preset only counts if the
+        functions are there AND bound.
+        """
+        data = self._request("GET", "/remote/presets")
+        rows = (data or {}).get("Presets", []) if isinstance(data, dict) else []
+        if not rows:
+            raise BridgeError("no Remote Control presets on this editor")
+        rejected = []
+        for row in rows:
+            name = row.get("Name")
+            if not name:
+                continue
+            try:
+                _, entries = self._preset_entries(name)
+            except BridgeError as exc:
+                rejected.append(f"{name}: unreadable ({exc})")
+                continue
+            missing = [f for f in REQUIRED_FUNCTIONS if f not in entries]
+            orphaned = [f for f in REQUIRED_FUNCTIONS
+                        if f in entries and not any(e[2] for e in entries[f])]
+            if missing:
+                rejected.append(f"{name}: missing {missing}")
+            elif orphaned:
+                rejected.append(f"{name}: {orphaned} bound to nothing")
+            else:
+                return name
+        raise BridgeError(
+            "no preset exposes the bridge API with its bindings intact:\n  "
+            + "\n  ".join(rejected)
+            + "\nPass --preset to pin one, or rebind it to the receiver in the open level.")
+
+    def load_preset(self):
+        """Map each C++ function name to its exposed label, arguments and owners."""
+        if self._load_failed:
+            # Do not re-attempt on every call: one unreachable editor would
+            # otherwise cost three full timeouts per command.
+            raise BridgeError(self._load_failed)
+        try:
+            if self.preset == "auto":
+                self.preset = self.discover_preset()
+            preset, entries = self._preset_entries(self.preset)
+        except BridgeError as exc:
+            self._load_failed = str(exc)
+            raise
+
+        self._labels, self._arguments, self._owners, self._duplicates = {}, {}, {}, {}
+        for name, found in entries.items():
+            self._duplicates[name] = [label for label, _, _ in found]
+            # A preset can expose one function more than once, under different
+            # labels and bindings -- re-exposing after a level move leaves the
+            # stale entry and adds "Name (1)". Prefer one that is bound; a blind
+            # last-wins would pick whichever was serialised last.
+            chosen = next((e for e in found if e[2]), found[-1])
+            self._labels[name], self._arguments[name], self._owners[name] = chosen
         if not self._labels:
             raise BridgeError(f"preset {self.preset} exposes no functions")
         return preset
@@ -187,6 +259,7 @@ class BridgeClient:
                 return None
         return self._owners.get(function)
 
+
     def check_bound(self, function):
         """Raise if the function is exposed but bound to nothing.
 
@@ -202,17 +275,23 @@ class BridgeClient:
                 f"{function} is exposed on preset {self.preset} but bound to no "
                 "object, so the call would return HTTP 200 and reach nothing. "
                 "Rebind the preset entries to the RammsBridgeReceiver in the "
-                "level that is currently open."
+                "level that is currently open, then re-run this command -- the "
+                "preset is read once per run."
             )
 
     def unbound_functions(self):
-        """Every exposed function that is bound to nothing."""
+        """Every exposed function bound to nothing, or None if that is unknown.
+
+        None rather than [] when the preset cannot be read: an empty list is an
+        all-clear, and a caller should not get one from a failed lookup.
+        """
         if not self._labels:
             try:
                 self.load_preset()
             except BridgeError:
-                return []
-        return sorted(name for name, owners in self._owners.items() if not owners)
+                return None
+        return sorted(name for name, owners in self._owners.items()
+                      if owners is not None and not owners)
 
     def get_setting(self, property_name, object_path=SETTINGS_PATH):
         payload = {"objectPath": object_path, "propertyName": property_name,
@@ -403,18 +482,25 @@ def sample_objects(source, pixels=False):
 
 def cmd_discover(client, args):
     preset = client.load_preset()
-    print(f"preset: {preset.get('Name', PRESET)}")
+    print(f"preset: {preset.get('Name', client.preset)}")
     print("\nexposed functions (call by LABEL, not by C++ name):")
     for name, label in sorted(client._labels.items()):
         argnames = client._arguments.get(name) or []
-        owners = client._owners.get(name) or []
-        bound = owners[0] if owners else "!! BOUND TO NOTHING !!"
+        owners = client._owners.get(name)
+        if owners is None:
+            bound = "(not reported by this preset)"
+        elif owners:
+            bound = ", ".join(owners)
+        else:
+            bound = "!! BOUND TO NOTHING !!"
         print(f"  {name:<24} label={label!r:<28} args={argnames}")
         print(f"  {'':<24} bound to: {bound}")
         labels = client._duplicates.get(name) or []
         if len(labels) > 1:
+            why = ("it is the bound one" if owners
+                   else "none of them are bound; using the last")
             print(f"  {'':<24} NOTE: exposed {len(labels)} times as {labels}; "
-                  f"using {label!r} because it is the bound one")
+                  f"using {label!r} -- {why}")
     for group in preset.get("Groups", []):
         for prop in group.get("ExposedProperties", []):
             print(f"  property: {prop.get('DisplayName')!r}")
@@ -428,7 +514,7 @@ def cmd_discover(client, args):
             print(f"  {prop:<24} <unreadable: {exc}>")
 
     unbound = client.unbound_functions()
-    if unbound:
+    if unbound:  # None means "could not tell", which load_preset already raised on
         print(f"\nPROBLEM: {len(unbound)} exposed function(s) are bound to no object:")
         for name in unbound:
             print(f"  {name}")
@@ -553,6 +639,71 @@ def cmd_events(client, args):
         return 0
 
 
+def _synthetic_frames(t, w, h):
+    """The three synthetic channel payloads for the frame at time `t`."""
+    import numpy as np
+
+    img = np.zeros((h, w, 4), dtype=np.uint8)
+    img[:, :, 0] = np.linspace(0, 255, w, dtype=np.uint8)[None, :]
+    img[:, :, 1] = np.linspace(0, 255, h, dtype=np.uint8)[:, None]
+    img[:, :, 2] = int((t * 60) % 256)
+    img[:, :, 3] = 255
+    bar = int((t * w / 3.0) % w)
+    img[:, max(0, bar - 4):bar + 4, :3] = 255
+
+    depth = np.linspace(300, 4000, h, dtype=np.uint16)[:, None].repeat(w, axis=1)
+
+    overlay = np.zeros((h, w, 4), dtype=np.uint8)
+    overlay[:, :, 2] = 255
+    overlay[:, :, 3] = 255
+    cy, cx = h // 2, int((t * w / 2.0) % w)
+    overlay[max(0, cy - 40):cy + 40, max(0, cx - 40):cx + 40, 1] = 255
+
+    return img, depth, overlay
+
+
+def _channel_sends(sender, t, w, h, ids, overlay):
+    """One zero-arg send per channel, in the order they should go out.
+
+    Spacing these across the frame is what keeps the receiver from dropping
+    all but the last: its inbound queue is shallow, and a burst arriving
+    between two game-thread ticks starves every channel but one.
+    """
+    scene_color, scene_depth, overlay_color = ids
+    img, depth, ov = _synthetic_frames(t, w, h)
+    sends = [
+        lambda: sender.send_image(0, img.tobytes(), w, h, fmt="bgra8",
+                                  group="camera/scene", role="color",
+                                  stream_id=scene_color),
+        lambda: sender.send_depth_uint16(1, depth.tobytes(), w, h,
+                                         group="camera/scene", role="depth",
+                                         stream_id=scene_depth),
+    ]
+    if overlay:
+        sends.append(lambda: sender.send_image(2, ov.tobytes(), w, h, fmt="bgra8",
+                                               group="overlay", role="color",
+                                               stream_id=overlay_color))
+    return sends
+
+
+def _send_frame_spaced(sends, base, period, sleep_until, stop=None):
+    """Send each channel, spread evenly across one frame period.
+
+    Scheduled against absolute deadlines derived from `base` rather than by
+    sleeping a fixed gap after each send: a fixed gap adds the time spent
+    building and sending the frame to every interval, so the stream drifts
+    below the rate that was asked for. Exactly one sleep per send, which is
+    the other half of getting the rate right.
+    """
+    slot = period / len(sends)
+    for index, send in enumerate(sends):
+        if stop is not None and stop():
+            return False
+        send()
+        sleep_until(base + (index + 1) * slot)
+    return True
+
+
 class VideoFeeder:
     """Background synthetic video, so boxes have something to sit on.
 
@@ -567,7 +718,8 @@ class VideoFeeder:
                  overlay=True):
         self.client = client
         self.host, self.port = host, port
-        self.width, self.height, self.fps = width, height, fps
+        self.width, self.height = width, height
+        self.fps = fps if fps > 0 else 12.0
         self.overlay = overlay
         self._thread = None
         self._stop = threading.Event()
@@ -589,13 +741,11 @@ class VideoFeeder:
 
     def _run(self):
         try:
-            import numpy as np
-
             from ramms_tools.streaming import StreamSender
         except ImportError as exc:
             self.error = f"no video (needs numpy): {exc}"
             return
-        scene_color, scene_depth, overlay_color = self._settings()
+        ids = self._settings()
         w, h = self.width, self.height
         sender = StreamSender(host=self.host, port=self.port)
         try:
@@ -603,39 +753,22 @@ class VideoFeeder:
         except OSError as exc:
             self.error = f"no video (RMSS {self.host}:{self.port}): {exc}"
             return
+
+        period = 1.0 / self.fps
         start = time.monotonic()
-        # Spread the channels across the frame interval instead of bursting them
-        # back-to-back: the receiver keeps only the newest pending frame, so
-        # channels sent in one burst starve each other and only the last one
-        # registers promptly (measured: 13-30s for the others, or never).
-        channels = 3 if self.overlay else 2
-        gap = max(0.0, (1.0 / self.fps) / channels)
+        frame = 0
         try:
             while not self._stop.is_set():
                 t = time.monotonic() - start
-                img = np.zeros((h, w, 4), dtype=np.uint8)
-                img[:, :, 0] = np.linspace(0, 255, w, dtype=np.uint8)[None, :]
-                img[:, :, 1] = np.linspace(0, 255, h, dtype=np.uint8)[:, None]
-                img[:, :, 2] = int((t * 60) % 256)
-                img[:, :, 3] = 255
-                bar = int((t * w / 3.0) % w)
-                img[:, max(0, bar - 4):bar + 4, :3] = 255
-                sender.send_image(0, img.tobytes(), w, h, fmt="bgra8",
-                                  group="camera/scene", role="color", stream_id=scene_color)
-                depth = np.linspace(300, 4000, h, dtype=np.uint16)[:, None].repeat(w, axis=1)
-                self._stop.wait(gap)
-                sender.send_depth_uint16(1, depth.tobytes(), w, h, group="camera/scene",
-                                         role="depth", stream_id=scene_depth)
-                self._stop.wait(gap)
-                if self.overlay:
-                    ov = np.zeros((h, w, 4), dtype=np.uint8)
-                    ov[:, :, 2] = 255
-                    ov[:, :, 3] = 255
-                    cy, cx = h // 2, int((t * w / 2.0) % w)
-                    ov[max(0, cy - 40):cy + 40, max(0, cx - 40):cx + 40, 1] = 255
-                    sender.send_image(2, ov.tobytes(), w, h, fmt="bgra8", group="overlay",
-                                      role="color", stream_id=overlay_color)
-                self._stop.wait(gap)
+                sends = _channel_sends(sender, t, w, h, ids, self.overlay)
+                _send_frame_spaced(
+                    sends,
+                    start + frame * period,
+                    period,
+                    lambda deadline: self._stop.wait(max(0.0, deadline - time.monotonic())),
+                    stop=self._stop.is_set,
+                )
+                frame += 1
         except OSError as exc:
             # Queued sends are reported by the worker, but anything raised here
             # would otherwise end the thread in silence and look like "video is
@@ -687,8 +820,8 @@ def cmd_stream(client, args):
     w, h = args.width, args.height
     # queue_size=0 sends synchronously, so a socket error raises here instead of
     # being logged by a worker thread while this command still prints
-    # "sent N frames ... dropped 0" and exits 0. This is a diagnostic: it should
-    # fail loudly. (It still only proves the bytes left the socket, not that the
+    # "sent N frames ..." and exits 0. This is a diagnostic: it should fail
+    # loudly. (It still only proves the bytes left the socket, not that the
     # editor rendered them -- that part is eyes-only.)
     sender = StreamSender(host=args.host, port=args.stream_port, queue_size=0)
     print(f"connecting to RMSS at {args.host}:{args.stream_port} ...")
@@ -707,44 +840,20 @@ def cmd_stream(client, args):
     print(f"expect: a {w}x{h} animated gradient with a moving bar, and depth that "
           "ramps front-to-back.")
 
+    ids = (scene_color, scene_depth, overlay_color)
+    period = 1.0 / args.fps
     frames = 0
-    # See VideoFeeder: the receiver keeps only the newest pending frame, so
-    # channels burst back-to-back starve each other. Space them out.
-    channels = 3 if args.overlay else 2
-    gap = max(0.0, (1.0 / args.fps) / channels)
     start = time.monotonic()
+
+    def sleep_until(deadline):
+        time.sleep(max(0.0, deadline - time.monotonic()))
+
     try:
         while time.monotonic() - start < args.seconds:
             t = time.monotonic() - start
-            # BGRA gradient with a bar sweeping left to right.
-            img = np.zeros((h, w, 4), dtype=np.uint8)
-            img[:, :, 0] = np.linspace(0, 255, w, dtype=np.uint8)[None, :]
-            img[:, :, 1] = np.linspace(0, 255, h, dtype=np.uint8)[:, None]
-            img[:, :, 2] = int((t * 60) % 256)
-            img[:, :, 3] = 255
-            bar = int((t * w / 3.0) % w)
-            img[:, max(0, bar - 4):bar + 4, :3] = 255
-            sender.send_image(0, img.tobytes(), w, h, fmt="bgra8",
-                              group="camera/scene", role="color", stream_id=scene_color)
-            time.sleep(gap)
-
-            # uint16 depth in millimetres, near at the top.
-            depth = np.linspace(300, 4000, h, dtype=np.uint16)[:, None].repeat(w, axis=1)
-            sender.send_depth_uint16(1, depth.tobytes(), w, h,
-                                     group="camera/scene", role="depth", stream_id=scene_depth)
-            time.sleep(gap)
-
-            if args.overlay:
-                ov = np.zeros((h, w, 4), dtype=np.uint8)
-                ov[:, :, 2] = 255
-                ov[:, :, 3] = 255
-                cy, cx = h // 2, int((t * w / 2.0) % w)
-                ov[max(0, cy - 40):cy + 40, max(0, cx - 40):cx + 40, 1] = 255
-                sender.send_image(2, ov.tobytes(), w, h, fmt="bgra8",
-                                  group="overlay", role="color", stream_id=overlay_color)
-
+            sends = _channel_sends(sender, t, w, h, ids, args.overlay)
+            _send_frame_spaced(sends, start + frames * period, period, sleep_until)
             frames += 1
-            time.sleep(gap)
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
@@ -775,7 +884,7 @@ def cmd_selftest(client, args):
         check(client._arguments.get("UpdatePanel") == ["PanelJSON"],
               "UpdatePanel declares PanelJSON",
               str(client._arguments.get("UpdatePanel")))
-        unbound = client.unbound_functions()
+        unbound = client.unbound_functions() or []
         check(not unbound, "every exposed function is bound to an object",
               f"{unbound} reach nothing -- Remote Control still answers HTTP 200, "
               "so every push below would be reported as a success. Rebind the "
@@ -1049,7 +1158,7 @@ def main():
 
     p = sub.add_parser("stream", help="send synthetic RMSS camera frames")
     p.add_argument("--seconds", type=float, default=10.0)
-    p.add_argument("--fps", type=float, default=15.0)
+    p.add_argument("--fps", type=_positive_float, default=15.0)
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=360)
     p.add_argument("--overlay", action="store_true", help="also send the engine overlay layer")
