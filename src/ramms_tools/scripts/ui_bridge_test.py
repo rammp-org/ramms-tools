@@ -67,6 +67,17 @@ FALLBACK_LABELS = {
 }
 
 
+def _unit_fraction(text):
+    """A progress fraction. pct is 0.0-1.0; 40 would be read as "4000%" or clamped."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError("--pct is a fraction from 0.0 to 1.0, not a percentage")
+    return value
+
+
 def _positive_int(text):
     """A count of objects to push: at least one. 0 would be a clear wearing a push's
     message, and a negative value silently drops from the END of the set instead."""
@@ -363,6 +374,46 @@ def panel(title="", message="", buttons=None, progress=None, style=None):
     return p
 
 
+# The fractions an advancing run walks through. 0.0 is deliberately first: it is the
+# value most likely to be mistaken for "no progress" by anything that infers the flag
+# from the payload instead of from the key's presence.
+PROGRESS_STEPS = (0.0, 0.3, 0.65, 1.0)
+
+
+def progress_panel(pct, phase="opening", title="fridge_ui_demo: open",
+                   message="opening door", pausable=True, buttons=None):
+    """A progress panel at one fraction. `pct` is 0.0-1.0, not a percentage.
+
+    The defaults keep everything except `pct` identical from call to call, which is
+    what makes an advancing run a test of the bar updating in place rather than of
+    the panel being rebuilt around it.
+    """
+    return panel(
+        title=title,
+        message=message,
+        buttons=buttons if buttons is not None
+        else [button("pause", "Pause", "normal"), button("cancel", "Cancel", "warning")],
+        progress={"phase": phase, "pct": pct, "message": message, "pausable": pausable},
+    )
+
+
+# Distinct panels that each carry their own progress: different phase, title, message,
+# buttons and fraction. A bar that keeps a previous panel's value, or that only tracks
+# the first panel it saw, shows up here and not in an advancing run of one panel.
+PROGRESS_PANELS = (
+    progress_panel(0.15, phase="unlatching", title="fridge_ui_demo: open",
+                   message="unlatching"),
+    progress_panel(0.55, phase="swinging", title="fridge_ui_demo: open",
+                   message="swinging door wide"),
+    progress_panel(0.8, phase="swinging", title="fridge_ui_demo: open",
+                   message="paused", pausable=False,
+                   buttons=[button("resume", "Resume", "normal"),
+                            button("cancel", "Cancel", "warning")]),
+    progress_panel(0.45, phase="reaching", title="arm_demo: reach",
+                   message="reaching for the handle"),
+)
+
+
 def detected_object(instance_id, perception_class, box, centroid=None, source="scene"):
     """One tappable object.
 
@@ -580,6 +631,32 @@ def cmd_discover(client, args):
 
 
 def cmd_panel(client, args):
+    if args.advance or args.phases or args.pct is not None:
+        if args.scenario not in ("progress", "paused"):
+            print("--pct, --advance and --phases only apply to the progress panels", file=sys.stderr)
+            return 2
+        if args.advance and args.phases:
+            print("--advance walks one panel, --phases walks several; pick one", file=sys.stderr)
+            return 2
+
+        if args.phases:
+            pushes = [(p, p["progress"]["pct"], p["message"]) for p in PROGRESS_PANELS]
+            what = ("each panel showed ITS OWN fraction, not the previous one's, and the\n"
+                    "          title, message and buttons changed with it")
+        else:
+            steps = PROGRESS_STEPS if args.advance else (args.pct,)
+            pushes = [(progress_panel(pct), pct, None) for pct in steps]
+            what = ("the bar moved through each value while the title, message and buttons\n"
+                    "          stayed put -- it should update in place, not rebuild the panel")
+
+        for i, (pan, pct, label) in enumerate(pushes):
+            client.update_panel(pan)
+            print(f"pushed pct={pct:.2f}" + (f"  ({label})" if label else ""))
+            if i + 1 < len(pushes):
+                time.sleep(args.interval)
+        print(f"  expect: {what}")
+        return 0
+
     pan, expectation = PANEL_SCENARIOS[args.scenario]
     ids = scenario_buttons(args.scenario)
     # Before the push, so a fast tap is not left behind the baseline.
@@ -1064,6 +1141,15 @@ def _optional(call, name):
     return run
 
 
+def _push_progress(client, args, pushes):
+    """Push a run of progress panels, spaced so a human can watch the bar move."""
+    for i, (pan, pct) in enumerate(pushes):
+        client.update_panel(pan)
+        print(f"  pushed pct={pct:.2f}")
+        if i + 1 < len(pushes):
+            time.sleep(args.progress_interval)
+
+
 def _walkthrough_steps(client, args):
     steps = [
         ("Idle panel", lambda: client.update_panel(PANEL_SCENARIOS["idle"][0]),
@@ -1072,6 +1158,27 @@ def _walkthrough_steps(client, args):
          PANEL_SCENARIOS["selection"][1], scenario_buttons("selection")),
         ("Progress panel", lambda: client.update_panel(PANEL_SCENARIOS["progress"][0]),
          PANEL_SCENARIOS["progress"][1], scenario_buttons("progress")),
+        ("Progress advances", lambda: _push_progress(client, args,
+            [(progress_panel(pct), pct) for pct in PROGRESS_STEPS]),
+         f"The SAME panel at {PROGRESS_STEPS}: the bar moves 0% to 100% while the\n"
+         "          title, message and buttons stay put. It should update in place --\n"
+         "          a panel that visibly rebuilds, or a bar that only moves on the first\n"
+         "          update, is the failure here. Note 0.0 must still SHOW a bar: a bar\n"
+         "          that appears only from the second update means something is inferring\n"
+         "          \"has progress\" from the value instead of from the key.", []),
+        ("Progress across panels", lambda: _push_progress(client, args,
+            [(pan, pan["progress"]["pct"]) for pan in PROGRESS_PANELS]),
+         "FOUR DIFFERENT panels, each carrying its own progress: 15% unlatching,\n"
+         "          55% swinging, 80% paused (Resume replaces Pause), then 45% on a\n"
+         "          different title. Each must show its own fraction -- a bar still\n"
+         "          holding the previous panel's value, or stuck on the first panel it\n"
+         "          saw, is the failure.", []),
+        ("Progress gone", lambda: client.update_panel(PANEL_SCENARIOS["selection"][0]),
+         "The bar DISAPPEARS and the selection panel's buttons are back. This is the\n"
+         "          regression check for the hasprogress bug: the schema omits the\n"
+         "          progress key rather than sending null, so a bar that stays visible\n"
+         "          here means the flag is latched instead of following the key.",
+         scenario_buttons("selection")),
         ("Error panel", lambda: client.update_panel(PANEL_SCENARIOS["error"][0]),
          PANEL_SCENARIOS["error"][1], scenario_buttons("error")),
         ("Layout stress", lambda: client.update_panel(PANEL_SCENARIOS["stress"][0]),
@@ -1277,6 +1384,14 @@ def main():
 
     p = sub.add_parser("panel", help="push one panel scenario")
     p.add_argument("--scenario", choices=sorted(PANEL_SCENARIOS), default="selection")
+    p.add_argument("--pct", type=_unit_fraction, default=None,
+                   help="push the progress panel at this 0.0-1.0 fraction instead")
+    p.add_argument("--advance", action="store_true",
+                   help=f"walk ONE panel through {PROGRESS_STEPS}, changing only pct")
+    p.add_argument("--phases", action="store_true",
+                   help="walk several DIFFERENT panels that each carry their own progress")
+    p.add_argument("--interval", type=_positive_float, default=1.0,
+                   help="seconds between --advance updates")
     p.add_argument("--wait", action="store_true", help="wait for a button press")
     p.add_argument("--timeout", type=float, default=60.0)
 
@@ -1316,6 +1431,8 @@ def main():
 
     p = sub.add_parser("walkthrough", help="guided pass over every surface")
     p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--progress-interval", type=_positive_float, default=0.8,
+                   help="seconds between the progress updates in the progress steps")
     p.add_argument("--no-taps", action="store_true", help="never wait for a tap")
     p.add_argument("--no-video", action="store_true",
                    help="do not stream synthetic frames during the walkthrough")
