@@ -417,7 +417,11 @@ PANEL_SCENARIOS = {
             progress={"phase": "opening", "pct": 0.4, "message": "opening door",
                       "pausable": True},
         ),
-        "A progress bar at 40% (pct is a 0.0-1.0 fraction) plus Pause/Cancel.",
+        "A progress bar at 40% (pct is a 0.0-1.0 fraction) plus Pause/Cancel.\n"
+        "          NO BAR AT ALL is the known failure: the schema marks progress optional\n"
+        "          by omitting the key, so FInteractionPanel's hasprogress is never sent\n"
+        "          and Json String To Struct leaves it false. The panel must set it from\n"
+        "          the key's presence (RammsBridgeSubsystem::PanelJsonHasProgress).",
     ),
     "paused": (
         panel(
