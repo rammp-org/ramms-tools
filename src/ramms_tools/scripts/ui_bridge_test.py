@@ -67,6 +67,18 @@ FALLBACK_LABELS = {
 }
 
 
+def _positive_int(text):
+    """A count of objects to push: at least one. 0 would be a clear wearing a push's
+    message, and a negative value silently drops from the END of the set instead."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer")
+    if value < 1:
+        raise argparse.ArgumentTypeError("--count must be 1 or more; use --clear to push nothing")
+    return value
+
+
 def _positive_float(text):
     """argparse type: --fps 0 would divide by zero when spacing the channels."""
     value = float(text)
@@ -470,10 +482,43 @@ PIXEL_SAMPLES = [
     ("tap_3", "faucet", (947, 72, 1178, 346), (1126, 302)),
 ]
 
+# A disjoint set: no instance_id here appears in NORMALIZED_SAMPLES. Pushing this
+# after that one is what catches a layer that adds without removing -- the ids have
+# to differ, or reusing a marker and leaking one look the same on screen.
+NORMALIZED_SAMPLES_B = [
+    ("jug_5", "jug", (0.12, 0.40, 0.38, 0.86), None),
+    ("plate_6", "plate", (0.44, 0.52, 0.72, 0.90), None),
+    ("knife_7", "knife", (0.60, 0.08, 0.95, 0.30), (0.78, 0.20)),
+]
 
-def sample_objects(source, pixels=False):
-    """Three tappable objects, normalized unless `pixels` asks otherwise."""
-    samples = PIXEL_SAMPLES if pixels else NORMALIZED_SAMPLES
+# Objects with no instance_id: they draw, but nothing can key a marker on them, so
+# they exercise the unkeyed path (reused in order, surplus removed) and a tap on one
+# has no id to send.
+UNKEYED_SAMPLES = [
+    ("", "unknown", (0.20, 0.20, 0.40, 0.45), None),
+    ("", "unknown", (0.55, 0.55, 0.78, 0.82), None),
+]
+
+SAMPLE_SETS = {
+    "a": NORMALIZED_SAMPLES,
+    "b": NORMALIZED_SAMPLES_B,
+    "unkeyed": UNKEYED_SAMPLES,
+}
+
+
+def sample_objects(source, pixels=False, variant="a", count=None):
+    """Tappable objects from one sample set, normalized unless `pixels` asks otherwise.
+
+    `count` takes only the first N, to check that dropping an object removes its
+    marker rather than leaving it behind.
+    """
+    if variant not in SAMPLE_SETS:
+        raise KeyError(f"unknown sample set {variant!r}; try one of {sorted(SAMPLE_SETS)}")
+    if pixels and variant != "a":
+        raise ValueError(f"there is no pixel-space sample set for {variant!r}, only for 'a'")
+    samples = PIXEL_SAMPLES if pixels else SAMPLE_SETS[variant]
+    if count is not None:
+        samples = samples[:count]
     return [detected_object(iid, cls, box, centroid, source)
             for iid, cls, box, centroid in samples]
 
@@ -545,20 +590,31 @@ def cmd_panel(client, args):
 
 
 def cmd_objects(client, args):
+    if args.clear and (args.count is not None or args.set != "a"):
+        print("--clear pushes an empty list, so --set and --count do nothing", file=sys.stderr)
+        return 2
+    if args.pixels and args.set != "a":
+        print("--pixels only has a pixel-space set for --set a", file=sys.stderr)
+        return 2
+    # None means "discover it"; an explicit --stream-id '' is honoured as empty, which
+    # is what the real bridge sends and is not the same request at all.
     stream_id = args.stream_id
-    if not stream_id:
+    if stream_id is None:
         prop = "SceneColorStreamID" if args.source == "scene" else "OverlayColorStreamID"
         try:
             stream_id = client.get_setting(prop) or ""
         except BridgeError:
             stream_id = ""
-    objects = [] if args.clear else sample_objects(args.source, args.pixels)
+    objects = [] if args.clear else sample_objects(
+        args.source, args.pixels, args.set, args.count)
     payload = detected_objects_payload(objects, args.select or "", stream_id)
     since = _current_sequence(client) if args.wait else None
     client.update_detected_objects(payload)
     if args.clear:
         print(f"cleared detected objects on stream_id={stream_id!r}")
-        print("  expect: every box disappears from the view.")
+        print("  expect: every box AND every POI disappears from the view -- an empty")
+        print("          list is the full set, so it clears every stream, whatever")
+        print("          stream_id it carries.")
         return 0
     space = "pixel (1280x720)" if args.pixels else "normalized 0-1"
     print(f"pushed {len(objects)} objects on stream_id={stream_id!r} source={args.source!r} "
@@ -570,8 +626,12 @@ def cmd_objects(client, args):
               "FallbackDetectionImageSize (640x480) if nothing is streaming -- so "
               "these only land correctly against a 1280x720 feed.")
     if args.wait:
-        return _await_tap(client, [o["instance_id"] for o in objects], args.timeout,
-                          since=since)
+        wanted = [o["instance_id"] for o in objects if o["instance_id"]]
+        if not wanted:
+            print("  note: none of these objects has an instance_id, and a tap on one sends no id,")
+            print("        so there is nothing to wait for. Skipping the wait.")
+            return 0
+        return _await_tap(client, wanted, args.timeout, since=since)
     return 0
 
 
@@ -983,6 +1043,23 @@ def cmd_walkthrough(client, args):
                 print(f"  note: {feeder.error}")
 
 
+def _optional(call, name):
+    """Run a bridge call whose absence should not end the walkthrough.
+
+    The camera feed is optional throughout this tool -- REQUIRED_FUNCTIONS deliberately
+    leaves OpenCameraFeed/CloseCameraFeed out, and selftest degrades gracefully for them.
+    A preset without them must not abort the run before the steps that exercise clearing,
+    which is what the later steps are for.
+    """
+    def run():
+        try:
+            call()
+        except BridgeError as exc:
+            print(f"  SKIPPED: {name} is not on this preset ({exc})")
+            print("           the overlay will not open, so the overlay steps below show nothing")
+    return run
+
+
 def _walkthrough_steps(client, args):
     steps = [
         ("Idle panel", lambda: client.update_panel(PANEL_SCENARIOS["idle"][0]),
@@ -995,52 +1072,110 @@ def _walkthrough_steps(client, args):
          PANEL_SCENARIOS["error"][1], scenario_buttons("error")),
         ("Layout stress", lambda: client.update_panel(PANEL_SCENARIOS["stress"][0]),
          PANEL_SCENARIOS["stress"][1], scenario_buttons("stress")),
-        ("Camera feed open", client.open_camera_feed,
-         "The camera feed appears.", []),
         ("Detected objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "cup_1",
                                      _scene_stream_id(client))),
-         "Three boxes on the scene view, cup_1 highlighted. Coordinates are\n          normalized, so they land the same whether or not a feed is streaming.", []),
+         "Three boxes on the SCENE camera, cup_1 highlighted, and a POI for each\n"
+         "          on the scene camera's POI layer. The coordinates are normalized, so\n"
+         "          they do not move with the frame size -- but the scene CAMERA is\n"
+         "          collapsed until its first frame arrives, so with nothing streaming\n"
+         "          expect the POIs alone and no boxes. (The overlay is not open yet;\n"
+         "          that is checked at \"Both cameras at once\".)", []),
         ("Selection moves", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "bowl_2",
                                      _scene_stream_id(client))),
          "Same three boxes, highlight moves to bowl_2.", []),
+        ("Objects replaced", lambda: client.update_detected_objects(
+            detected_objects_payload(sample_objects("scene", variant="b"), "jug_5",
+                                     _scene_stream_id(client))),
+         "A DIFFERENT three objects -- jug_5, plate_6, knife_7 -- with jug_5\n"
+         "          highlighted. None of cup_1, bowl_2 or tap_3 may still be on\n"
+         "          screen: six at once means the layer adds without removing.", []),
+        ("One object dropped", lambda: client.update_detected_objects(
+            detected_objects_payload(sample_objects("scene", variant="b", count=1), "",
+                                     _scene_stream_id(client))),
+         "Exactly ONE object, jug_5, nothing highlighted. plate_6 and knife_7 are\n"
+         "          gone -- each push is the full set, so what it leaves out is over.", []),
+        ("Objects without ids", lambda: client.update_detected_objects(
+            detected_objects_payload(sample_objects("scene", variant="unkeyed"), "",
+                                     _scene_stream_id(client))),
+         "Two objects labelled \"unknown\", and jug_5 gone. These carry no\n"
+         "          instance_id, so nothing can key a marker on them and a tap on one\n"
+         "          sends nothing at all -- the marker refuses to post without an id.", []),
         ("Objects cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _scene_stream_id(client))),
-         "All boxes disappear from the scene camera.", []),
+         "Every box and POI disappears -- not just the scene camera's. An empty\n"
+         "          list is the full set, so it clears every stream.", []),
+        ("Overlay camera opened", _optional(client.open_camera_feed, "OpenCameraFeed"),
+         "The engine overlay's window appears. OpenCameraFeed drives this, so it\n"
+         "          has to come BEFORE the overlay's objects: boxes and POIs are drawn\n"
+         "          over an image, and until that image is up there is nothing to draw\n"
+         "          them on.", []),
         ("Overlay objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("overlay"), "bowl_2",
                                      _overlay_stream_id(client))),
-         "Boxes now on the ENGINE OVERLAY, not the scene camera, bowl_2\n"
-         "          highlighted. The two layers are independent: each needs its own\n"
-         "          frames and its own objects.", []),
+         "Boxes and POIs now on the ENGINE OVERLAY only, bowl_2 highlighted, and\n"
+         "          the scene camera stays empty. The two cameras are independent\n"
+         "          surfaces: each needs its own frames, its own objects, and its own\n"
+         "          POI layer, because a centroid is normalized to the image it was\n"
+         "          found in.", []),
         ("Overlay cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _overlay_stream_id(client))),
-         "The overlay's boxes disappear.", []),
-        ("Camera feed close", client.close_camera_feed,
-         "The camera feed disappears.", []),
+         "The overlay's boxes and POIs disappear. (An empty list clears every\n"
+         "          stream; only the overlay had anything to lose here.)", []),
+        ("Both cameras at once", lambda: client.update_detected_objects(
+            detected_objects_payload(
+                sample_objects("scene") + sample_objects("overlay", variant="b"),
+                "cup_1", _scene_stream_id(client))),
+         "ONE push, both cameras: cup_1/bowl_2/tap_3 on the scene camera and\n"
+         "          jug_5/plate_6/knife_7 on the engine overlay, each with its own\n"
+         "          boxes and POIs. Each object's own `source` decides which surface\n"
+         "          takes it, not the push's stream_id. An object must NOT appear on\n"
+         "          both, and must not appear on the wrong one: that would mean a\n"
+         "          surface is accepting every source and placing another camera's\n"
+         "          coordinates against its own rectangle.", []),
+        ("Cleared the way the bridge clears", lambda: client.update_detected_objects(
+            detected_objects_payload([], "", "")),
+         "EVERYTHING disappears, from both layers at once. This is the real\n"
+         "          bridge's clear: an empty objects list with an EMPTY stream_id.\n"
+         "          stream_id is never consulted on a clear, so it clears every\n"
+         "          stream -- boxes and POIs alike.", []),
+        ("Overlay camera closed", _optional(client.close_camera_feed, "CloseCameraFeed"),
+         "The engine overlay's window disappears. Its POIs and boxes go with it.", []),
     ]
 
-    for index, (title, action, expectation, ids) in enumerate(steps, 1):
-        print(f"\n[{index}/{len(steps)}] {title}")
-        since = _current_sequence(client) if (ids and not args.no_taps) else None
-        try:
-            action()
-        except BridgeError as exc:
-            print(f"  FAILED: {exc}")
-            return 1
-        print(f"  expect: {expectation}")
-        if ids and not args.no_taps:
-            print(f"  tap any of {ids} (or press Enter to skip)")
-            if _await_button(client, ids, args.timeout, allow_skip=True,
-                             since=since) == 1:
+    def run_steps():
+        for index, (title, action, expectation, ids) in enumerate(steps, 1):
+            print(f"\n[{index}/{len(steps)}] {title}")
+            since = _current_sequence(client) if (ids and not args.no_taps) else None
+            try:
+                action()
+            except BridgeError as exc:
+                print(f"  FAILED: {exc}")
                 return 1
-        else:
-            input("  press Enter to continue ")
+            print(f"  expect: {expectation}")
+            if ids and not args.no_taps:
+                print(f"  tap any of {ids} (or press Enter to skip)")
+                if _await_button(client, ids, args.timeout, allow_skip=True,
+                                 since=since) == 1:
+                    return 1
+            else:
+                input("  press Enter to continue ")
+        return 0
 
-    client.update_panel(PANEL_SCENARIOS["idle"][0])
-    print("\nwalkthrough complete; UI left on the idle panel")
-    return 0
+    try:
+        result = run_steps()
+    finally:
+        # However the run ended, leave the UI somewhere sane rather than on whatever
+        # panel and detections it had reached.
+        try:
+            client.update_detected_objects(detected_objects_payload([], "", ""))
+            client.update_panel(PANEL_SCENARIOS["idle"][0])
+        except BridgeError:
+            pass
+    print("\nwalkthrough complete; UI left on the idle panel"
+          if result == 0 else "\nwalkthrough stopped; UI reset to the idle panel")
+    return result
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -1144,7 +1279,12 @@ def main():
     p = sub.add_parser("objects", help="push detected objects")
     p.add_argument("--source", choices=("scene", "overlay"), default="scene")
     p.add_argument("--select", default="", help="instance_id to highlight")
-    p.add_argument("--stream-id", default="", help="override the stream_id")
+    p.add_argument("--stream-id", default=None,
+                   help="override the stream_id; pass '' for the empty one the bridge sends")
+    p.add_argument("--set", choices=sorted(SAMPLE_SETS), default="a",
+                   help="which sample set: 'b' is disjoint from 'a', 'unkeyed' has no instance_ids")
+    p.add_argument("--count", type=_positive_int, default=None,
+                   help="push only the first N of the set, to check the rest are removed")
     p.add_argument("--clear", action="store_true", help="push an empty list instead")
     p.add_argument("--pixels", action="store_true",
                    help="send pixel-space boxes for a 1280x720 feed instead of normalized 0-1")
