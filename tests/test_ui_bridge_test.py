@@ -14,6 +14,7 @@ import pytest
 
 from ramms_tools.scripts.ui_bridge_test import (
     PANEL_SCENARIOS,
+    SAMPLE_SETS,
     BridgeClient,
     BridgeError,
     button,
@@ -22,6 +23,7 @@ from ramms_tools.scripts.ui_bridge_test import (
     panel,
     sample_objects,
     scenario_buttons,
+    _positive_int,
 )
 
 
@@ -91,12 +93,16 @@ def test_explicit_centroid_wins():
 
 def test_samples_are_normalized_by_default():
     """Pixel boxes get divided by the live frame size (or a 640x480 fallback), so
-    a box drawn for 1280x720 lands off-screen. Coordinates <= 1.0 are used as-is."""
-    for obj in sample_objects("scene"):
-        for key in ("X", "Y", "Z", "W"):
-            assert 0.0 <= obj["box"][key] <= 1.0, obj
-        for key in ("X", "Y"):
-            assert 0.0 <= obj["centroid"][key] <= 1.0, obj
+    a box drawn for 1280x720 lands off-screen. Coordinates <= 1.0 are used as-is.
+
+    Every set, not just "a": a set that strays above 1.0 is silently rescaled by the
+    widget and lands somewhere else entirely."""
+    for variant in SAMPLE_SETS:
+        for obj in sample_objects("scene", variant=variant):
+            for key in ("X", "Y", "Z", "W"):
+                assert 0.0 <= obj["box"][key] <= 1.0, obj
+            for key in ("X", "Y"):
+                assert 0.0 <= obj["centroid"][key] <= 1.0, obj
 
 
 def test_pixel_samples_fit_a_1280x720_frame():
@@ -109,10 +115,66 @@ def test_pixel_samples_fit_a_1280x720_frame():
 
 def test_box_is_never_degenerate():
     """A box whose min equals its max reads as 'no box' and is skipped."""
-    for pixels in (False, True):
-        for obj in sample_objects("scene", pixels=pixels):
+    for variant in SAMPLE_SETS:
+        for obj in sample_objects("scene", variant=variant):
             assert obj["box"]["X"] != obj["box"]["Z"], obj
             assert obj["box"]["Y"] != obj["box"]["W"], obj
+    for obj in sample_objects("scene", pixels=True):
+        assert obj["box"]["X"] != obj["box"]["Z"], obj
+        assert obj["box"]["Y"] != obj["box"]["W"], obj
+
+
+def test_centroid_is_never_the_skipped_origin():
+    """A centroid of exactly (0, 0) with no box is the orchestrator's 'no position',
+    and is dropped. A sample that hit it would silently never appear."""
+    for variant in SAMPLE_SETS:
+        for obj in sample_objects("scene", variant=variant):
+            assert (obj["centroid"]["X"], obj["centroid"]["Y"]) != (0.0, 0.0), obj
+
+
+def test_sets_a_and_b_share_no_instance_id():
+    """The 'Objects replaced' step proves removal by pushing a disjoint set. A shared
+    id would be reused rather than removed, and the step would pass either way."""
+    a = {o["instance_id"] for o in sample_objects("scene", variant="a")}
+    b = {o["instance_id"] for o in sample_objects("scene", variant="b")}
+    assert a and b and not (a & b), (a, b)
+
+
+def test_unkeyed_set_has_no_instance_ids():
+    objs = sample_objects("scene", variant="unkeyed")
+    assert objs and all(o["instance_id"] == "" for o in objs), objs
+
+
+def test_count_takes_the_first_n():
+    objs = sample_objects("scene", variant="b", count=1)
+    assert [o["instance_id"] for o in objs] == ["jug_5"], objs
+
+
+def test_pixels_with_another_set_is_refused():
+    """Silently returning set 'a' would make a programmatic caller test the wrong set."""
+    with pytest.raises(ValueError):
+        sample_objects("scene", pixels=True, variant="b")
+    with pytest.raises(KeyError):
+        sample_objects("scene", variant="nope")
+
+
+def test_count_must_be_at_least_one():
+    """0 would be a clear wearing a push's message; a negative value drops from the END."""
+    import argparse
+
+    assert _positive_int("3") == 3
+    for bad in ("0", "-1", "x"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _positive_int(bad)
+
+
+def test_clear_payload_carries_an_empty_stream_id():
+    """What the real bridge sends, and what the final walkthrough step asserts."""
+    assert detected_objects_payload([], "", "") == {
+        "stream_id": "",
+        "selected_instance_id": "",
+        "objects": [],
+    }
 
 
 def test_payload_carries_selection_and_stream_id():

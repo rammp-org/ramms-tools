@@ -67,6 +67,18 @@ FALLBACK_LABELS = {
 }
 
 
+def _positive_int(text):
+    """A count of objects to push: at least one. 0 would be a clear wearing a push's
+    message, and a negative value silently drops from the END of the set instead."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer")
+    if value < 1:
+        raise argparse.ArgumentTypeError("--count must be 1 or more; use --clear to push nothing")
+    return value
+
+
 def _positive_float(text):
     """argparse type: --fps 0 would divide by zero when spacing the channels."""
     value = float(text)
@@ -500,6 +512,10 @@ def sample_objects(source, pixels=False, variant="a", count=None):
     `count` takes only the first N, to check that dropping an object removes its
     marker rather than leaving it behind.
     """
+    if variant not in SAMPLE_SETS:
+        raise KeyError(f"unknown sample set {variant!r}; try one of {sorted(SAMPLE_SETS)}")
+    if pixels and variant != "a":
+        raise ValueError(f"there is no pixel-space sample set for {variant!r}, only for 'a'")
     samples = PIXEL_SAMPLES if pixels else SAMPLE_SETS[variant]
     if count is not None:
         samples = samples[:count]
@@ -574,6 +590,9 @@ def cmd_panel(client, args):
 
 
 def cmd_objects(client, args):
+    if args.clear and (args.count is not None or args.set != "a"):
+        print("--clear pushes an empty list, so --set and --count do nothing", file=sys.stderr)
+        return 2
     if args.pixels and args.set != "a":
         print("--pixels only has a pixel-space set for --set a", file=sys.stderr)
         return 2
@@ -607,8 +626,12 @@ def cmd_objects(client, args):
               "FallbackDetectionImageSize (640x480) if nothing is streaming -- so "
               "these only land correctly against a 1280x720 feed.")
     if args.wait:
-        return _await_tap(client, [o["instance_id"] for o in objects], args.timeout,
-                          since=since)
+        wanted = [o["instance_id"] for o in objects if o["instance_id"]]
+        if not wanted:
+            print("  note: none of these objects has an instance_id, and a tap on one sends no id,")
+            print("        so there is nothing to wait for. Skipping the wait.")
+            return 0
+        return _await_tap(client, wanted, args.timeout, since=since)
     return 0
 
 
@@ -1020,6 +1043,23 @@ def cmd_walkthrough(client, args):
                 print(f"  note: {feeder.error}")
 
 
+def _optional(call, name):
+    """Run a bridge call whose absence should not end the walkthrough.
+
+    The camera feed is optional throughout this tool -- REQUIRED_FUNCTIONS deliberately
+    leaves OpenCameraFeed/CloseCameraFeed out, and selftest degrades gracefully for them.
+    A preset without them must not abort the run before the steps that exercise clearing,
+    which is what the later steps are for.
+    """
+    def run():
+        try:
+            call()
+        except BridgeError as exc:
+            print(f"  SKIPPED: {name} is not on this preset ({exc})")
+            print("           the overlay will not open, so the overlay steps below show nothing")
+    return run
+
+
 def _walkthrough_steps(client, args):
     steps = [
         ("Idle panel", lambda: client.update_panel(PANEL_SCENARIOS["idle"][0]),
@@ -1036,10 +1076,11 @@ def _walkthrough_steps(client, args):
             detected_objects_payload(sample_objects("scene"), "cup_1",
                                      _scene_stream_id(client))),
          "Three boxes on the SCENE camera, cup_1 highlighted, and a POI for each\n"
-         "          on the scene camera's POI layer. Nothing on the engine overlay:\n"
-         "          every surface takes only its own camera's objects. Coordinates are\n"
-         "          normalized to that camera's image, so they land the same whether or\n"
-         "          not a feed is streaming.", []),
+         "          on the scene camera's POI layer. The coordinates are normalized, so\n"
+         "          they do not move with the frame size -- but the scene CAMERA is\n"
+         "          collapsed until its first frame arrives, so with nothing streaming\n"
+         "          expect the POIs alone and no boxes. (The overlay is not open yet;\n"
+         "          that is checked at \"Both cameras at once\".)", []),
         ("Selection moves", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "bowl_2",
                                      _scene_stream_id(client))),
@@ -1058,12 +1099,14 @@ def _walkthrough_steps(client, args):
         ("Objects without ids", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene", variant="unkeyed"), "",
                                      _scene_stream_id(client))),
-         "Two unlabelled objects, and jug_5 gone. These have no instance_id, so\n"
-         "          nothing can key a marker on them and a tap sends no id.", []),
+         "Two objects labelled \"unknown\", and jug_5 gone. These carry no\n"
+         "          instance_id, so nothing can key a marker on them and a tap on one\n"
+         "          sends nothing at all -- the marker refuses to post without an id.", []),
         ("Objects cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _scene_stream_id(client))),
-         "All boxes and POIs disappear from the scene camera.", []),
-        ("Overlay camera opened", client.open_camera_feed,
+         "Every box and POI disappears -- not just the scene camera's. An empty\n"
+         "          list is the full set, so it clears every stream.", []),
+        ("Overlay camera opened", _optional(client.open_camera_feed, "OpenCameraFeed"),
          "The engine overlay's window appears. OpenCameraFeed drives this, so it\n"
          "          has to come BEFORE the overlay's objects: boxes and POIs are drawn\n"
          "          over an image, and until that image is up there is nothing to draw\n"
@@ -1078,7 +1121,8 @@ def _walkthrough_steps(client, args):
          "          found in.", []),
         ("Overlay cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _overlay_stream_id(client))),
-         "The overlay's boxes and POIs disappear.", []),
+         "The overlay's boxes and POIs disappear. (An empty list clears every\n"
+         "          stream; only the overlay had anything to lose here.)", []),
         ("Both cameras at once", lambda: client.update_detected_objects(
             detected_objects_payload(
                 sample_objects("scene") + sample_objects("overlay", variant="b"),
@@ -1096,30 +1140,42 @@ def _walkthrough_steps(client, args):
          "          bridge's clear: an empty objects list with an EMPTY stream_id.\n"
          "          stream_id is never consulted on a clear, so it clears every\n"
          "          stream -- boxes and POIs alike.", []),
-        ("Overlay camera closed", client.close_camera_feed,
+        ("Overlay camera closed", _optional(client.close_camera_feed, "CloseCameraFeed"),
          "The engine overlay's window disappears. Its POIs and boxes go with it.", []),
     ]
 
-    for index, (title, action, expectation, ids) in enumerate(steps, 1):
-        print(f"\n[{index}/{len(steps)}] {title}")
-        since = _current_sequence(client) if (ids and not args.no_taps) else None
-        try:
-            action()
-        except BridgeError as exc:
-            print(f"  FAILED: {exc}")
-            return 1
-        print(f"  expect: {expectation}")
-        if ids and not args.no_taps:
-            print(f"  tap any of {ids} (or press Enter to skip)")
-            if _await_button(client, ids, args.timeout, allow_skip=True,
-                             since=since) == 1:
+    def run_steps():
+        for index, (title, action, expectation, ids) in enumerate(steps, 1):
+            print(f"\n[{index}/{len(steps)}] {title}")
+            since = _current_sequence(client) if (ids and not args.no_taps) else None
+            try:
+                action()
+            except BridgeError as exc:
+                print(f"  FAILED: {exc}")
                 return 1
-        else:
-            input("  press Enter to continue ")
+            print(f"  expect: {expectation}")
+            if ids and not args.no_taps:
+                print(f"  tap any of {ids} (or press Enter to skip)")
+                if _await_button(client, ids, args.timeout, allow_skip=True,
+                                 since=since) == 1:
+                    return 1
+            else:
+                input("  press Enter to continue ")
+        return 0
 
-    client.update_panel(PANEL_SCENARIOS["idle"][0])
-    print("\nwalkthrough complete; UI left on the idle panel")
-    return 0
+    try:
+        result = run_steps()
+    finally:
+        # However the run ended, leave the UI somewhere sane rather than on whatever
+        # panel and detections it had reached.
+        try:
+            client.update_detected_objects(detected_objects_payload([], "", ""))
+            client.update_panel(PANEL_SCENARIOS["idle"][0])
+        except BridgeError:
+            pass
+    print("\nwalkthrough complete; UI left on the idle panel"
+          if result == 0 else "\nwalkthrough stopped; UI reset to the idle panel")
+    return result
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -1227,7 +1283,7 @@ def main():
                    help="override the stream_id; pass '' for the empty one the bridge sends")
     p.add_argument("--set", choices=sorted(SAMPLE_SETS), default="a",
                    help="which sample set: 'b' is disjoint from 'a', 'unkeyed' has no instance_ids")
-    p.add_argument("--count", type=int, default=None,
+    p.add_argument("--count", type=_positive_int, default=None,
                    help="push only the first N of the set, to check the rest are removed")
     p.add_argument("--clear", action="store_true", help="push an empty list instead")
     p.add_argument("--pixels", action="store_true",
