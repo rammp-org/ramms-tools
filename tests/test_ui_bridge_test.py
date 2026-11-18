@@ -25,9 +25,10 @@ from ramms_tools.scripts.ui_bridge_test import (
     scenario_buttons,
     PROGRESS_STEPS,
     PROGRESS_PANELS,
+    PROGRESS_SCALE_PAIRS,
     progress_panel,
     _positive_int,
-    _unit_fraction,
+    _percent,
 )
 
 
@@ -708,15 +709,25 @@ def test_progress_panel_always_carries_the_progress_key():
 
 def test_progress_steps_start_at_zero_and_end_full():
     assert PROGRESS_STEPS[0] == 0.0
-    assert PROGRESS_STEPS[-1] == 1.0
+    assert PROGRESS_STEPS[-1] == 100.0
     assert list(PROGRESS_STEPS) == sorted(PROGRESS_STEPS), PROGRESS_STEPS
 
 
-def test_progress_fractions_are_fractions_not_percentages():
-    for pct in PROGRESS_STEPS:
-        assert 0.0 <= pct <= 1.0, pct
-    for pan in PROGRESS_PANELS:
-        assert 0.0 <= pan["progress"]["pct"] <= 1.0, pan
+def test_progress_values_use_the_0_100_scale_this_ui_expects():
+    """RAMMS_Panel divides pct before handing it to the bar, and the schema records
+    fridge_ui_demo -- the engine these panels impersonate -- as yielding 0-100 for
+    that reason. A fraction renders a bar 0.4% full while looking like a UI bug.
+
+    Anything in (0, 1) is the fraction mistake, so no value may sit there."""
+    for pct in list(PROGRESS_STEPS) + [p["progress"]["pct"] for p in PROGRESS_PANELS]:
+        assert 0.0 <= pct <= 100.0, pct
+        assert not (0.0 < pct < 1.0), f"{pct} looks like a 0.0-1.0 fraction"
+
+
+def test_stored_progress_scenarios_use_the_same_scale():
+    for name in ("progress", "paused"):
+        pct = PANEL_SCENARIOS[name][0]["progress"]["pct"]
+        assert pct > 1.0, (name, pct)
 
 
 def test_advancing_run_changes_only_the_fraction():
@@ -747,11 +758,26 @@ def test_non_progress_scenarios_omit_the_key_entirely():
         assert "progress" not in PANEL_SCENARIOS[name][0], name
 
 
-def test_pct_must_be_a_unit_fraction():
+def test_pct_takes_either_scale():
+    """The UI accepts both now (PanelProgressFraction), so neither is a mistake."""
     import argparse
 
-    assert _unit_fraction("0") == 0.0
-    assert _unit_fraction("1") == 1.0
-    for bad in ("40", "-0.1", "1.5", "x"):
+    for good in ("0", "0.4", "40", "1", "100"):
+        _percent(good)
+    for bad in ("-1", "101", "x"):
         with pytest.raises(argparse.ArgumentTypeError):
-            _unit_fraction(bad)
+            _percent(bad)
+
+
+def test_scale_pairs_are_equivalent_values_on_the_two_scales():
+    """Each pair must mean the same bar under the over-1-is-a-percentage rule, or the
+    step asserts something false and a one-scale panel would pass it."""
+    for fraction, percent in PROGRESS_SCALE_PAIRS:
+        assert 0.0 < fraction <= 1.0, fraction
+        assert percent > 1.0, percent
+        assert abs(fraction * 100.0 - percent) < 1e-9, (fraction, percent)
+
+
+def test_scale_pairs_include_the_ambiguous_one():
+    """1.0 vs 100 is the pair the rule has to make a choice about, so it is covered."""
+    assert (1.0, 100.0) in PROGRESS_SCALE_PAIRS
