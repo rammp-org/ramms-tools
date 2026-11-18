@@ -23,7 +23,12 @@ from ramms_tools.scripts.ui_bridge_test import (
     panel,
     sample_objects,
     scenario_buttons,
+    PROGRESS_STEPS,
+    PROGRESS_PANELS,
+    PROGRESS_SCALE_PAIRS,
+    progress_panel,
     _positive_int,
+    _percent,
 )
 
 
@@ -689,3 +694,90 @@ def test_a_stop_between_channels_abandons_the_rest_of_the_frame():
     assert module._send_frame_spaced(sends, 0.0, 1.0, lambda d: None,
                                      stop=lambda: stopped["now"]) is False
     assert sent == [0], "must not keep sending ~900 KB per channel after a stop"
+
+
+# ── progress ─────────────────────────────────────────────────────────
+
+def test_progress_panel_always_carries_the_progress_key():
+    """The key's PRESENCE is the flag -- the schema omits it rather than sending null.
+    A pct of 0.0 must still carry it, or the bar only appears from the second update."""
+    for pct in PROGRESS_STEPS:
+        p = progress_panel(pct)
+        assert "progress" in p, p
+        assert p["progress"]["pct"] == pct, p
+
+
+def test_progress_steps_start_at_zero_and_end_full():
+    assert PROGRESS_STEPS[0] == 0.0
+    assert PROGRESS_STEPS[-1] == 100.0
+    assert list(PROGRESS_STEPS) == sorted(PROGRESS_STEPS), PROGRESS_STEPS
+
+
+def test_progress_values_use_the_0_100_scale_this_ui_expects():
+    """RAMMS_Panel divides pct before handing it to the bar, and the schema records
+    fridge_ui_demo -- the engine these panels impersonate -- as yielding 0-100 for
+    that reason. A fraction renders a bar 0.4% full while looking like a UI bug.
+
+    Anything in (0, 1) is the fraction mistake, so no value may sit there."""
+    for pct in list(PROGRESS_STEPS) + [p["progress"]["pct"] for p in PROGRESS_PANELS]:
+        assert 0.0 <= pct <= 100.0, pct
+        assert not (0.0 < pct < 1.0), f"{pct} looks like a 0.0-1.0 fraction"
+
+
+def test_stored_progress_scenarios_use_the_same_scale():
+    for name in ("progress", "paused"):
+        pct = PANEL_SCENARIOS[name][0]["progress"]["pct"]
+        assert pct > 1.0, (name, pct)
+
+
+def test_advancing_run_changes_only_the_fraction():
+    """This is what makes it a test of the bar updating in place: if the title,
+    message or buttons moved too, a panel rebuild would pass as a working bar."""
+    panels = [progress_panel(pct) for pct in PROGRESS_STEPS]
+    for key in ("title", "message", "buttons"):
+        assert len({json.dumps(p[key]) for p in panels}) == 1, key
+    assert len({p["progress"]["pct"] for p in panels}) == len(PROGRESS_STEPS)
+
+
+def test_multi_panel_progress_values_are_distinct():
+    """A bar holding a previous panel's value only shows up if the values differ."""
+    pcts = [p["progress"]["pct"] for p in PROGRESS_PANELS]
+    assert len(set(pcts)) == len(pcts), pcts
+    assert len(PROGRESS_PANELS) > 2
+
+
+def test_multi_panel_progress_varies_the_panel_too():
+    """Otherwise it is just an advancing run under a different name."""
+    assert len({p["message"] for p in PROGRESS_PANELS}) > 1
+    assert len({json.dumps(p["buttons"]) for p in PROGRESS_PANELS}) > 1
+
+
+def test_non_progress_scenarios_omit_the_key_entirely():
+    """Sending null instead would defeat the key-existence check the UI now does."""
+    for name in ("idle", "selection", "error"):
+        assert "progress" not in PANEL_SCENARIOS[name][0], name
+
+
+def test_pct_takes_either_scale():
+    """The UI accepts both now (PanelProgressFraction), so neither is a mistake."""
+    import argparse
+
+    for good in ("0", "0.4", "40", "1", "100"):
+        _percent(good)
+    for bad in ("-1", "101", "x"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _percent(bad)
+
+
+def test_scale_pairs_are_equivalent_values_on_the_two_scales():
+    """Each pair must mean the same bar under the over-1-is-a-percentage rule, or the
+    step asserts something false and a one-scale panel would pass it."""
+    for fraction, percent in PROGRESS_SCALE_PAIRS:
+        assert 0.0 < fraction <= 1.0, fraction
+        assert percent > 1.0, percent
+        assert abs(fraction * 100.0 - percent) < 1e-9, (fraction, percent)
+
+
+def test_scale_pairs_include_the_ambiguous_one():
+    """1.0 vs 100 is the pair the rule has to make a choice about, so it is covered."""
+    assert (1.0, 100.0) in PROGRESS_SCALE_PAIRS
