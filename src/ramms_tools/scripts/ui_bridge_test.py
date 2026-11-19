@@ -14,6 +14,9 @@ Usage:
     ramms-ui-bridge-test stream --seconds 10      # synthetic RMSS camera frames
     ramms-ui-bridge-test events --follow          # watch taps as you click
     ramms-ui-bridge-test events --expect probe:ok --timeout 30
+    ramms-ui-bridge-test joints                   # robot display: joints, monitor, status bar
+    ramms-ui-bridge-test joints --check           # stow/activate/drive/park, all read back
+    ramms-ui-bridge-test joints --set link_1=40   # by name; every other joint held
     ramms-ui-bridge-test walkthrough              # guided pass over everything
 
 Requires the UE editor running with Remote Control enabled (HTTP on 30010) and
@@ -27,6 +30,13 @@ actually declares, and that taps come back through PollUIEvents with the exact
 IDs that were pushed. Those are the two things that broke silently before -- a
 mis-named parameter is accepted with HTTP 200 and arrives as an empty string.
 
+Also automatic: the robot display's joints. Joint targets, the joint-motion
+monitor's verdict (arm Stowed/Active, wheels moving) and the status bar's text
+are all readable as properties, so `joints --check` and selftest's joints section
+assert them. Writes go only to a running game -- PIE, or a packaged or -game build:
+in the editor with nothing playing, the editor's own level answers on the same
+paths and would be written instead, so selftest skips the joints and says so.
+
 Not automatic: whether a panel *looks* right. Nothing readable comes back for
 panel/world-state/camera-feed state, so each scenario prints what you should
 see and, where it matters, waits for you to tap and confirms the ID round-trips.
@@ -35,6 +45,7 @@ see and, where it matters, waits for you to tap and confirms the ID round-trips.
 import argparse
 import json
 import os
+import re
 import select
 import sys
 import threading
@@ -65,6 +76,48 @@ FALLBACK_LABELS = {
     "CloseCameraFeed": "Close Camera Feed",
     "PollUIEvents": "Poll UIEvents",
 }
+
+
+# ── joints ───────────────────────────────────────────────────────────
+#
+# The RAMMP display's arm and wheels are driven by one call: SetAllJointTargets(Values) on its
+# URammsSkeletalPoseComponent, exposed on the preset as "Set All Joint Targets". Values is
+# POSITIONAL over the component's Joints array (53 entries on the RAMMP display: wheels at 2
+# and 9, arm link_0..link_6 at 46-52, degrees for revolute joints) -- so every vector here is
+# built BY NAME from the component's own list, never from hardcoded indices.
+#
+# What reacts: URammsJointMotionMonitorComponent classifies each write (arm Stowed/Active
+# against its stow pose; wheels moving while their targets change), and the HUD's status bar
+# shows the result (arm "Stowed"/"Active", chair "DRIVING"/"PARKED"). All three are readable as
+# properties over Remote Control, so these checks are automatic rather than eyes-only.
+
+JOINT_FUNCTION = "SetAllJointTargets"
+# Remote Control's preset description lists NO arguments for SetAllJointTargets: it omits
+# parameters flagged CPF_OutParm, and a `const TArray<double>&` parameter carries that flag.
+# Taking the empty list at its word would refuse the one parameter the function has. The name
+# is pinned here instead -- and every send is confirmed by reading the targets back, because a
+# wrong name is accepted with HTTP 200 and arrives as an empty array.
+KNOWN_ARGUMENTS = {JOINT_FUNCTION: ["Values"]}
+# What a dangling entry should be rebound to, for the ones that are not the receiver's.
+REBIND_TARGETS = {
+    JOINT_FUNCTION: "the RammsSkeletalPose component of the robot display (BP_RAMMP_RemoteDisplay*)",
+    "UpdateSystemState": "the robot display actor (BP_RAMMP_RemoteDisplay*)",
+}
+MONITOR_COMPONENT = "JointMotionMonitor"
+# Which engine is running, told by which engine object exists. The editor's (UEditorEngine)
+# PlayWorld names the live play world -- "/Game/Maps/UEDPIE_0_Map_UI.Map_UI" -- or is empty when
+# nothing is playing, which matters because the editor's own level then answers on the very paths
+# a game would. A game, packaged or `UnrealEditor -game`, has GameEngine_0 and no editor level: the
+# bound path is the live robot. (An editor-only settings CDO is NOT a test for the editor: the
+# editor binary loads UnrealEd in -game too.)
+EDITOR_ENGINE = ("/Engine/Transient.UnrealEdEngine_0", "PlayWorld")
+GAME_ENGINE = ("/Engine/Transient.GameEngine_0", "bUseFixedFrameRate")
+# The HUD's status bar, under whichever engine owns the game instance. The instance number
+# changes every play session and Remote Control has no object search, so it is probed.
+STATUS_BAR_PATH = ("/Engine/Transient.{engine}:GameInstance_{n}.W_RAMMS_UI_C_0.WidgetTree_0."
+                   "RAMMS_StatusBar.WidgetTree_0.{widget}")
+STATUS_BAR_ENGINES = ("UnrealEdEngine_0", "GameEngine_0")
+STATUS_BAR_INSTANCES = 1024  # one per play session this editor has run; all probed in one request
 
 
 def _percent(text):
@@ -262,6 +315,8 @@ class BridgeClient:
                 declared = self._arguments.get(function)
             except BridgeError:
                 declared = None
+        if declared == [] and function in KNOWN_ARGUMENTS:
+            declared = KNOWN_ARGUMENTS[function]
         if declared is not None:
             known = {name.lower() for name in declared if name}
             unknown = sorted(n for n in parameters if n.lower() not in known)
@@ -301,12 +356,12 @@ class BridgeClient:
         """
         owners = self.owners_for(function)
         if owners is not None and not owners:
+            target = REBIND_TARGETS.get(function, "the RammsBridgeReceiver")
             raise BridgeError(
                 f"{function} is exposed on preset {self.preset} but bound to no "
                 "object, so the call would return HTTP 200 and reach nothing. "
-                "Rebind the preset entries to the RammsBridgeReceiver in the "
-                "level that is currently open, then re-run this command -- the "
-                "preset is read once per run."
+                f"Rebind it to {target} in the level that is currently open, then "
+                "re-run this command -- the preset is read once per run."
             )
 
     def unbound_functions(self):
@@ -322,6 +377,36 @@ class BridgeClient:
                 return None
         return sorted(name for name, owners in self._owners.items()
                       if owners is not None and not owners)
+
+    def call_object(self, object_path, function, **parameters):
+        """Call a UFUNCTION on one object by path, outside any preset.
+
+        Subject to the project's Remote Control allow-list (Config/DefaultRemoteControl.ini):
+        a function that is not on it comes back as an errorMessage, which _request raises.
+        """
+        payload = {"objectPath": object_path, "functionName": function,
+                   "parameters": parameters, "generateTransaction": False}
+        if self.verbose:
+            print(f"  -> {object_path}.{function}({', '.join(parameters)})")
+        return self._request("PUT", "/remote/object/call", payload) or {}
+
+    def read_many(self, reads):
+        """Read several (object_path, property) pairs in ONE request: {index: value} for those found.
+
+        /remote/batch runs the reads together, so probing hundreds of candidate paths costs one
+        round trip (measured: 512 in 0.18 s) instead of one engine tick each -- a backgrounded
+        editor answers single reads at a few dozen a second.
+        """
+        requests = [{"RequestId": i, "URL": "/remote/object/property", "Verb": "PUT",
+                     "Body": {"objectPath": path, "propertyName": prop, "access": "READ_ACCESS"}}
+                    for i, (path, prop) in enumerate(reads)]
+        body = self._request("PUT", "/remote/batch", {"Requests": requests}) or {}
+        found = {}
+        for response in body.get("Responses", []) if isinstance(body, dict) else []:
+            value = response.get("ResponseBody")
+            if response.get("ResponseCode") == 200 and isinstance(value, dict):
+                found[response.get("RequestId")] = value.get(reads[response.get("RequestId")][1])
+        return found
 
     def get_setting(self, property_name, object_path=SETTINGS_PATH):
         payload = {"objectPath": object_path, "propertyName": property_name,
@@ -596,6 +681,398 @@ def sample_objects(source, pixels=False, variant="a", count=None):
 
 # ── commands ─────────────────────────────────────────────────────────
 
+# ── joints: pure helpers ─────────────────────────────────────────────
+
+def pie_path(path, instance=0):
+    """The play-in-editor copy of an editor-world object path.
+
+    PIE duplicates the level into a package prefixed UEDPIE_<n>_; the object names inside it are
+    unchanged. A preset binding names the EDITOR's level, so reading that path during play reads
+    the editor's copy -- which never ticks. Measured: it answered "Stowed" while the running game
+    said "Active". Paths that are not in a level package come back unchanged.
+    """
+    package, sep, rest = path.partition(".")
+    head, slash, short = package.rpartition("/")
+    # Only an object INSIDE a map ("<package>.<map>:PersistentLevel.<actor>") has a play copy;
+    # a class default or an asset ("/Script/Module.Default__X") does not.
+    if not sep or ":" not in rest or not slash or short.startswith("UEDPIE_"):
+        return path
+    return f"{head}/UEDPIE_{instance}_{short}{sep}{rest}"
+
+
+def play_copy(path, play_world):
+    """`path` moved into the play world the editor reports, or None if it is not that map's.
+
+    play_world is UEditorEngine::PlayWorld, e.g. "/Game/Maps/UEDPIE_0_Map_UI.Map_UI": its instance
+    number is used as reported rather than assumed to be 0.
+    """
+    match = re.fullmatch(r"(.*/)UEDPIE_(\d+)_([^/.]+)\.\3", play_world or "")
+    if not match:
+        return None
+    live = pie_path(path, int(match.group(2)))
+    return live if live.startswith(f"{match.group(1)}UEDPIE_{match.group(2)}_{match.group(3)}.") else None
+
+
+def plain_text(rich):
+    """A rich-text block's visible text: '<status-default>Stowed</>' -> 'Stowed'."""
+    return re.sub(r"<[^>]*>", "", rich or "").strip()
+
+
+def joint_index(joints):
+    """JointName -> position in the Values array."""
+    return {j.get("JointName"): i for i, j in enumerate(joints)}
+
+
+def with_joints(targets, index, values):
+    """targets with the named joints replaced and every other joint held.
+
+    Exact names only: the gripper's own joints are called link_0_l, link_3_r and so on, and a
+    loose match would move the gripper when the arm was meant.
+    """
+    missing = sorted(name for name in values if name not in index)
+    if missing:
+        raise BridgeError(f"the display has no joint(s) {missing}")
+    out = [float(v) for v in targets]
+    for name, value in values.items():
+        out[index[name]] = float(value)
+    return out
+
+
+def within_limits(joint, value):
+    """Whether a target would be applied as sent (a joint with enforced limits clamps it)."""
+    if not joint.get("bEnforceLimits"):
+        return True
+    return float(joint.get("MinValue", value)) <= value <= float(joint.get("MaxValue", value))
+
+
+def active_offset(joints, index, arm_names, stowed, tolerance):
+    """One arm joint moved far past the stow tolerance, in a direction its limits allow.
+
+    Far past rather than just past, so a joint that drifts or a rounding difference cannot
+    leave the monitor straddling the boundary; and unclamped, so the readback compares what
+    was sent with what was applied.
+    """
+    step = max(30.0, 6.0 * float(tolerance))
+    for name, base in zip(arm_names, stowed):
+        joint = joints[index[name]]
+        for value in (float(base) + step, float(base) - step):
+            if within_limits(joint, value):
+                return {name: value}
+    raise BridgeError("no arm joint can move past the stow tolerance without hitting its limits")
+
+
+# ── joints: the display, found through its preset binding ───────────
+
+class JointsUnavailable(BridgeError):
+    """Joints cannot be checked here -- a reason to skip, not to fail.
+
+    The preset does not expose joint targets at all, or the editor is not playing (so the only
+    copy of the robot that answers is the one the saved level holds).
+    """
+
+
+class JointRig:
+    """The robot display's pose component, monitor and status bar, resolved for the live world."""
+
+    def __init__(self, client, pose_path, world):
+        self.client = client
+        self.pose_path = pose_path
+        self.world = world  # "play session" (editor PIE) | "game" (packaged or -game)
+        self.actor_path = pose_path.rpartition(".")[0]
+        self.monitor_path = f"{self.actor_path}.{MONITOR_COMPONENT}"
+        self.joints = self.read_joints()
+        if not self.joints:
+            raise BridgeError(f"{pose_path} has no joints")
+        self.index = joint_index(self.joints)
+        self.monitor = self._read_monitor()
+        self._status_root = None  # (engine, game instance number) once found
+
+    # ── locating ─────────────────────────────────────────────────
+
+    @classmethod
+    def locate(cls, client):
+        if not client._labels:
+            client.load_preset()
+        if JOINT_FUNCTION not in client._labels:
+            raise JointsUnavailable(f"preset {client.preset} does not expose {JOINT_FUNCTION}")
+        client.check_bound(JOINT_FUNCTION)
+        owners = client.owners_for(JOINT_FUNCTION) or []
+        if not owners:
+            raise BridgeError(f"preset {client.preset} does not report what {JOINT_FUNCTION} is bound to")
+        bound = owners[0]
+        play_world = _read(client, *EDITOR_ENGINE)
+        if play_world is not _ABSENT:
+            # The editor. Write only into its play world: its own level answers on the very path
+            # the binding names, and a write there lands in the actor whose values the map saves.
+            if not play_world:
+                raise JointsUnavailable(
+                    "the editor is not playing. Its own level answers on the bound path, so joint "
+                    "targets sent now would be written into the saved level's actor. Start PIE "
+                    "and re-run.")
+            live = play_copy(bound, play_world)
+            if live is None:
+                raise BridgeError(f"{JOINT_FUNCTION} is bound to {bound}, which is not in the "
+                                  f"world being played ({play_world})")
+            if not _readable(client, live, "Joints"):
+                raise BridgeError(f"the play session has no {live}")
+            return cls(client, live, "play session")
+        if _read(client, *GAME_ENGINE) is not _ABSENT:
+            return cls(client, bound, "game")
+        # Neither engine answered: refuse rather than guess, because guessing "game" in an
+        # editor would send through the preset into the saved level's actor.
+        raise BridgeError("cannot tell whether this is the editor or a game (neither "
+                          f"{EDITOR_ENGINE[0]} nor {GAME_ENGINE[0]} answered), so nothing is sent")
+
+    # ── reading ──────────────────────────────────────────────────
+
+    def read_joints(self):
+        return self.client.get_setting("Joints", self.pose_path) or []
+
+    def targets(self):
+        return [float(j.get("TargetValue", 0.0)) for j in self.read_joints()]
+
+    def applied(self, names):
+        """Each named joint's CurrentValue -- what the skeleton is actually showing."""
+        joints = self.read_joints()
+        return {n: float(joints[self.index[n]].get("CurrentValue", 0.0)) for n in names}
+
+    def _read_monitor(self):
+        names = ("ArmJointNames", "StowedPose", "StowedTolerance", "WheelJointNames",
+                 "WheelMotionThreshold", "WheelIdleTimeout")
+        try:
+            config = {name: self.client.get_setting(name, self.monitor_path) for name in names}
+        except BridgeError:
+            return None  # a display without a monitor: joints still move, indicators unchecked
+        if len(config["ArmJointNames"] or []) != len(config["StowedPose"] or []):
+            raise BridgeError(f"{self.monitor_path}: ArmJointNames and StowedPose differ in length")
+        return config
+
+    def arm_state(self):
+        return self.client.get_setting("ArmPoseState", self.monitor_path)
+
+    def wheels_moving(self):
+        return bool(self.client.get_setting("bWheelsMoving", self.monitor_path))
+
+    def status_text(self, widget):
+        """The status bar's text for TXT_ArmStatus / TXT_ChairStatus, or None if not found."""
+        if not self._status_root:
+            # Probed again on every call until found: a failed probe is not remembered, so one
+            # dropped request cannot turn every later indicator check into "not readable".
+            roots = [(engine, n) for engine in STATUS_BAR_ENGINES for n in range(STATUS_BAR_INSTANCES)]
+            try:
+                found = self.client.read_many(
+                    [(STATUS_BAR_PATH.format(engine=e, n=n, widget="TXT_ArmStatus"), "Text") for e, n in roots])
+            except BridgeError:
+                found = {}
+            if not found:
+                return None
+            self._status_root = roots[max(found)]  # the newest play session's, if several answer
+        engine, n = self._status_root
+        path = STATUS_BAR_PATH.format(engine=engine, n=n, widget=widget)
+        try:
+            return plain_text(self.client.get_setting("Text", path))
+        except BridgeError:
+            return None
+
+    # ── writing ──────────────────────────────────────────────────
+
+    def send(self, targets):
+        """Push a full joint vector and confirm it is what the display now holds.
+
+        Full, because a short array is accepted and writes only the first joints -- on this
+        display, the base's linkages. Confirmed, because nothing else proves the parameter name
+        landed or that the call reached the live world rather than the editor's copy.
+        """
+        if len(targets) != len(self.joints):
+            raise BridgeError(f"{len(targets)} values for {len(self.joints)} joints; a short "
+                              "array would silently write only the first few")
+        values = [float(v) for v in targets]
+        if self.world == "play session":
+            # Not through the preset. Its entry names the EDITOR's level, and Remote Control
+            # resolves it there even during play: measured, a preset call wrote the editor's
+            # copy -- the actor whose values Map_UI saves -- and left the running robot where it
+            # was. So in PIE the game's own component is written directly.
+            self.client.call_object(self.pose_path, JOINT_FUNCTION, Values=values)
+        else:
+            # A game (packaged or -game): the preset's path IS the live robot, and the preset is
+            # the route an external sender uses, so exercise that.
+            self.client.call(JOINT_FUNCTION, Values=values)
+        landed = self.targets()
+        wrong = [(self.joints[i].get("JointName"), sent, got)
+                 for i, (sent, got) in enumerate(zip(targets, landed))
+                 if within_limits(self.joints[i], sent) and abs(sent - got) > 1e-3]
+        if len(landed) != len(targets) or wrong:
+            raise BridgeError(
+                f"the joint targets did not land on {self.pose_path}: e.g. {wrong[:3]}. Either "
+                "the Values parameter arrived empty, or the preset entry is bound to a different "
+                "object than the one being read (the editor's copy instead of the game's).")
+        return landed
+
+    def restore(self, original):
+        """Put back the targets found at the start -- except the wheels, left where they stopped.
+
+        Spinning them back would be a wheel-target change like any other: the chair would read
+        DRIVING for a moment after the run had finished.
+        """
+        wheels = (self.monitor or {}).get("WheelJointNames") or []
+        now = self.targets()
+        self.send(with_joints(original, self.index,
+                              {n: now[self.index[n]] for n in wheels if n in self.index}))
+
+    def monitored(self, group):
+        """The monitor's ArmJointNames or WheelJointNames, refused if the display lacks any of them."""
+        if not self.monitor:
+            raise BridgeError(f"no {MONITOR_COMPONENT} on {self.actor_path}, so nothing classifies the joints")
+        names = list(self.monitor[group] or [])
+        missing = [n for n in names if n not in self.index]
+        if missing:
+            raise BridgeError(f"{MONITOR_COMPONENT}.{group} names {missing}, which "
+                              f"{self.pose_path} does not have")
+        if not names:
+            raise BridgeError(f"{MONITOR_COMPONENT}.{group} is empty")
+        return names
+
+    def poses(self):
+        """(stowed, active) target vectors, wheels held where they are now."""
+        arm, stowed = self.monitored("ArmJointNames"), self.monitor["StowedPose"]
+        base = self.targets()
+        stow = with_joints(base, self.index, dict(zip(arm, stowed)))
+        nudge = active_offset(self.joints, self.index, arm, stowed, self.monitor["StowedTolerance"])
+        return stow, with_joints(stow, self.index, nudge)
+
+
+_ABSENT = object()
+
+
+def _read(client, path, prop):
+    """The property's value, or _ABSENT if the object or property does not answer."""
+    try:
+        return client.get_setting(prop, path)
+    except BridgeError:
+        return _ABSENT
+
+
+def _readable(client, path, prop):
+    return _read(client, path, prop) is not _ABSENT
+
+
+def _poll_until(read, expected, timeout, sleep, clock):
+    """Poll read() until it returns expected, or timeout. Returns the last value seen."""
+    deadline = clock() + timeout
+    value = read()
+    while value != expected and clock() < deadline:
+        sleep(0.05)
+        value = read()
+    return value
+
+
+# Looked up at call time, not bound as defaults, so tests can run the timed checks on a fake
+# clock instead of sleeping through them.
+def _sleep(seconds):
+    time.sleep(seconds)
+
+
+def _clock():
+    return time.monotonic()
+
+
+def run_joint_checks(rig, check, sleep=None, clock=None, rate=10.0, step=5.0, frames=8):
+    """Stow -> active -> stow, then drive -> park, each confirmed by readback.
+
+    Three arm pushes rather than two because the monitor only announces a CHANGE: a stow push
+    while already stowed fires nothing, so this forces two real transitions whatever state it
+    starts in. Every push carries the wheels where they are and every drive frame carries the
+    stowed arm, or one check would flip the other indicator. Restores the targets it found,
+    except the wheels (see JointRig.restore).
+
+    Do not run it while something else is streaming joints (the RAMMP UI bridge, the Gen1
+    prototype): the other sender's next frame overwrites these, and the checks fail for it.
+    """
+    sleep = sleep or _sleep
+    clock = clock or _clock
+    try:
+        wheels = rig.monitored("WheelJointNames")
+        stow, active = rig.poses()
+    except BridgeError as exc:
+        check(False, "the display's joint-motion monitor watches joints it has", str(exc))
+        return
+    original = rig.targets()
+    bar = rig.status_text("TXT_ArmStatus") is not None
+    check(bar, "the HUD's status bar is readable",
+          "no RAMMS_StatusBar under " + STATUS_BAR_PATH.format(engine="{UnrealEdEngine_0|GameEngine_0}",
+                                                              n=f"{{0..{STATUS_BAR_INSTANCES - 1}}}",
+                                                              widget="TXT_ArmStatus")
+          + " -- the indicator checks below are skipped. Is the HUD up (not Simulate), with W_RAMMS_UI unrenamed?")
+
+    def indicator(widget, expected, what):
+        if not bar:
+            return
+        text = _poll_until(lambda: rig.status_text(widget), expected, 1.0, sleep, clock)
+        check(text == expected, f"{what}: status bar reads {expected!r}",
+              f"it reads {text!r}. A status bar built before rammp-org/ramms-ui's start-up fix shows "
+              "its designer default until the first change")
+
+    try:
+        for name, pose, expected in (("arm stowed", stow, "Stowed"), ("arm active", active, "Active"),
+                                     ("arm stowed again", stow, "Stowed")):
+            try:
+                rig.send(pose)
+            except BridgeError as exc:
+                check(False, f"{name}: targets landed", str(exc))
+                return
+            check(True, f"{name}: targets landed")
+            # Landing proves the display RECEIVED the joints; CurrentValue proves the skeleton
+            # moved to them. A pose component that eases toward its targets gets time to arrive.
+            arm = rig.monitor["ArmJointNames"]
+            want = {n: pose[rig.index[n]] for n in arm}
+
+            def arrived():
+                return all(abs(v - want[n]) <= 0.5 for n, v in rig.applied(arm).items())
+            _poll_until(arrived, True, 3.0, sleep, clock)
+            lag = {n: round(v - want[n], 2) for n, v in rig.applied(arm).items() if abs(v - want[n]) > 0.5}
+            check(not lag, f"{name}: arm joints moved to their targets", f"still off by {lag}")
+            state = _poll_until(rig.arm_state, expected, 1.0, sleep, clock)
+            check(state == expected, f"{name}: monitor says {expected}", f"it says {state!r}")
+            indicator("TXT_ArmStatus", expected, name)
+
+        threshold = float(rig.monitor["WheelMotionThreshold"])
+        idle = float(rig.monitor["WheelIdleTimeout"])
+        if step <= threshold or 1.0 / rate >= idle:
+            check(False, "drive stream outruns the monitor",
+                  f"step {step} must exceed {threshold} and the frame period must be under {idle} s")
+            return
+        held = {name: stow[rig.index[name]] for name in wheels}
+        moving_seen, driving_text = False, None
+        for k in range(1, frames + 1):
+            frame = with_joints(stow, rig.index, {n: v + k * step for n, v in held.items()})
+            try:
+                rig.send(frame)
+            except BridgeError as exc:
+                check(False, f"wheels turning: frame {k} landed", str(exc))
+                return
+            moving_seen = moving_seen or rig.wheels_moving()
+            if bar and k >= 2 and driving_text != "DRIVING":
+                # Read WHILE the frames are still coming: after they stop, the chair parks
+                # within WheelIdleTimeout, and a slow read would see that instead.
+                driving_text = rig.status_text("TXT_ChairStatus")
+            sleep(1.0 / rate)
+        check(moving_seen, "wheels turning: monitor says moving",
+              f"{frames} frames of +{step} deg at {rate} Hz never registered")
+        if bar:
+            check(driving_text == "DRIVING", "wheels turning: status bar reads 'DRIVING'",
+                  f"it read {driving_text!r} while the wheels were turning")
+        sleep(idle)
+        moving = _poll_until(rig.wheels_moving, False, idle + 1.0, sleep, clock)
+        check(not moving, f"wheels stopped: monitor says parked within {idle} s + margin")
+        indicator("TXT_ChairStatus", "PARKED", "wheels stopped")
+    finally:
+        try:
+            rig.restore(original)
+            check(True, "joint targets put back as found (the wheels stay where they stopped)")
+        except BridgeError as exc:
+            check(False, "joint targets put back as found", f"{exc} -- the robot is left in the test's pose")
+
+
 def cmd_discover(client, args):
     preset = client.load_preset()
     print(f"preset: {preset.get('Name', client.preset)}")
@@ -609,7 +1086,9 @@ def cmd_discover(client, args):
             bound = ", ".join(owners)
         else:
             bound = "!! BOUND TO NOTHING !!"
-        print(f"  {name:<24} label={label!r:<28} args={argnames}")
+        note = (f"  (RC omits it; the argument is {KNOWN_ARGUMENTS[name]})"
+                if not argnames and name in KNOWN_ARGUMENTS else "")
+        print(f"  {name:<24} label={label!r:<28} args={argnames}{note}")
         print(f"  {'':<24} bound to: {bound}")
         labels = client._duplicates.get(name) or []
         if len(labels) > 1:
@@ -636,9 +1115,11 @@ def cmd_discover(client, args):
             print(f"  {name}")
         print("  Remote Control answers HTTP 200 for these and the call reaches")
         print("  nothing, so pushes look like they worked and the UI never changes.")
-        print("  It happens when the level holding RammsBridgeReceiver is moved or")
-        print("  replaced: the preset still points at the old path. Rebind the")
-        print("  preset entries to the receiver in the level that is open now.")
+        print("  It happens when the object an entry is bound to is moved or")
+        print("  replaced -- the level holding RammsBridgeReceiver, or the robot")
+        print("  display actor -- and the preset still points at the old path.")
+        for name in unbound:
+            print(f"    {name}: rebind to {REBIND_TARGETS.get(name, 'the RammsBridgeReceiver')}")
         return 1
 
     latest, _ = client.poll_events(0)
@@ -804,6 +1285,95 @@ def cmd_events(client, args):
             print(f"FAIL: interrupted before {args.expect!r} arrived")
             return 1
         return 0
+
+
+def _reporter():
+    """A selftest-style check(): prints pass/FAIL and remembers failures."""
+    failures = []
+
+    def check(ok, what, detail=""):
+        print(f"  {'pass' if ok else 'FAIL'}  {what}{(' -- ' + detail) if detail and not ok else ''}")
+        if not ok:
+            failures.append(what)
+    return check, failures
+
+
+def _describe_joints(rig):
+    targets = rig.targets()
+    print(f"joints: {JOINT_FUNCTION} -> {rig.pose_path}  ({rig.world})")
+    if rig.world == "play session":
+        print("  sent straight to the play session's component: during PIE the preset entry "
+              "resolves to the editor's level, not the game")
+    print(f"  {len(rig.joints)} joints, set by position; vectors are built by name from this list")
+    if not rig.monitor:
+        print(f"  no {MONITOR_COMPONENT} on {rig.actor_path}: joints move, but nothing classifies them")
+        return
+    m = rig.monitor
+    for label, group in (("arm", m["ArmJointNames"]), ("wheels", m["WheelJointNames"])):
+        where = ", ".join(f"{n}@{rig.index[n]}={targets[rig.index[n]]:.1f}" if n in rig.index
+                          else f"{n}@MISSING" for n in group)
+        print(f"  {label:<7} {where}")
+    print(f"  stow pose {[round(v, 1) for v in m['StowedPose']]} +/- {m['StowedTolerance']} deg; "
+          f"wheels move past {m['WheelMotionThreshold']} deg, park after {m['WheelIdleTimeout']} s")
+    print(f"monitor: arm {rig.arm_state()}, wheels {'moving' if rig.wheels_moving() else 'still'}")
+    arm, chair = rig.status_text("TXT_ArmStatus"), rig.status_text("TXT_ChairStatus")
+    print(f"status bar: arm {arm!r}, chair {chair!r}" if arm is not None
+          else "status bar: NOT FOUND under any game instance -- is the HUD up?")
+    missing = [n for n in m["ArmJointNames"] + m["WheelJointNames"] if n not in rig.index]
+    if missing:
+        print(f"PROBLEM: the monitor watches {missing}, which this pose component does not have")
+
+
+def cmd_joints(client, args):
+    """Drive the robot display's arm and wheels, and check the status indicators follow."""
+    try:
+        rig = JointRig.locate(client)
+    except BridgeError as exc:
+        print(f"joints: {exc}", file=sys.stderr)
+        return 1
+
+    if args.check:
+        check, failures = _reporter()
+        run_joint_checks(rig, check, rate=args.rate, step=args.step,
+                         frames=max(3, int(args.seconds * args.rate)))
+        print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all joint checks passed'}")
+        return 1 if failures else 0
+
+    if args.set:
+        values = {}
+        for pair in args.set:
+            name, sep, value = pair.partition("=")
+            if not sep:
+                raise BridgeError(f"--set takes NAME=DEGREES, got {pair!r}")
+            values[name] = float(value)
+        rig.send(with_joints(rig.targets(), rig.index, values))
+        print(f"  sent {values}; everything else held")
+    elif args.stow or args.activate:
+        stow, active = rig.poses()
+        rig.send(stow if args.stow else active)
+        print(f"  sent the {'stowed' if args.stow else 'active'} arm pose, wheels held")
+    elif args.drive:
+        wheels = rig.monitored("WheelJointNames")
+        base = rig.targets()  # the arm stays wherever it is
+        held = {n: base[rig.index[n]] for n in wheels}
+        frames = max(3, int(args.seconds * args.rate))
+        for k in range(1, frames + 1):
+            rig.send(with_joints(base, rig.index, {n: v + k * args.step for n, v in held.items()}))
+            _sleep(1.0 / args.rate)
+        print(f"  streamed {frames} frames of +{args.step} deg at {args.rate} Hz; "
+              f"moving now: {rig.wheels_moving()} (expect the chair to read PARKED within "
+              f"{rig.monitor['WheelIdleTimeout']} s)")
+    elif args.sweep:
+        stow, active = rig.poses()
+        steps = max(4, int(args.seconds * args.rate))
+        for k in range(steps + 1):
+            # Out and back: the arm swings to the active pose and returns to stowed.
+            t = 1.0 - abs(2.0 * k / steps - 1.0)
+            rig.send([a + (b - a) * t for a, b in zip(stow, active)])
+            _sleep(args.seconds / steps)
+        print("  swept stowed -> active -> stowed")
+    _describe_joints(rig)
+    return 0
 
 
 def _synthetic_frames(t, w, h):
@@ -1054,10 +1624,14 @@ def cmd_selftest(client, args):
         unbound = client.unbound_functions() or []
         check(not unbound, "every exposed function is bound to an object",
               f"{unbound} reach nothing -- Remote Control still answers HTTP 200, "
-              "so every push below would be reported as a success. Rebind the "
-              "preset to the receiver in the open level.")
-        if unbound:
-            print("\nFAILED: the preset is not bound; later checks would be "
+              "so a push to them would be reported as a success. Rebind them in "
+              "the open level.")
+        # Only the bridge's own entries make the checks below meaningless. A dangling
+        # joint or system-state entry (the robot display was replaced, not the receiver)
+        # is a failure in its own right, but must not hide every bridge check.
+        bridge_unbound = [f for f in unbound if f in FALLBACK_LABELS]
+        if bridge_unbound:
+            print("\nFAILED: the bridge functions are not bound; later checks would be "
                   "meaningless, so they are skipped")
             return 1
     except BridgeError as exc:
@@ -1116,6 +1690,23 @@ def cmd_selftest(client, args):
     except BridgeError as exc:
         check(False, "PollUIEvents", str(exc))
 
+    print("joints")
+    skipped = None
+    if JOINT_FUNCTION not in client._labels:
+        skipped = f"{JOINT_FUNCTION} is not on this preset"
+        print(f"  skip  {skipped}")
+    else:
+        try:
+            rig = JointRig.locate(client)
+        except JointsUnavailable as exc:
+            skipped = str(exc)
+            print(f"  skip  {skipped}")
+        except BridgeError as exc:
+            check(False, "the robot display's joints are reachable", str(exc))
+        else:
+            check(True, f"the robot display's joints are reachable ({rig.world})")
+            run_joint_checks(rig, check)
+
     # Leave the UI somewhere sane rather than on the stress panel.
     try:
         client.update_panel(PANEL_SCENARIOS["idle"][0])
@@ -1123,7 +1714,8 @@ def cmd_selftest(client, args):
     except BridgeError:
         pass
 
-    print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all checks passed'}")
+    print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all checks passed'}"
+          + (f" -- joints NOT checked: {skipped}" if skipped else ""))
     return 1 if failures else 0
 
 
@@ -1176,7 +1768,57 @@ def _push_progress(client, args, pushes):
             time.sleep(args.progress_interval)
 
 
+class _WalkthroughJoints:
+    """Joint steps for the walkthrough, skipped as a group when the preset has no joints."""
+
+    def __init__(self, client):
+        self.client = client
+        self.rig = None
+        self.original = None
+        self.unavailable = None
+
+    def step(self, action):
+        def run():
+            if self.unavailable is None and self.rig is None:
+                try:
+                    self.rig = JointRig.locate(self.client)
+                    self.original = self.rig.targets()
+                except JointsUnavailable as exc:
+                    self.unavailable = str(exc)
+            if self.unavailable:
+                print(f"  SKIPPED: {self.unavailable}")
+                return
+            action(self.rig)
+            state = self.rig.arm_state() if self.rig.monitor else None
+            if state is not None:
+                print(f"  monitor: arm {state}, wheels {'moving' if self.rig.wheels_moving() else 'still'}")
+        return run
+
+    def restore(self):
+        if self.rig and self.original:
+            self.rig.restore(self.original)
+
+
+def _drive_and_park(rig, rate=10.0, step=5.0, frames=10):
+    wheels = rig.monitored("WheelJointNames")
+    base = rig.targets()
+    held = {n: base[rig.index[n]] for n in wheels}
+    seen = False
+    for k in range(1, frames + 1):
+        rig.send(with_joints(base, rig.index, {n: v + k * step for n, v in held.items()}))
+        seen = seen or rig.wheels_moving()
+        _sleep(1.0 / rate)
+    if not seen:
+        raise BridgeError(f"{frames} frames of +{step} deg never registered as the wheels moving")
+    idle = float(rig.monitor["WheelIdleTimeout"])
+    _sleep(idle)
+    moving = _poll_until(rig.wheels_moving, False, idle + 1.0, _sleep, _clock)
+    if moving:
+        raise BridgeError("the wheels stopped changing but the monitor still says moving")
+
+
 def _walkthrough_steps(client, args):
+    joints = _WalkthroughJoints(client)
     steps = [
         ("Idle panel", lambda: client.update_panel(PANEL_SCENARIOS["idle"][0]),
          PANEL_SCENARIOS["idle"][1], []),
@@ -1288,6 +1930,20 @@ def _walkthrough_steps(client, args):
          "          stream -- boxes and POIs alike.", []),
         ("Overlay camera closed", _optional(client.close_camera_feed, "CloseCameraFeed"),
          "The engine overlay's window disappears. Its POIs and boxes go with it.", []),
+        ("Arm stowed", joints.step(lambda rig: rig.send(rig.poses()[0])),
+         "The 3D robot's arm folds into its stowed pose beside the seat, and the\n"
+         "          status bar's arm text reads Stowed. The joint targets were read back,\n"
+         "          so this also proves the push reached the running display.", []),
+        ("Arm active", joints.step(lambda rig: rig.send(rig.poses()[1])),
+         "ONE arm joint swings well out of the stowed pose and the arm text reads\n"
+         "          Active. The rest of the arm, the wheels and the gripper do not move:\n"
+         "          the push carries every joint, and only one of them changed.", []),
+        ("Arm stowed again", joints.step(lambda rig: rig.send(rig.poses()[0])),
+         "The arm returns and the text reads Stowed again. Two real transitions,\n"
+         "          because the monitor only announces a change.", []),
+        ("Wheels drive, then park", joints.step(lambda rig: _drive_and_park(rig)),
+         "While that ran, the drive wheels turned and the chair text read DRIVING;\n"
+         "          it now reads PARKED, because the wheel targets stopped changing.", []),
     ]
 
     def run_steps():
@@ -1319,6 +1975,10 @@ def _walkthrough_steps(client, args):
             client.update_panel(PANEL_SCENARIOS["idle"][0])
         except BridgeError:
             pass
+        try:
+            joints.restore()
+        except BridgeError as exc:
+            print(f"  note: could not restore the joint targets: {exc}")
     print("\nwalkthrough complete; UI left on the idle panel"
           if result == 0 else "\nwalkthrough stopped; UI reset to the idle panel")
     return result
@@ -1466,6 +2126,19 @@ def main():
     p.add_argument("--timeout", type=float, default=0.0)
     p.add_argument("--interval", type=float, default=0.4)
 
+    p = sub.add_parser("joints", help="drive the robot display's arm and wheels; check the indicators")
+    act = p.add_mutually_exclusive_group()
+    act.add_argument("--check", action="store_true",
+                     help="stow, activate, stow, drive, park -- each confirmed by readback; restores after")
+    act.add_argument("--stow", action="store_true", help="arm to the monitor's stow pose, wheels held")
+    act.add_argument("--activate", action="store_true", help="one arm joint well past the stow tolerance")
+    act.add_argument("--drive", action="store_true", help="turn the drive wheels for --seconds, then stop")
+    act.add_argument("--sweep", action="store_true", help="swing the arm stowed -> active -> stowed, for eyes")
+    act.add_argument("--set", nargs="+", metavar="NAME=DEG", help="set joints by name, everything else held")
+    p.add_argument("--seconds", type=_positive_float, default=1.0)
+    p.add_argument("--rate", type=_positive_float, default=10.0, help="frames per second for --drive/--sweep")
+    p.add_argument("--step", type=_positive_float, default=5.0, help="wheel degrees per --drive frame")
+
     p = sub.add_parser("walkthrough", help="guided pass over every surface")
     p.add_argument("--timeout", type=float, default=60.0)
     p.add_argument("--progress-interval", type=_positive_float, default=0.8,
@@ -1480,7 +2153,8 @@ def main():
     handlers = {
         "discover": cmd_discover, "selftest": cmd_selftest, "panel": cmd_panel,
         "objects": cmd_objects, "worldstate": cmd_worldstate, "camera": cmd_camera,
-        "stream": cmd_stream, "events": cmd_events, "walkthrough": cmd_walkthrough,
+        "stream": cmd_stream, "events": cmd_events, "joints": cmd_joints,
+        "walkthrough": cmd_walkthrough,
     }
     try:
         return handlers[args.command](client, args)
