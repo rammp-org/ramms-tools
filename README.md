@@ -823,6 +823,9 @@ ramms-ui-bridge-test objects --select cup_1   # tappable boxes, with one highlig
 ramms-ui-bridge-test camera open              # OpenCameraFeed / CloseCameraFeed
 ramms-ui-bridge-test stream --seconds 10 --overlay   # synthetic scene colour + depth + overlay
 ramms-ui-bridge-test events --follow          # watch button presses and object taps live
+ramms-ui-bridge-test joints                   # the robot display: joints, monitor, status bar
+ramms-ui-bridge-test joints --check           # stow, activate, drive, park -- all read back
+ramms-ui-bridge-test joints --set link_1=40   # set joints by name; every other joint held
 ramms-ui-bridge-test walkthrough              # guided pass over every surface
 ```
 
@@ -863,6 +866,51 @@ somewhere. `--preset` pins one, and a failed discovery names every candidate it
 rejected and why. What a panel *looks* like still needs eyes:
 no panel/world-state/camera state is readable back, so each scenario prints
 what you should see, and the tap round-trip is what gets asserted.
+
+**The robot display's joints** are checked automatically. They go through
+`SetAllJointTargets` (preset label `Set All Joint Targets`) on the display's
+`RammsSkeletalPose` component. Each send is a full positional vector, built by joint
+name from the component's own list: a short array is accepted but writes only the
+first few joints, which on the RAMMP display are the base linkages. `joints --check`,
+and the joints section of `selftest`, do this:
+
+1. stow the arm, then make it active, then stow it again;
+2. turn the drive wheels, then stop them.
+
+After each step it reads back the joint targets, the skeleton's applied values, the
+joint-motion monitor's verdict (`ArmPoseState`, `bWheelsMoving`) and the status bar's
+arm and chair text (`Stowed`/`Active`, `DRIVING`/`PARKED`). A status bar it cannot
+find counts as one failure, and its indicator checks are skipped rather than passed.
+At the end it puts the targets back, except the wheels, which stay where they
+stopped: spinning them back would make the chair read `DRIVING` again. A restore
+that does not land is a failure too.
+
+Where the joints are sent depends on what is running. The tool reads the editor's
+`UnrealEdEngine_0.PlayWorld` (the live play world, or empty when nothing plays), or
+finds `GameEngine_0` (a game). If neither answers, it sends nothing.
+
+- **Editor, playing (PIE):** sent straight to the play session's component
+  (`/Game/Maps/UEDPIE_<n>_<map>...`, as `PlayWorld` names it), not through the
+  preset. A preset entry names the
+  editor's level and resolves there even during play. Measured: a preset call wrote
+  the editor's copy of the actor and the running robot stayed where it was. The same
+  applies to any other sender driving the preset during PIE.
+- **Editor, not playing:** refused, because the editor's own level answers on
+  those paths and the targets would be written into the actor that the map saves.
+  `joints` exits non-zero; `selftest` skips the joint checks and names the reason
+  on its last line.
+- **A game (packaged, or `UnrealEditor -game`):** sent through the preset, because
+  that is the route an external sender uses.
+
+Two Remote Control quirks are handled:
+
+- The preset reports **no arguments** for `SetAllJointTargets` (it leaves out
+  `const TArray<double>&` parameters), so the tool pins the argument name, `Values`.
+- If the joint entry is left dangling after the display actor is swapped,
+  `discover` says what to rebind it to.
+
+Don't run the joint checks while another sender is streaming joints: its next frame
+overwrites the test's targets.
 
 ### `ramms-control` — Any Robot's Controls
 
