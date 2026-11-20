@@ -14,6 +14,10 @@ Usage:
     ramms-ui-bridge-test stream --seconds 10      # synthetic RMSS camera frames
     ramms-ui-bridge-test events --follow          # watch taps as you click
     ramms-ui-bridge-test events --expect probe:ok --timeout 30
+    ramms-ui-bridge-test styles                   # every button style, read back and checked
+    ramms-ui-bridge-test styles --scenario style-fallback   # unknown / differently-cased styles
+    ramms-ui-bridge-test pois --tap               # POIs, and a tap dimming the others
+    ramms-ui-bridge-test markers                  # world markers derived from 2D + depth (editor PIE)
     ramms-ui-bridge-test joints                   # robot display: joints, monitor, status bar
     ramms-ui-bridge-test joints --check           # stow/activate/drive/park, all read back
     ramms-ui-bridge-test joints --set link_1=40   # by name; every other joint held
@@ -37,13 +41,27 @@ assert them. Writes go only to a running game -- PIE, or a packaged or -game bui
 in the editor with nothing playing, the editor's own level answers on the same
 paths and would be written instead, so selftest skips the joints and says so.
 
-Not automatic: whether a panel *looks* right. Nothing readable comes back for
-panel/world-state/camera-feed state, so each scenario prints what you should
-see and, where it matters, waits for you to tap and confirms the ID round-trips.
+Also automatic, in a running game: what the panel's buttons draw and what the
+POI layer shows. Each button's id, label, style, label text, label opacity and
+brush tint, and each POI's object and opacity, are readable widget properties, so
+`styles` checks that every button shows its own label, that unknown and
+differently-cased style names fall back as RAMMS_Button's switch does, and that
+its styles are told apart; `pois` checks one POI per object and, after a tap
+(`--tap`), that the others dim to the layer's UnselectedPOIOpacity.
+
+Not automatic: anything else about how the HUD *looks* -- layout, colours as a
+person sees them, the panel-level style (RAMMS_Panel does not draw it), world
+state and the camera feed. Those scenarios print what you should see and, where
+it matters, wait for a tap and confirm the ID round-trips.
+
+The walkthrough moves on from the screen as well as from Enter: a panel step on
+a press of one of that panel's buttons, and every later step on the panel's Next
+button or a tap on any box or POI it shows. Each press or tap round-trips too.
 """
 
 import argparse
 import json
+import math
 import os
 import re
 import select
@@ -53,6 +71,12 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import NamedTuple
+
+try:
+    import msvcrt  # Windows: lets Enter be noticed without blocking
+except ImportError:
+    msvcrt = None
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 30010
@@ -192,7 +216,9 @@ class BridgeClient:
         if not body.strip():
             return None
         try:
-            parsed = json.loads(body)
+            # strict=False: Remote Control puts raw newlines in some errorMessages. Strict parsing
+            # rejects the whole body, which for /remote/batch silently loses every response in it.
+            parsed = json.loads(body, strict=False)
         except json.JSONDecodeError:
             return body
         # Remote Control reports failures in-band with HTTP 200.
@@ -445,6 +471,21 @@ class BridgeClient:
 
 # ── payload builders (docs/USER_INPUT_JSON_SCHEMA.md) ────────────────
 
+# Button styles. The bridge contract (rammp-UI-bridge docs/USER_INPUT_JSON_SCHEMA.md §6.3) defines
+# normal | warning | error, and the Orchestrator sends its Cancel buttons as "warning". RAMMS_Button
+# (ramms-ui 4769575, read from its graph 2026-11-20) recognises valid | invalid | unavailable | cancel
+# | error, case-insensitively, and draws anything else -- normal, warning, absent, unknown -- as valid.
+CONTRACT_BUTTON_STYLES = ("normal", "warning", "error")
+UI_BUTTON_STYLES = ("valid", "invalid", "unavailable", "cancel", "error")
+BUTTON_STYLES = CONTRACT_BUTTON_STYLES + tuple(s for s in UI_BUTTON_STYLES if s not in CONTRACT_BUTTON_STYLES)
+
+
+def ui_button_style(style):
+    """The RAMMS_Button style a sent style selects: its own when it is one, else the fallback, valid."""
+    key = (style or "").lower()
+    return key if key in UI_BUTTON_STYLES else "valid"
+
+
 def button(button_id, label, style=None):
     b = {"button_id": button_id, "label": label}
     if style:
@@ -591,17 +632,53 @@ PANEL_SCENARIOS = {
             buttons=[button("retry", "Retry", "normal"), button("cancel", "Cancel", "error")],
             style="error",
         ),
-        "Panel-level error styling plus an error-styled button.",
+        "Retry looks normal and Cancel error-styled. The panel's own style is sent\n"
+        "          too, but RAMMS_Panel does not draw it: the panel looks like any other.\n"
+        "          Its only effect is that a style change under the same title replays\n"
+        "          the entrance animation, as a new panel would.",
+    ),
+    "styles": (
+        panel(
+            title="Button styles",
+            message="One button per style, each labelled with the style it was sent.",
+            buttons=[button("style:absent", "absent")]
+            + [button(f"style:{name}", name, name) for name in BUTTON_STYLES],
+        ),
+        "Every button reads its OWN label (the style name). RAMMS_Button today:\n"
+        "          absent, normal, warning, valid: blue, white label\n"
+        "          invalid: amber, dark label;  error: flat dark navy, white label\n"
+        "          unavailable: blue, label at half opacity (still clickable)\n"
+        "          cancel: KNOWN FAILURE -- drawn like invalid and reading \"OPEN\", not\n"
+        "          \"cancel\": SetStyle's cancel branch is not connected to SetStyle_Cancel.\n"
+        "          Also check: warning looks the same as normal, though the contract\n"
+        "          uses it for the Orchestrator's Cancel buttons. `styles` checks this.",
+    ),
+    "style-fallback": (
+        panel(
+            title="Style fallback",
+            message="Unknown styles fall back to valid; style names ignore case.",
+            buttons=[button("fallback:valid", "valid", "valid"),
+                     button("fallback:unavailable", "unavailable", "unavailable"),
+                     button("fallback:error", "error", "error"),
+                     button("fallback:bogus", "bogus", "bogus"),
+                     button("fallback:VALID", "VALID", "VALID"),
+                     button("fallback:Unavailable", "Unavailable", "Unavailable"),
+                     button("fallback:Error", "Error", "Error"),
+                     {"button_id": "fallback:empty", "label": "empty", "style": ""}],
+        ),
+        "The first three are the references. bogus, VALID and empty look like valid\n"
+        "          (blue); Unavailable looks like unavailable and Error like error --\n"
+        "          style names ignore case.",
     ),
     "stress": (
         panel(
             title="A title that is quite a lot longer than any real panel would ever use",
             message=("Long body text to check wrapping and clipping. " * 6
                      + "Unicode: café — ½° ✓ 日本語"),
-            buttons=[button(f"many:{i}", f"Button {i}", ["normal", "warning", "error"][i % 3])
+            buttons=[button(f"many:{i}", f"Button {i}", BUTTON_STYLES[i % len(BUTTON_STYLES)])
                      for i in range(8)],
         ),
-        "Long text and 8 buttons -- check wrapping, clipping and layout.",
+        "Long text and 8 buttons in every style -- check wrapping, clipping and layout.",
     ),
     "empty": (
         panel(),
@@ -1073,6 +1150,252 @@ def run_joint_checks(rig, check, sleep=None, clock=None, rate=10.0, step=5.0, fr
             check(False, "joint targets put back as found", f"{exc} -- the robot is left in the test's pose")
 
 
+# ── HUD readback: panel buttons and POIs ─────────────────────────────
+#
+# Everything the HUD draws for a push is a widget Remote Control can read: a panel button's
+# PanelButton (id, label, style), its label text and opacity and its brush, and a POI's object and
+# opacity. They live under the play session's game instance (measured in RammpUI PIE, 2026-11-20):
+#   buttons  <GameInstance>.W_RAMMS_UI_C_0.WidgetTree_0.RAMMS_Panel.WidgetTree_0.RAMMS_Button_C_<k>
+#   POIs     <GameInstance>.RAMMS_POI_C_<k>
+#   layer    <GameInstance>.W_RAMMS_UI_C_0.WidgetTree_0.RammsDetectionPOILayer
+# k only grows (UE never reuses an object name) and widgets a push replaced linger until garbage
+# collection, so a widget is live only while it is still in its parent: a non-empty Slot.
+
+PANEL_BUTTON_PATH = "{root}.W_RAMMS_UI_C_0.WidgetTree_0.RAMMS_Panel.WidgetTree_0.RAMMS_Button_C_{k}"
+POI_PATH = "{root}.RAMMS_POI_C_{k}"
+POI_LAYER_PATH = "{root}.W_RAMMS_UI_C_0.WidgetTree_0.RammsDetectionPOILayer"
+HUD_PROBE_CHUNK = 1024
+HUD_PROBE_LIMIT = 16384
+
+
+def find_game_instance(client):
+    """'/Engine/Transient.<engine>:GameInstance_<n>' of the running HUD, or None (one batch)."""
+    roots = [f"/Engine/Transient.{e}:GameInstance_{n}"
+             for e in STATUS_BAR_ENGINES for n in range(STATUS_BAR_INSTANCES)]
+    # Not caught: a refused connection or an in-band error is a real problem, not "no HUD". Paths that
+    # don't resolve come back as per-request 400s, which read_many leaves out.
+    found = client.read_many([(STATUS_BAR_PATH.format(engine=e, n=n, widget="TXT_ArmStatus"), "Text")
+                              for e in STATUS_BAR_ENGINES for n in range(STATUS_BAR_INSTANCES)])
+    return roots[max(found)] if found else None
+
+
+def probe_indexed(client, template, prop, chunk=HUD_PROBE_CHUNK, limit=HUD_PROBE_LIMIT, stop_after_empty=None):
+    """{k: value of prop} for every '<template with k>' that answers, one /remote/batch per chunk.
+
+    stop_after_empty=N stops after N empty chunks that follow a hit. That is safe only where the live
+    widgets are the newest ones, contiguous at the top: panel buttons, rebuilt on every push. POIs are
+    kept per object, so a long-lived one can sit far below newer ones; scan those to the limit. Past
+    the limit the scan carries on while chunks still answer, so a long session is not cut off.
+    """
+    hits, empty_after_hit, start = {}, 0, 0
+    while start < limit or (hits and max(hits) >= start - chunk):
+        ks = range(start, start + chunk)
+        found = client.read_many([(template.format(k=k), prop) for k in ks])
+        start += chunk
+        if found:
+            hits.update({ks[i]: value for i, value in found.items()})
+            empty_after_hit = 0
+        elif hits and stop_after_empty is not None:
+            empty_after_hit += 1
+            if empty_after_hit >= stop_after_empty:
+                break
+        if start >= 1 << 20:
+            break
+    return hits
+
+
+def unmangle(struct):
+    """A Blueprint struct's fields without their GUID suffix: label_4_2D47...F -> label."""
+    return {re.sub(r"_\d+_[0-9A-F]{32}$", "", key): value for key, value in (struct or {}).items()}
+
+
+def rich_tag(rich):
+    """'btn-light' from '<btn-light>Label</>'; None for plain text."""
+    match = re.match(r"\s*<([^/>]+)>", rich or "")
+    return match.group(1) if match else None
+
+
+def _tint(widget_style):
+    tint = ((widget_style or {}).get("Normal") or {}).get("TintColor") or {}
+    color = tint.get("SpecifiedColor") or {}
+    return tuple(round(float(color.get(c, 0.0)), 3) for c in "RGBA") if color else None
+
+
+def read_panel_buttons(client, root):
+    """The panel's live buttons, in creation order: id, label, style as sent, and what is drawn."""
+    template = PANEL_BUTTON_PATH.replace("{root}", root)
+    # Every push builds new buttons, so the live ones are the newest: stopping early is safe here.
+    panel_buttons = probe_indexed(client, template, "PanelButton", stop_after_empty=2)
+    ks = sorted(panel_buttons)
+    slots = client.read_many([(template.format(k=k), "Slot") for k in ks]) if ks else {}
+    live = [k for i, k in enumerate(ks) if slots.get(i)]
+    reads = []
+    for k in live:
+        path = template.format(k=k)
+        reads += [(f"{path}.WidgetTree_0.TXT_Button", "Text"), (f"{path}.WidgetTree_0.TXT_Button", "RenderOpacity"),
+                  (f"{path}.WidgetTree_0.BTN", "WidgetStyle")]
+    values = client.read_many(reads) if reads else {}
+    rows = []
+    for j, k in enumerate(live):
+        sent = unmangle(panel_buttons[k])
+        text = values.get(3 * j)
+        opacity = values.get(3 * j + 1)
+        rows.append({
+            "k": k, "button_id": sent.get("button_id", ""), "label": sent.get("label", ""),
+            "style": sent.get("style", ""), "text": plain_text(text) if text is not None else None,
+            "tag": rich_tag(text), "opacity": round(float(opacity), 3) if opacity is not None else None,
+            "tint": _tint(values.get(3 * j + 2)),
+        })
+    return rows
+
+
+def button_look(row):
+    """What a button looks like, as far as Remote Control can tell: brush tint, label opacity, text style."""
+    return (row["tint"], row["opacity"], row["tag"])
+
+
+def check_button_styles(pushed, rows):
+    """[(status, what, detail)] for a pushed panel against its live buttons; status pass | FAIL | warn.
+
+    Asserts what any intent for the styles needs: one live button per pushed one, each showing its own
+    label, unknown and differently-cased names drawn like the style they fall back to, and the UI's
+    styles told apart. A contract style drawn like another is a warning, not a failure: the UI may
+    have moved on from the contract on purpose, but whoever sends it should know.
+    """
+    results = []
+    by_id = {}
+    for row in rows:
+        by_id.setdefault(row["button_id"], []).append(row)
+    looks = {}
+    for b in pushed:
+        found = by_id.get(b["button_id"], [])
+        what = f"{b['button_id']} is on the panel once"
+        if len(found) != 1:
+            results.append(("FAIL", what, f"found {len(found)} live buttons with that id"))
+            continue
+        results.append(("pass", what, ""))
+        row = found[0]
+        shown = row["text"]
+        results.append(("pass" if shown == b["label"] else "FAIL", f"{b['button_id']} shows its label {b['label']!r}",
+                        f"it shows {shown!r}"))
+        looks[b["button_id"]] = (b.get("style"), button_look(row))
+
+    reference = {}
+    for style, look in looks.values():
+        if style and style in UI_BUTTON_STYLES:
+            reference.setdefault(style, look)
+    for button_id, (style, look) in looks.items():
+        target = ui_button_style(style)
+        # Only names that are not themselves a UI style; warning is reported against the contract below.
+        if style in UI_BUTTON_STYLES or style == "warning" or target not in reference:
+            continue
+        results.append(("pass" if look == reference[target] else "FAIL",
+                        f"{button_id} (style {style!r}) looks like {target}",
+                        f"{look} vs {target}'s {reference[target]}"))
+    names = [s for s in UI_BUTTON_STYLES if s in reference]
+    for i, a in enumerate(names):
+        for b2 in names[i + 1:]:
+            results.append(("pass" if reference[a] != reference[b2] else "FAIL", f"{a} and {b2} look different",
+                            f"both look like {reference[a]}"))
+    contract = {s: look for s, look in looks.values() if s in CONTRACT_BUTTON_STYLES}
+    if "warning" in contract and "normal" in contract and contract["warning"] == contract["normal"]:
+        results.append(("warn", "the contract's warning looks like normal",
+                        "the Orchestrator sends its Cancel buttons as \"warning\"; RAMMS_Button draws "
+                        "them like any other button"))
+    return results
+
+
+def read_pois(client, root, ks=None):
+    """The POI layer's live POIs: the object each shows, and its opacity (ColorAndOpacity alpha).
+
+    ks limits the read to POIs already found (re-reading opacity after a tap creates no new POIs);
+    without it every candidate name is scanned.
+    """
+    template = POI_PATH.replace("{root}", root)
+    if ks is None:
+        objects = probe_indexed(client, template, "DetectedObjectData")
+    else:
+        values = client.read_many([(template.format(k=k), "DetectedObjectData") for k in ks])
+        objects = {ks[i]: value for i, value in values.items()}
+    ks = sorted(objects)
+    reads = [(template.format(k=k), prop) for k in ks for prop in ("Slot", "ColorAndOpacity")]
+    values = client.read_many(reads) if reads else {}
+    rows = []
+    for j, k in enumerate(ks):
+        if not values.get(2 * j):
+            continue
+        color = values.get(2 * j + 1) or {}
+        data = objects[k] or {}
+        rows.append({"k": k, "instance_id": data.get("InstanceId", ""), "class": data.get("PerceptionClass", ""),
+                     "alpha": round(float(color.get("A", 1.0)), 3)})
+    return rows
+
+
+def read_poi_layer(client, root):
+    """The layer's dim opacity and visibility (None where Remote Control won't say)."""
+    path = POI_LAYER_PATH.replace("{root}", root)
+    values = client.read_many([(path, "UnselectedPOIOpacity"), (path, "Visibility")])
+    opacity = values.get(0)
+    return {"unselected_opacity": float(opacity) if opacity is not None else None, "visibility": values.get(1)}
+
+
+def check_pois(pushed_objects, rows):
+    """[(status, what, detail)]: one live POI per pushed object with an id, as many id-less ones as pushed."""
+    results = []
+    ids = [o.get("instance_id", "") for o in pushed_objects]
+    live_ids = [r["instance_id"] for r in rows]
+    for instance_id in [i for i in ids if i]:
+        n = live_ids.count(instance_id)
+        results.append(("pass" if n == 1 else "FAIL", f"one POI for {instance_id}", f"found {n}"))
+    unkeyed = ids.count("")
+    n = live_ids.count("")
+    results.append(("pass" if n == unkeyed else "FAIL", f"{unkeyed} POI(s) without an id", f"found {n}"))
+    extra = sorted({i for i in live_ids if i and i not in ids})
+    results.append(("pass" if not extra else "FAIL", "no POIs left over from an earlier push", f"still showing {extra}"))
+    return results
+
+
+def check_poi_dimming(rows, tapped_id, dim, tolerance=1e-3):
+    """[(status, what, detail)]: with tapped_id last tapped, it is opaque and every other POI is at dim.
+
+    tapped_id None means nothing is tapped (or the tapped object is gone): every POI opaque.
+    """
+    if dim is None:
+        return [("FAIL", "the POI layer's UnselectedPOIOpacity is readable",
+                 "no such property: this RammsUI predates POI dimming, or the layer has another name or path")]
+    results = []
+    for row in rows:
+        name = row["instance_id"] or f"(no id, POI {row['k']})"
+        want = 1.0 if tapped_id is None or row["instance_id"] == tapped_id else dim
+        results.append(("pass" if abs(row["alpha"] - want) <= tolerance else "FAIL",
+                        f"POI {name} at opacity {want:g}", f"it is at {row['alpha']:g}"))
+    return results
+
+
+def tap_origin(event):
+    """Which surface an object_tapped came from, by what it carries.
+
+    - 'camera image': a tap_point, or a camera stream id ('camera/scene/color', 'engine/overlay') --
+      a marker tap without a point (no frame yet) still names its camera's stream;
+    - '3D view': a bare source alias ('scene', 'overlay'), which world markers send;
+    - 'POI layer': neither. A world marker whose object had no source sends neither too, so this
+      one is a best guess.
+    """
+    stream_id = event.get("stream_id") or ""
+    if "tap_point" in event or "/" in stream_id:
+        return "camera image"
+    return "3D view" if stream_id else "POI layer"
+
+
+def report(results, check):
+    """Feed check_* results to a selftest-style check(); a warn only prints."""
+    for status, what, detail in results:
+        if status == "warn":
+            print(f"  warn  {what} -- {detail}")
+        else:
+            check(status == "pass", what, detail)
+
+
 def cmd_discover(client, args):
     preset = client.load_preset()
     print(f"preset: {preset.get('Name', client.preset)}")
@@ -1374,6 +1697,860 @@ def cmd_joints(client, args):
         print("  swept stowed -> active -> stowed")
     _describe_joints(rig)
     return 0
+
+
+def _hud_root_or_explain(client):
+    root = find_game_instance(client)
+    if root is None:
+        print("no HUD found: start PIE (or the game) with W_RAMMS_UI on screen. Remote Control can only "
+              "read widgets in a running game", file=sys.stderr)
+    return root
+
+
+def _print_buttons(rows):
+    for r in rows:
+        tint = "#" + "".join(f"{int(round(v * 255)):02X}" for v in r["tint"][:3]) if r["tint"] else "?"
+        print(f"  {r['button_id']:<22} style={r['style']!r:<14} shows={r['text']!r:<16} "
+              f"tag={r['tag']} opacity={r['opacity']} tint={tint}")
+
+
+def _await_buttons(client, root, pushed, timeout=3.0, sleep=None, clock=None):
+    """The live buttons once every pushed id is on the panel (the panel builds them a tick or two later)."""
+    sleep, clock = sleep or _sleep, clock or _clock
+    want = {b["button_id"] for b in pushed}
+    deadline = clock() + timeout
+    rows = read_panel_buttons(client, root)
+    while not want <= {r["button_id"] for r in rows} and clock() < deadline:
+        sleep(0.2)
+        rows = read_panel_buttons(client, root)
+    return rows
+
+
+def run_style_checks(client, root, scenario, check, sleep=None, clock=None):
+    """Push a style scenario and check the live buttons against it."""
+    pan = PANEL_SCENARIOS[scenario][0]
+    client.update_panel(pan)
+    rows = _await_buttons(client, root, pan["buttons"], sleep=sleep, clock=clock)
+    _print_buttons(rows)
+    report(check_button_styles(pan["buttons"], rows), check)
+    return rows
+
+
+def cmd_styles(client, args):
+    """Push a style panel, read back what each button draws, and check it."""
+    root = _hud_root_or_explain(client)
+    if root is None:
+        return 1
+    check, failures = _reporter()
+    print(f"panel scenario {args.scenario!r} on {root}")
+    run_style_checks(client, root, args.scenario, check)
+    if args.wait:
+        ids = scenario_buttons(args.scenario)
+        print(f"  tap any of {ids}: every style still reports its press today, unavailable included")
+        _await_button(client, ids, args.timeout, allow_skip=True)
+    print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all style checks passed'}")
+    return 1 if failures else 0
+
+
+def run_poi_checks(client, root, check, objects=None):
+    """Push the sample objects to the POI layer and check one POI per object, opacity untouched."""
+    objects = objects if objects is not None else sample_objects("scene")
+    client.update_detected_objects(detected_objects_payload(objects, "", _scene_stream_id(client)))
+    _sleep(0.5)
+    layer = read_poi_layer(client, root)
+    rows = read_pois(client, root)
+    for r in rows:
+        print(f"  POI {r['k']:<4} {r['instance_id'] or '(no id)':<10} {r['class']:<10} opacity={r['alpha']:g}")
+    if layer["visibility"] == "Collapsed":
+        print("  note: the POI layer is collapsed -- the scene camera is showing. Press the camera toggle on "
+              "the status bar to see (and tap) the POIs")
+    report(check_pois(objects, rows), check)
+    dim = layer["unselected_opacity"]
+    lit = [r for r in rows if r["alpha"] > (dim or 0) + 1e-3]
+    if dim is not None and rows and len(lit) == 1 and len(rows) > 1:
+        print(f"  note: {lit[0]['instance_id']!r} is still the last tapped POI from earlier, so the others "
+              "are dimmed. Tap empty background to clear it")
+    else:
+        report(check_poi_dimming(rows, None, dim or 0.0), check)
+    return rows, layer
+
+
+SKIPPED = "skipped"
+
+
+def _can_poll_stdin():
+    """Whether Enter can be noticed without blocking: a terminal, on POSIX or a Windows console.
+
+    Piped or captured stdin can't: a wait there runs to its timeout, and a step with
+    no timeout falls back to input().
+    """
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return False
+    except (AttributeError, OSError, ValueError):
+        return False
+    return msvcrt is not None if os.name == "nt" else True
+
+
+def _enter_pressed():
+    """Whether Enter was pressed (without blocking); False where stdin can't be polled."""
+    if not _can_poll_stdin():
+        return False
+    try:
+        if os.name == "nt":
+            while msvcrt.kbhit():
+                if msvcrt.getwch() in "\r\n":
+                    return True
+            return False
+        if select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _next_event(client, wanted, kind, timeout, since, sleep=None, clock=None):
+    """The first `kind` event after `since` carrying one of `wanted`; None at the timeout, SKIPPED on Enter."""
+    sleep, clock = sleep or _sleep, clock or _clock
+    deadline = clock() + timeout
+    while clock() < deadline:
+        if _enter_pressed():
+            return SKIPPED
+        _, events = client.poll_events(since)
+        for event in events:
+            since = max(since, int(event.get("seq", since)))
+            print(f"    [{event.get('seq')}] {_describe(event)}")
+            if event.get("event_type") == kind and _event_id(event) in wanted:
+                return event
+        sleep(0.4)
+    return None
+
+
+def _poll_dimming(client, root, ks, tapped_id, dim, timeout, sleep=None, clock=None):
+    """check_poi_dimming once it passes, or as it stands at the timeout; SKIPPED on Enter."""
+    sleep, clock = sleep or _sleep, clock or _clock
+    deadline = clock() + timeout
+    while True:
+        results = check_poi_dimming(read_pois(client, root, ks), tapped_id, dim)
+        if all(status == "pass" for status, _, _ in results) or clock() >= deadline:
+            return results
+        if _enter_pressed():
+            return SKIPPED
+        sleep(0.2)
+
+
+def _tap_round_trip(client, root, rows, dim, timeout, check):
+    """Ask for a tap on a POI, check the others dim; ask for a tap on the background, check they return."""
+    ks = [r["k"] for r in rows]
+    ids = [r["instance_id"] for r in rows if r["instance_id"]]
+    print(f"\n  tap one of the POIs {ids} (it dims the others to {dim:g}); Enter skips")
+    since = _current_sequence(client)
+    event = _next_event(client, set(ids), "object_tapped", timeout, since)
+    if event is SKIPPED:
+        print("  skipped")
+        return
+    if event is None:
+        check(False, "a POI was tapped", f"no object_tapped for {ids} within {timeout:g} s")
+        return
+    tapped = event.get("instance_id")
+    check(tap_origin(event) == "POI layer", f"the tap on {tapped} came from the POI layer",
+          f"it came from the {tap_origin(event)}: tap a POI, not a box on a camera image")
+    results = _poll_dimming(client, root, ks, tapped, dim, 2.0)
+    if results is SKIPPED:
+        print("  skipped")
+        return
+    report(results, check)
+    print("\n  now tap empty background: that clears the selection and every POI goes opaque again; Enter skips")
+    results = _poll_dimming(client, root, ks, None, dim, timeout)
+    if results is SKIPPED:
+        print("  skipped")
+        return
+    report(results, check)
+
+
+def cmd_pois(client, args):
+    """Push objects to the POI layer; check them, and with --tap, that a tap dims the rest."""
+    root = _hud_root_or_explain(client)
+    if root is None:
+        return 1
+    check, failures = _reporter()
+    rows, layer = run_poi_checks(client, root, check)
+    if args.tap and rows:
+        dim = layer["unselected_opacity"]
+        if dim is None:
+            report(check_poi_dimming(rows, None, None), check)
+        else:
+            _tap_round_trip(client, root, rows, dim, args.timeout, check)
+    print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all POI checks passed'}")
+    return 1 if failures else 0
+
+
+# ── world markers derived from 2D: the depth fallback ────────────────
+#
+# URammsDetectionWorldMarkers places an object with no position_m by unprojecting its centroid
+# through the camera named by its `source`: that stream's intrinsics, the range read from its depth
+# sibling (same group), and the stream's pose. `markers` checks it against a camera whose answer is
+# known: it streams one itself, with its intrinsics and pose in the RMSS metadata the stream bridge
+# already reads, and works out independently where each centroid must land.
+#
+# The component is driven through the editor's Python, not Remote Control: the project's Remote
+# Control allow-list covers only the bridge receiver (rightly), and the component is not something a
+# robot UI calls. That makes this an editor-only check, in a play session.
+
+# Its own stream ids: the stream bridge reads a stream's intrinsics and size only when it first sees
+# it, so a scene stream first sent without intrinsics -- the synthetic video `walkthrough` and
+# `stream` send, or an older bridge -- never gains them, however many later frames carry them.
+# Asymmetric on purpose (fx != fy, the principal point off-centre, a roll in the pose), so a swapped
+# axis or a dropped angle cannot pass by symmetry. Fixed for the same reason as the ids: a second
+# run with other values would be read against the first run's registration.
+MARKER_CAMERA = {
+    "color_id": "test/markers/color",
+    "depth_id": "test/markers/depth",
+    "group": "test/markers",
+    "channels": (5, 6),
+    "size": (320, 240),
+    "intrinsics": {"fx": 260.0, "fy": 240.0, "cx": 158.0, "cy": 122.0},
+    "transform": {"x": 100.0, "y": -50.0, "z": 120.0, "pitch": -10.0, "yaw": 30.0, "roll": 5.0},
+    # Which frames carry the intrinsics and pose. The UI bridge puts them on the DEPTH frames only
+    # (ui_bridge_node.py _forward_scene_camera_depth); "both" is another producer's way.
+    "meta_on": "depth",
+}
+# The same camera with its intrinsics and pose on the colour frames too -- its own ids, because a
+# stream's registration keeps intrinsics from earlier frames, so one mode would mask the other.
+MARKER_CAMERA_COLOUR_META = dict(MARKER_CAMERA, color_id="test/markers-colour-meta/color",
+                                 depth_id="test/markers-colour-meta/depth", group="test/markers-colour-meta",
+                                 channels=(7, 8), meta_on="both")
+MARKER_WALL_MM = 2000                       # the back wall, everywhere not covered below
+MARKER_BOX_MM = 1200                        # a box in front of it
+MARKER_BOX = (0.40, 0.40, 0.60, 0.60)       # its normalized rectangle
+MARKER_DROPOUT = (0.15, 0.15, 0.30, 0.30)   # no return at all (zeros), as a shiny or dark surface gives
+MARKER_TOLERANCE_CM = 0.5
+MARKER_PREFIX = "rmtest_"                   # every test object's id and class: how its markers are told apart
+
+
+def marker_depth_image(camera=MARKER_CAMERA, box_mm=MARKER_BOX_MM):
+    """The test camera's depth, uint16 millimetres: a wall, a box in front of it, a dropout patch."""
+    import numpy as np
+    w, h = camera["size"]
+    depth = np.full((h, w), MARKER_WALL_MM, np.uint16)
+    for (x0, y0, x1, y1), value in ((MARKER_BOX, box_mm), (MARKER_DROPOUT, 0)):
+        depth[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)] = value
+    return depth
+
+
+def sample_depth_cm(depth, nx, ny, radius):
+    """The range at a normalized point, in cm, as the component reads it; None with no return.
+
+    The median of the non-zero samples in a (2r+1)^2 window around the pixel the point falls in,
+    clamped to the image -- SampleDepthUU in RammsDetectionWorldMarkers.cpp.
+    """
+    h, w = depth.shape
+    cx = min(max(int(math.floor(nx * w)), 0), w - 1)
+    cy = min(max(int(math.floor(ny * h)), 0), h - 1)
+    r = min(max(int(radius), 0), 8)
+    window = depth[max(0, cy - r):min(h, cy + r + 1), max(0, cx - r):min(w, cx + r + 1)]
+    samples = sorted(float(v) * 0.1 for v in window.ravel() if v > 0)
+    return samples[len(samples) // 2] if samples else None
+
+
+def ue_rotate(pitch, yaw, roll, v):
+    """v rotated by FRotator(pitch, yaw, roll), degrees -- FRotationMatrix's axes, row-vector form."""
+    sp, cp = math.sin(math.radians(pitch)), math.cos(math.radians(pitch))
+    sy, cy = math.sin(math.radians(yaw)), math.cos(math.radians(yaw))
+    sr, cr = math.sin(math.radians(roll)), math.cos(math.radians(roll))
+    x_axis = (cp * cy, cp * sy, sp)
+    y_axis = (sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp)
+    z_axis = (-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp)
+    return tuple(v[0] * x_axis[i] + v[1] * y_axis[i] + v[2] * z_axis[i] for i in range(3))
+
+
+def camera_local_to_world(local, transform):
+    """A point in the camera's Unreal-local frame (X along the view, Y right, Z up), in cm, to world."""
+    r = ue_rotate(transform["pitch"], transform["yaw"], transform["roll"], local)
+    return (r[0] + transform["x"], r[1] + transform["y"], r[2] + transform["z"])
+
+
+def expected_derived(nx, ny, depth_cm, camera=MARKER_CAMERA):
+    """Where a normalized centroid at depth_cm belongs: pinhole unprojection, then the stream's pose.
+
+    u = nx * width; X (the view axis) = depth; Y = (u - cx) * depth / fx; Z = -(v - cy) * depth / fy
+    -- RammsProjection.ush's mapping inverted, which the projector and the marker share.
+    """
+    w, h = camera["size"]
+    k = camera["intrinsics"]
+    u, v = nx * w, ny * h
+    local = (depth_cm, (u - k["cx"]) * depth_cm / k["fx"], -(v - k["cy"]) * depth_cm / k["fy"])
+    return camera_local_to_world(local, camera["transform"])
+
+
+def expected_sent_camera(position_m, camera=MARKER_CAMERA):
+    """A position_m in the optical frame (X right, Y down, Z forward; metres), placed through the pose."""
+    x, y, z = position_m
+    return camera_local_to_world((z * 100.0, x * 100.0, -y * 100.0), camera["transform"])
+
+
+def expected_sent_world(position_m):
+    """A position_m in the producer's world frame (right-handed, Z up; metres): Y is negated."""
+    x, y, z = position_m
+    return (x * 100.0, -y * 100.0, z * 100.0)
+
+
+class MarkerCameraFeeder:
+    """Streams MARKER_CAMERA -- colour and depth, each with its intrinsics and pose -- until stopped."""
+
+    def __init__(self, host, port, camera=MARKER_CAMERA, rate=10.0):
+        self.host, self.port, self.camera, self.rate = host, port, camera, rate
+        self.sender = None
+        self.error = None
+        self._stop = threading.Event()
+        self._thread = None
+        self.box_mm = MARKER_BOX_MM
+        self._frames = None
+
+    def set_box_mm(self, box_mm):
+        """Move the box: the next frames carry it at this depth (a fresh value tells fresh depth from stale)."""
+        self.box_mm = box_mm
+        self._frames = None
+
+    def metadata(self):
+        """The RMSS metadata RammsStreamCameraBridge reads: intrinsics {fx,fy,cx,cy}, transform {x..roll}."""
+        return {"intrinsics": dict(self.camera["intrinsics"]), "transform": dict(self.camera["transform"])}
+
+    def frames(self):
+        import numpy as np
+        w, h = self.camera["size"]
+        colour = np.zeros((h, w, 4), np.uint8)
+        colour[..., 0] = np.linspace(40, 220, w, dtype=np.uint8)[None, :]
+        colour[..., 1] = np.linspace(40, 220, h, dtype=np.uint8)[:, None]
+        colour[..., 3] = 255
+        return colour.tobytes(), marker_depth_image(self.camera, self.box_mm).tobytes()
+
+    def send_once(self, colour, depth):
+        w, h = self.camera["size"]
+        meta = self.metadata()
+        colour_ch, depth_ch = self.camera["channels"]
+        colour_meta = meta if self.camera.get("meta_on", "depth") == "both" else None
+        self.sender.send_image(colour_ch, colour, w, h, fmt="bgra8", metadata=colour_meta, group=self.camera["group"],
+                               role="color", stream_id=self.camera["color_id"])
+        self.sender.send_depth_uint16(depth_ch, depth, w, h, metadata=meta, group=self.camera["group"],
+                                      role="depth", stream_id=self.camera["depth_id"])
+
+    def start(self):
+        """None once streaming, else why it cannot."""
+        try:
+            from ramms_tools.streaming import StreamSender
+        except ImportError as exc:
+            return f"streaming is unavailable ({exc})"
+        try:
+            self.sender = StreamSender(host=self.host, port=self.port, queue_size=0)
+            self.sender.connect()
+        except OSError as exc:
+            return f"cannot connect to RMSS on {self.host}:{self.port} ({exc})"
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return None
+
+    def _run(self):
+        while not self._stop.is_set():
+            frames = self._frames = self._frames or self.frames()
+            try:
+                self.send_once(*frames)
+            except OSError as exc:
+                self.error = f"streaming stopped: {exc}"
+                return
+            self._stop.wait(1.0 / self.rate)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        if self.sender is not None:
+            try:
+                self.sender.disconnect()  # also unblocks a send the join above timed out on
+            except OSError:
+                pass
+
+
+# Runs inside the editor. State lives in a module of its own because each command gets fresh
+# globals: a temporary component and any held depth request must survive from one command to the
+# next, and be found again (and released) by a later run if this one died half way.
+EDITOR_MARKERS_PRELUDE = r'''
+import json, sys, types
+import unreal
+
+_S = sys.modules.get("_ramms_markers_test")
+if _S is None:
+    _S = types.ModuleType("_ramms_markers_test")
+    _S.component, _S.requested = None, []
+    sys.modules["_ramms_markers_test"] = _S
+
+
+def _world():
+    return unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()
+
+
+def _actors(world, cls=None):
+    return list(unreal.GameplayStatics.get_all_actors_of_class(world, cls or unreal.Actor))
+
+
+def _components(world, cls):
+    found = []
+    for actor in _actors(world):
+        found += list(actor.get_components_by_class(cls))
+    return found
+
+
+def _alive(obj, world):
+    try:
+        return obj is not None and unreal.SystemLibrary.is_valid(obj) and obj.get_world().get_path_name() == world.get_path_name()
+    except Exception:
+        return False
+
+
+def _release():
+    for bridge in _S.requested:
+        try:
+            bridge.release_raw_data_forwarding()
+        except Exception:
+            pass
+    _S.requested = []
+
+
+def _destroy_own():
+    comp, _S.component = _S.component, None
+    if comp is not None:
+        try:
+            comp.set_detected_objects_json('{"objects": []}')
+            comp.destroy_component(comp)
+        except Exception:
+            pass
+
+
+def _drop_projectors(ids):
+    # The level's projection manager gives every stream that turns active a projector of its own,
+    # so the test camera would otherwise go on painting its gradient into the 3D view.
+    for manager in _components(_world(), unreal.RammsCameraProjectionManager):
+        for stream_id in ids:
+            try:
+                manager.remove_projector(stream_id)
+            except Exception:
+                pass
+
+
+def _describe(comp):
+    cls = comp.get_editor_property("marker_class")
+    try:
+        ours = cls is not None and unreal.MathLibrary.class_is_child_of(cls, unreal.RammsDetectionWorldMarker.static_class())
+    except Exception:
+        ours = False
+    return {"path": comp.get_path_name(), "accepted_sources": [str(s) for s in comp.get_editor_property("accepted_sources")],
+            "spawn_markers": bool(comp.get_editor_property("spawn_markers")),
+            "marker_class": cls.get_name() if cls is not None else "", "marker_is_ramms": bool(ours)}
+
+
+def _op_setup(params):
+    world = _world()
+    if world is None:
+        return {"error": "no play session: start PIE (Play) first -- the markers live in the game world"}
+    # Whatever an earlier run left behind goes first, so this run's measurements are its own.
+    _release()
+    _destroy_own()
+    _drop_projectors(params.get("stream_ids", []))
+    level = [c for c in _components(world, unreal.RammsDetectionWorldMarkers) if not c.is_being_destroyed()]
+    bridges = _components(world, unreal.RammsStreamCameraBridge)
+    host = bridges[0].get_owner() if bridges else _actors(world)[0]
+    # The checks' own component, never the level's: it is not registered, so it neither begins play nor
+    # binds to bridge pushes, and is driven only by the calls below -- the app's markers are untouched.
+    _S.component = unreal.new_object(unreal.RammsDetectionWorldMarkers, outer=host)
+    return {"world": world.get_path_name(), "component": _S.component.get_path_name(),
+            "level_components": [_describe(c) for c in level],
+            "bridges": [b.get_path_name() for b in bridges],
+            "sample_radius": int(_S.component.get_editor_property("depth_sample_radius"))}
+
+
+def _op_derive(params):
+    points = []
+    for x, y in params["points"]:
+        found = _S.component.derive_world_location(params["source"], unreal.Vector2D(x, y))
+        points.append(None if found is None else [found.x, found.y, found.z])
+    return {"points": points}
+
+
+def _markers(prefix):
+    found = []
+    for actor in _actors(_world(), unreal.RammsDetectionWorldMarker):
+        label = str(actor.get_label_text())
+        if label.startswith(prefix):
+            loc = actor.get_actor_location()
+            found.append({"label": label, "location": [loc.x, loc.y, loc.z]})
+    return found
+
+
+def _op_apply(params):
+    _S.component.set_detected_objects_json(params["payload"])
+    return {"markers": _markers(params.get("prefix", ""))}
+
+
+def _op_markers(params):
+    return {"markers": _markers(params.get("prefix", ""))}
+
+
+def _op_depth(params):
+    if params.get("request"):
+        for bridge in _components(_world(), unreal.RammsStreamCameraBridge):
+            bridge.request_raw_data_forwarding()
+            _S.requested.append(bridge)
+    else:
+        _release()
+    return {"held": len(_S.requested)}
+
+
+def _op_teardown(params):
+    _destroy_own()
+    _release()
+    _drop_projectors(params.get("stream_ids", []))
+    return {"ok": True}
+
+
+def _ramms_markers_run(op, params):
+    try:
+        result = globals()["_op_" + op](params)
+    except Exception as exc:
+        result = {"error": "%s: %s" % (type(exc).__name__, exc)}
+    print("RAMMS_MARKERS_RESULT " + json.dumps(result))
+'''
+
+MARKERS_RESULT = "RAMMS_MARKERS_RESULT "
+
+
+class EditorMarkers:
+    """The world-marker component in the play session, driven through the editor's Python."""
+
+    def __init__(self, editor):
+        self.editor = editor
+
+    def call(self, op, **params):
+        script = EDITOR_MARKERS_PRELUDE + f"\n_ramms_markers_run({op!r}, json.loads({json.dumps(params)!r}))\n"
+        lines = self.editor.run(script)
+        result = next((json.loads(line[len(MARKERS_RESULT):]) for line in lines if line.startswith(MARKERS_RESULT)), None)
+        if result is None:
+            raise BridgeError(f"the editor's {op} step printed no result: {lines[-3:]}")
+        if "error" in result:
+            raise BridgeError(f"the editor's {op} step failed: {result['error']}")
+        return result
+
+
+def _fmt_point(p):
+    return "(" + ", ".join(f"{v:.1f}" for v in p) + ")"
+
+
+def _off_by(got, want):
+    return math.dist(got, want)
+
+
+def _await_derived(markers, source, point, want, timeout, sleep, clock):
+    """The derived position for point once it is within tolerance of want; as it last was at the timeout."""
+    deadline = clock() + timeout
+    while True:
+        got = markers.call("derive", source=source, points=[list(point)])["points"][0]
+        if (got is not None and _off_by(got, want) <= MARKER_TOLERANCE_CM) or clock() >= deadline:
+            return got
+        sleep(0.25)
+
+
+def marker_payload_cases(camera, depth, radius):
+    """(what, object, push stream_id, expected world point or None, why it fails today if it does)."""
+    cid = camera["color_id"]
+    w, h = camera["size"]
+    box_centre, wall = (0.5, 0.5), (0.8, 0.2)
+    at_box = expected_derived(*box_centre, sample_depth_cm(depth, *box_centre, radius), camera)
+    at_wall = expected_derived(*wall, sample_depth_cm(depth, *wall, radius), camera)
+
+    def obj(key, **fields):
+        return dict({"instance_id": MARKER_PREFIX + key, "perception_class": MARKER_PREFIX + key}, **fields)
+
+    sent_camera = (0.10, -0.05, 1.50)
+    sent_world = (1.0, 0.5, 0.8)
+    return [
+        ("centroid as [x, y], normalized, `source` = the camera's stream id",
+         obj("array", centroid=[0.5, 0.5], source=cid), "", at_box, ""),
+        ("centroid as {\"X\", \"Y\"} -- how the bridge encodes it for UE",
+         obj("object", centroid={"X": 0.5, "Y": 0.5}, source=cid), "", at_box,
+         "the component reads centroid and box only as JSON arrays, and the bridge re-encodes both as "
+         "objects (USER_INPUT_JSON_SCHEMA.md, end of section 3), so it derives nothing for any real bridge object"),
+        (f"centroid in pixels of the {w}x{h} frame -- the bridge's units",
+         obj("pixels", centroid=[wall[0] * w, wall[1] * h], source=cid), "", at_wall,
+         "a centroid is used as if normalized; the bridge sends pixels of the source's frame, which the "
+         "camera widget divides by the frame size"),
+        ("box only, as [x0, y0, x1, y1]: placed at its centre",
+         obj("box_array", box=[0.45, 0.45, 0.55, 0.55], source=cid), "", at_box, ""),
+        ("box only, as {\"X\", \"Y\", \"Z\", \"W\"} -- how the bridge encodes it",
+         obj("box_object", box={"X": 0.45, "Y": 0.45, "Z": 0.55, "W": 0.55}, source=cid), "", at_box,
+         "box is read only as a JSON array, as centroid is"),
+        ("no `source` on the object: the push's stream_id names the camera",
+         obj("push_source", centroid=[0.5, 0.5]), cid, at_box, ""),
+        ("a centroid where the depth has no return: no marker",
+         obj("dropout", centroid=[0.22, 0.22], source=cid), "", None, ""),
+        ("sent position_m, world frame (the 3D path, as a control)",
+         obj("sent_world", position_m=dict(zip("XYZ", sent_world)), frame="world", source=cid), "",
+         expected_sent_world(sent_world), ""),
+        ("sent position_m, camera frame, through the stream's pose (control)",
+         obj("sent_camera", position_m=dict(zip("XYZ", sent_camera)), frame="camera", source=cid), "",
+         expected_sent_camera(sent_camera, camera), ""),
+    ]
+
+
+def _check_bound_component(markers, client, check, components):
+    """Whether the level's world-marker component places markers from bridge pushes: push one through it.
+
+    A sent world-frame position, so no camera or depth can stand in the way, tagged with a source the
+    component accepts. Cleared again by pushing the empty set.
+    """
+    what = "the level's world-marker component places markers from bridge pushes"
+    if not components:
+        report([("warn", what, "there is none: no actor in this level carries URammsDetectionWorldMarkers, so it "
+                 "shows no world markers at all. The checks below use one of their own, given each payload "
+                 "directly -- the receiver passes pushes through unchanged")], check)
+        return
+    comp = components[0]
+    if not comp["spawn_markers"]:
+        report([("warn", what, f"not checked: {comp['path']} has bSpawnMarkers off, so what it shows is up to "
+                 "whatever listens to OnDetectionWorldPoints")], check)
+        return
+    if not comp["marker_is_ramms"]:
+        report([("warn", what, f"not checked: its MarkerClass ({comp['marker_class'] or 'none'}) is not a "
+                 "RammsDetectionWorldMarker, so its markers cannot be read back here")], check)
+        return
+    accepted = comp["accepted_sources"]
+    source = "" if not accepted or "" in accepted else accepted[0]
+    probe = {"instance_id": MARKER_PREFIX + "bound", "perception_class": MARKER_PREFIX + "bound",
+             "position_m": {"X": 1.0, "Y": 0.5, "Z": 0.8}, "frame": "world", "source": source}
+    client.update_detected_objects(detected_objects_payload([probe], "", ""))
+    try:
+        placed = markers.call("markers", prefix=probe["perception_class"])["markers"]
+    finally:
+        client.update_detected_objects(detected_objects_payload([], "", ""))
+    check(bool(placed), what, f"{comp['path']} placed no marker for a pushed position_m (source {source!r}): "
+          "it is not receiving bridge pushes -- not registered, or it never began play")
+
+
+def _check_pushed_derived(markers, client, check, camera, depth, radius, components, timeout, sleep, clock):
+    """A 2D object pushed through the receiver, as the bridge sends one, gets a derived marker from the level's component.
+
+    The app's whole path: the receiver, the bridge subsystem, the level's own component (registered, so
+    bound to pushes, and asking for depth itself), the {"X", "Y"} pixel centroid the bridge sends.
+    """
+    what = "a 2D object pushed through the receiver gets a derived marker from the level's component"
+    if not components or not components[0]["spawn_markers"] or not components[0]["marker_is_ramms"]:
+        return  # already reported: no level component, or none whose markers can be read back
+    accepted = components[0]["accepted_sources"]
+    if accepted and not any(a.lower() == camera["color_id"].lower() for a in accepted):
+        report([("warn", what, f"not checked: the level's component accepts only {accepted}, not the test camera's "
+                 f"'{camera['color_id']}' (`markers --scene` streams it as the scene camera)")], check)
+        return
+    w, h = camera["size"]
+    wall = (0.8, 0.2)
+    want = expected_derived(*wall, sample_depth_cm(depth, *wall, radius), camera)
+    label = MARKER_PREFIX + "pushed"
+    obj = {"instance_id": label, "perception_class": label, "source": camera["color_id"],
+           "centroid": {"X": wall[0] * w, "Y": wall[1] * h}}
+    client.update_detected_objects(detected_objects_payload([obj], "", ""))
+    try:
+        deadline = clock() + timeout
+        while True:
+            placed = markers.call("markers", prefix=label)["markers"]
+            if placed or clock() >= deadline:
+                break
+            sleep(0.25)  # the level's component asks for depth on its first need, and retries meanwhile
+    finally:
+        client.update_detected_objects(detected_objects_payload([], "", ""))
+    if not placed:
+        check(False, what, f"no marker within {timeout:g} s")
+        return
+    off = _off_by(placed[0]["location"], want)
+    check(off <= MARKER_TOLERANCE_CM and len(placed) == 1, f"{what}, at {_fmt_point(want)}",
+          f"{len(placed)} marker(s), at {_fmt_point(placed[0]['location'])}, {off:.1f} cm away")
+
+
+def run_marker_checks(markers, client, check, feeder, camera=MARKER_CAMERA, timeout=8.0, sleep=None, clock=None,
+                      unaided_box_mm=None):
+    """Every derived-position check against the streamed test camera; leaves nothing behind.
+
+    unaided_box_mm: the box's depth while checking what the component manages unaided -- a value this
+    run alone uses, so a position derived from an older frame (the provider keeps a stream's last raw
+    frame after forwarding stops) cannot pass for a fresh one.
+    """
+    sleep, clock = sleep or _sleep, clock or _clock
+    if unaided_box_mm is None:
+        unaided_box_mm = 1300 + int(clock() * 1000) % 400 * 2
+    # Projectors are dropped only for the test camera's own ids: under --scene they are the real scene
+    # camera's, and its projector is the level's to keep.
+    ids = [camera["color_id"], camera["depth_id"]] if camera.get("own_ids", True) else []
+    setup = markers.call("setup", stream_ids=ids)
+    try:
+        _marker_checks(markers, client, check, feeder, camera, setup, timeout, sleep, clock, unaided_box_mm)
+    finally:
+        feeder.set_box_mm(MARKER_BOX_MM)
+        markers.call("teardown", stream_ids=ids)
+
+
+def _marker_checks(markers, client, check, feeder, camera, setup, timeout, sleep, clock, unaided_box_mm):
+    radius = setup["sample_radius"]
+    depth = marker_depth_image(camera)
+    cid = camera["color_id"]
+    _check_bound_component(markers, client, check, setup.get("level_components", []))
+    if not setup["bridges"]:
+        check(False, "a RammsStreamCameraBridge in the play session",
+              "none: nothing turns RMSS frames into camera streams, so nothing can be derived")
+        return
+
+    centre = (0.5, 0.5)
+    feeder.set_box_mm(unaided_box_mm)
+    unaided = marker_depth_image(camera, unaided_box_mm)
+    want = expected_derived(*centre, sample_depth_cm(unaided, *centre, radius), camera)
+    got = _await_derived(markers, cid, centre, want, min(timeout, 3.0), sleep, clock)
+    what = "a derived position from the current depth, with only what the component asks for itself"
+    if got is None:
+        check(False, what, "none: no depth bytes reach the camera provider. The component has to get the stream "
+              "bridge to forward depth (RequestDepthRawDataForwarding) itself; before that fix only "
+              "RammsCameraProjectionManager asked, and only for CPU projection. The rest of this run holds a request "
+              "of its own")
+    else:
+        off = _off_by(got, want)
+        check(off <= MARKER_TOLERANCE_CM, what,
+              f"placed at {_fmt_point(got)}, {off:.1f} cm from where the box is now: derived from an OLD depth "
+              "frame. The provider keeps a stream's last raw frame after raw-data forwarding stops (here, an "
+              "earlier run's), so markers go on using depth that is no longer arriving")
+    feeder.set_box_mm(MARKER_BOX_MM)
+    markers.call("depth", request=True)
+    want = expected_derived(*centre, sample_depth_cm(depth, *centre, radius), camera)
+    got = _await_derived(markers, cid, centre, want, timeout, sleep, clock)
+    what = "a derived position from the current depth, with depth forwarded"
+    if got is None:
+        check(False, what, f"none after {timeout:g} s: '{cid}' was registered earlier with another size or "
+              "without intrinsics (restart the play session), or its frames stopped arriving")
+        return
+    # A position that never settles on the right one, with fresh frames arriving all along, is the
+    # projection disagreeing, not a wait that was too short: say so, and let the points below show how.
+    off = _off_by(got, want)
+    check(off <= MARKER_TOLERANCE_CM, what, f"the image centre settles at {_fmt_point(got)}, {off:.1f} cm from "
+          f"{_fmt_point(want)}, with depth forwarded for {timeout:g} s: the projection disagrees (see below)")
+
+    _check_pushed_derived(markers, client, check, camera, depth, radius, setup.get("level_components", []),
+                          timeout, sleep, clock)
+
+    points = [("the box in front of the wall, image centre", centre),
+              ("the wall, upper right", (0.8, 0.2)),
+              ("the wall, top-left pixel", (0.0, 0.0)),
+              ("the wall, bottom-right pixel", (319.5 / 320, 239.5 / 240))]
+    found = markers.call("derive", source=cid, points=[list(p) for _, p in points])["points"]
+    for (what, p), got in zip(points, found):
+        want = expected_derived(*p, sample_depth_cm(depth, *p, radius), camera)
+        if got is None:
+            check(False, f"{what} {p}: derived to {_fmt_point(want)}", "no position at all")
+        else:
+            off = _off_by(got, want)
+            check(off <= MARKER_TOLERANCE_CM, f"{what} {tuple(round(v, 3) for v in p)}: derived to {_fmt_point(want)}",
+                  f"placed at {_fmt_point(got)}, {off:.1f} cm away")
+
+    dropout, outside = (0.22, 0.22), (1.25, 0.5)
+    got_dropout, got_outside = markers.call("derive", source=cid, points=[list(dropout), list(outside)])["points"]
+    check(got_dropout is None, "no position where the depth has no return",
+          f"placed at {_fmt_point(got_dropout or (0, 0, 0))}")
+    check(got_outside is None, f"no position for a point outside the image {outside}",
+          f"placed at {_fmt_point(got_outside or (0, 0, 0))}: depth is read at the clamped edge pixel and the "
+          "point unprojected anyway, so a pixel centroid taken as normalized lands metres off rather than nowhere")
+
+    scene_id = _scene_stream_id(client) or "camera/scene/color"
+    via_alias, direct = (markers.call("derive", source=s, points=[list(centre)])["points"][0]
+                         for s in ("scene", scene_id))
+    if cid == scene_id and direct is not None:
+        # The test camera is the scene camera (--scene): an object exactly as the bridge sends it.
+        w, h = camera["size"]
+        wall = (0.8, 0.2)
+        want_wall = expected_derived(*wall, sample_depth_cm(depth, *wall, radius), camera)
+        obj = {"instance_id": MARKER_PREFIX + "bridge", "perception_class": MARKER_PREFIX + "bridge", "source": "scene",
+               "box": {"X": 0.75 * w, "Y": 0.15 * h, "Z": 0.85 * w, "W": 0.25 * h},
+               "centroid": {"X": wall[0] * w, "Y": wall[1] * h}}
+        placed = markers.call("apply", payload=json.dumps(detected_objects_payload([obj], "", "")),
+                              prefix=MARKER_PREFIX)["markers"]
+        mine = [m for m in placed if m["label"] == obj["perception_class"]]
+        off = _off_by(mine[0]["location"], want_wall) if mine else None
+        check(bool(mine) and off <= MARKER_TOLERANCE_CM,
+              f"an object exactly as the bridge sends it (source \"scene\", box and centroid as {{\"X\", ...}} pixels): "
+              f"marker at {_fmt_point(want_wall)}",
+              f"at {_fmt_point(mine[0]['location'])}, {off:.1f} cm away" if mine else "no marker")
+    if direct is None:
+        report([("warn", "the bridge's source \"scene\" places objects on the scene camera",
+                 f"not decided: the scene camera ('{scene_id}') derives nothing either -- nothing streams it, or "
+                 "not with intrinsics, a pose and depth (the synthetic video sends neither). `markers --scene` "
+                 "streams the test camera as the scene camera, which decides it")], check)
+    elif via_alias is None:
+        check(False, "the bridge's source \"scene\" places objects on the scene camera",
+              f"'{scene_id}' derives {_fmt_point(direct)}, but 'scene' derives nothing: the component looks "
+              "`source` up as a stream id, with no alias table like the camera widget's SceneDetectionSources")
+    else:
+        check(_off_by(via_alias, direct) <= MARKER_TOLERANCE_CM, "the bridge's source \"scene\" places objects on "
+              "the scene camera", f"'scene' gives {_fmt_point(via_alias)}, '{scene_id}' gives {_fmt_point(direct)}")
+
+    for what, obj, push_stream, want, why in marker_payload_cases(camera, depth, radius):
+        payload = json.dumps(detected_objects_payload([obj], "", push_stream))
+        placed = markers.call("apply", payload=payload, prefix=MARKER_PREFIX)["markers"]
+        mine = [m for m in placed if m["label"] == obj["perception_class"]]
+        others = [m["label"] for m in placed if m["label"] != obj["perception_class"]]
+        if want is None:
+            check(not mine, what, f"a marker at {_fmt_point(mine[0]['location'])}" if mine else "")
+        elif not mine:
+            check(False, f"{what}: marker at {_fmt_point(want)}", "no marker" + (f" -- {why}" if why else ""))
+        else:
+            off = _off_by(mine[0]["location"], want)
+            check(off <= MARKER_TOLERANCE_CM and len(mine) == 1, f"{what}: marker at {_fmt_point(want)}",
+                  f"{len(mine)} marker(s), at {_fmt_point(mine[0]['location'])}, {off:.1f} cm away"
+                  + (f" -- {why}" if why else ""))
+        if others:
+            check(False, f"{what}: only this push's marker", f"also {others}: earlier markers were not removed")
+
+
+def cmd_markers(client, args):
+    """Check world markers derived from 2D detections against a streamed camera with known geometry."""
+    from ramms_tools.editor_exec import EditorExec, EditorExecError
+    camera = MARKER_CAMERA_COLOUR_META if getattr(args, "metadata", "depth") == "both" else MARKER_CAMERA
+    if getattr(args, "scene", False):
+        # The scene camera's own stream ids and group, so `source: "scene"` names this camera. It takes
+        # over the scene camera view while it runs; the bridge re-registers the stream at this size.
+        scene_color, scene_depth, _ = VideoFeeder(client, args.host, args.stream_port)._settings()
+        camera = dict(camera, color_id=scene_color, depth_id=scene_depth, group="camera/scene", channels=(0, 1),
+                      own_ids=False)
+    feeder = MarkerCameraFeeder(args.host, args.stream_port, camera)
+    problem = feeder.start()
+    if problem:
+        print(f"  cannot stream the test camera: {problem}")
+        return 1
+    k, t = camera["intrinsics"], camera["transform"]
+    print(f"  streaming a {camera['size'][0]}x{camera['size'][1]} test camera on "
+          f"{camera['color_id']!r} + {camera['depth_id']!r}: fx={k['fx']:g} fy={k['fy']:g} "
+          f"cx={k['cx']:g} cy={k['cy']:g}, at ({t['x']:g}, {t['y']:g}, {t['z']:g}) cm, "
+          f"pitch {t['pitch']:g} yaw {t['yaw']:g} roll {t['roll']:g}")
+    print(f"  intrinsics and pose on the {'colour and depth' if camera['meta_on'] == 'both' else 'depth'} frames"
+          f"{'' if camera['meta_on'] == 'both' else ' only, as the UI bridge sends them'}")
+    print(f"  depth: wall {MARKER_WALL_MM / 1000:g} m, a box at {MARKER_BOX_MM / 1000:g} m over {MARKER_BOX}, "
+          f"no return over {MARKER_DROPOUT}")
+    check, failures = _reporter()
+    try:
+        with EditorExec(project=args.editor_project) as editor:
+            run_marker_checks(EditorMarkers(editor), client, check, feeder, camera=camera, timeout=args.timeout)
+    except EditorExecError as exc:
+        print(f"  cannot use the editor's Python: {exc}")
+        return 1
+    except BridgeError as exc:
+        check(False, "world-marker checks", str(exc))
+    finally:
+        feeder.stop()
+        if feeder.error:
+            print(f"  note: {feeder.error}")
+    print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all world-marker checks passed'}")
+    return 1 if failures else 0
 
 
 def _synthetic_frames(t, w, h):
@@ -1690,6 +2867,19 @@ def cmd_selftest(client, args):
     except BridgeError as exc:
         check(False, "PollUIEvents", str(exc))
 
+    print("button styles")
+    try:
+        hud = find_game_instance(client)
+        if hud is None:
+            print("  skip  no HUD found: the style and POI checks read widgets in a running game")
+        else:
+            for scenario in ("styles", "style-fallback"):
+                run_style_checks(client, hud, scenario, check)
+            print("POI layer")
+            run_poi_checks(client, hud, check)
+    except BridgeError as exc:
+        check(False, "HUD readback", str(exc))
+
     print("joints")
     skipped = None
     if JOINT_FUNCTION not in client._labels:
@@ -1817,15 +3007,133 @@ def _drive_and_park(rig, rate=10.0, step=5.0, frames=10):
         raise BridgeError("the wheels stopped changing but the monitor still says moving")
 
 
+def _walkthrough_styles(client, scenario):
+    root = find_game_instance(client)
+    if root is None:
+        client.update_panel(PANEL_SCENARIOS[scenario][0])
+        print("  (no HUD found to read the buttons back: judge by eye)")
+        return
+    check, failures = _reporter()
+    run_style_checks(client, root, scenario, check)
+    if failures:
+        print(f"  {len(failures)} style check(s) failed -- see above")
+
+
+def _walkthrough_poi_tap(client, args):
+    root = find_game_instance(client)
+    if root is None:
+        print("  SKIPPED: no HUD found to read the POIs back")
+        return
+    ns = argparse.Namespace(tap=not args.no_taps, timeout=args.timeout)
+    cmd_pois(client, ns)
+
+
+NEXT_BUTTON = "walkthrough:next"
+NEXT_PANEL = panel(
+    title="Walkthrough",
+    message="Tap Next, or any box or POI on screen, to go on to the next step.",
+    buttons=[button(NEXT_BUTTON, "Next")],
+)
+# Where nothing on screen can move a step on (--no-taps, or no terminal to watch alongside the
+# taps), the panel says what does, rather than offering a Next that would be ignored.
+ENTER_PANEL = panel(title="Walkthrough", message="Press Enter in the terminal to go on to the next step.")
+
+
+class StepTaps(NamedTuple):
+    """What on screen moves a walkthrough step on, besides Enter.
+
+    checked: the tap is part of what the step checks (a panel's own buttons), so the
+    wait is bounded by --timeout and a miss is reported. Otherwise the step waits, as
+    long as it takes, for a tap or Enter -- the time is for looking, not for tapping.
+
+    rebaseline: the step's action waits for taps of its own, so only what comes after it
+    may move the step on -- otherwise the tap the action just used would, at once.
+    """
+    buttons: tuple = ()
+    objects: tuple = ()
+    checked: bool = False
+    rebaseline: bool = False
+
+
+def _button_ids(*panels):
+    """Every button id on these panels, in order, each once."""
+    return tuple(dict.fromkeys(b["button_id"] for pan in panels for b in pan.get("buttons", [])))
+
+
+def _panel_taps(name):
+    return StepTaps(buttons=_button_ids(PANEL_SCENARIOS[name][0]), checked=True)
+
+
+def _next_taps(*object_lists):
+    """Next on NEXT_PANEL, or a tap on any of these objects that has an id."""
+    ids = tuple(dict.fromkeys(o["instance_id"] for objs in object_lists for o in objs if o.get("instance_id")))
+    return StepTaps(buttons=(NEXT_BUTTON,), objects=ids)
+
+
+def _step_prompt(taps):
+    ways = []
+    if NEXT_BUTTON in taps.buttons:
+        ways.append("Next on the panel")
+    others = [b for b in taps.buttons if b != NEXT_BUTTON]
+    if others:
+        ways.append(f"a button ({', '.join(others)})")
+    if taps.objects:
+        ways.append(f"a box or POI ({', '.join(taps.objects)})")
+    if not ways:
+        return "  press Enter to go on (nothing on screen reports a tap at this step)"
+    return f"  to go on, tap {' or '.join(ways)} -- or press Enter"
+
+
+def _await_step(client, taps, since, timeout=None, sleep=None, clock=None):
+    """Wait for a press of one of taps.buttons, a tap on one of taps.objects, or Enter.
+
+    Returns how the step was moved on: "button", "object", "enter" or "timeout".
+    Other events are printed and do not move it on. An object tap without an id is
+    flagged: the UI should not post one.
+    """
+    sleep, clock = sleep or _sleep, clock or _clock
+    deadline = None if timeout is None else clock() + timeout
+    while deadline is None or clock() < deadline:
+        _, events = client.poll_events(since)
+        for event in events:
+            since = max(since, int(event.get("seq", since)))
+            print(f"    [{event.get('seq')}] {_describe(event)}")
+            kind = event.get("event_type")
+            if kind == "button_press" and event.get("button_id") in taps.buttons:
+                print(f"  OK: {event.get('button_id')!r} round-tripped")
+                return "button"
+            if kind == "object_tapped" and not event.get("instance_id"):
+                print("  note: a tap posted object_tapped with no instance_id -- an object without")
+                print("        an id should send nothing")
+            elif kind == "object_tapped" and event.get("instance_id") in taps.objects:
+                print(f"  OK: {event.get('instance_id')!r} round-tripped")
+                return "object"
+        if _enter_pressed():
+            return "enter"
+        sleep(0.4)
+    wanted = list(taps.buttons) + list(taps.objects)
+    print(f"  no matching tap within {timeout:.0f}s (wanted one of {wanted}); going on")
+    return "timeout"
+
+
+def _walkthrough_poi_step(client, args, screen_moves_on):
+    """Put Next on the panel for the rest of the walkthrough (or say Enter), then check the POIs."""
+    client.update_panel(NEXT_PANEL if screen_moves_on else ENTER_PANEL)
+    _walkthrough_poi_tap(client, args)
+
+
 def _walkthrough_steps(client, args):
     joints = _WalkthroughJoints(client)
+    scene, scene_b = sample_objects("scene"), sample_objects("scene", variant="b")
+    # The same test run_steps makes for the steps after the POI one, which are all unchecked.
+    screen_moves_on = not args.no_taps and _can_poll_stdin()
     steps = [
         ("Idle panel", lambda: client.update_panel(PANEL_SCENARIOS["idle"][0]),
-         PANEL_SCENARIOS["idle"][1], []),
+         PANEL_SCENARIOS["idle"][1], StepTaps()),
         ("Selection panel", lambda: client.update_panel(PANEL_SCENARIOS["selection"][0]),
-         PANEL_SCENARIOS["selection"][1], scenario_buttons("selection")),
+         PANEL_SCENARIOS["selection"][1], _panel_taps("selection")),
         ("Progress panel", lambda: client.update_panel(PANEL_SCENARIOS["progress"][0]),
-         PANEL_SCENARIOS["progress"][1], scenario_buttons("progress")),
+         PANEL_SCENARIOS["progress"][1], _panel_taps("progress")),
         ("Progress advances", lambda: _push_progress(client, args,
             [(progress_panel(pct), pct) for pct in PROGRESS_STEPS]),
          f"The SAME panel at {PROGRESS_STEPS}: the bar moves 0% to 100% while the\n"
@@ -1833,7 +3141,8 @@ def _walkthrough_steps(client, args):
          "          a panel that visibly rebuilds, or a bar that only moves on the first\n"
          "          update, is the failure here. Note 0.0 must still SHOW a bar: a bar\n"
          "          that appears only from the second update means something is inferring\n"
-         "          \"has progress\" from the value instead of from the key.", []),
+         "          \"has progress\" from the value instead of from the key.",
+         StepTaps(buttons=_button_ids(progress_panel(0.0)))),
         ("Progress on both scales", lambda: _push_progress(client, args,
             [(progress_panel(pct), pct)
              for pair in PROGRESS_SCALE_PAIRS for pct in pair]),
@@ -1842,24 +3151,44 @@ def _walkthrough_steps(client, args):
          "          pair. The schema's convention is 0.0-1.0 but fridge_ui_demo yields\n"
          "          0-100 for this widget, so the panel accepts either -- over 1 is a\n"
          "          percentage, 1 or less a fraction. A bar that jumps between a pair\n"
-         "          handles only one scale; note 1.0 means FULL here, not 1%.", []),
+         "          handles only one scale; note 1.0 means FULL here, not 1%.",
+         StepTaps(buttons=_button_ids(progress_panel(0.0)))),
         ("Progress across panels", lambda: _push_progress(client, args,
             [(pan, pan["progress"]["pct"]) for pan in PROGRESS_PANELS]),
          "FOUR DIFFERENT panels, each carrying its own progress: 15% unlatching,\n"
          "          55% swinging, 80% paused (Resume replaces Pause), then 45% on a\n"
          "          different title. Each must show its own fraction -- a bar still\n"
          "          holding the previous panel's value, or stuck on the first panel it\n"
-         "          saw, is the failure.", []),
+         "          saw, is the failure.", StepTaps(buttons=_button_ids(*PROGRESS_PANELS))),
         ("Progress gone", lambda: client.update_panel(PANEL_SCENARIOS["selection"][0]),
          "The bar DISAPPEARS and the selection panel's buttons are back. This is the\n"
          "          regression check for the hasprogress bug: the schema omits the\n"
          "          progress key rather than sending null, so a bar that stays visible\n"
          "          here means the flag is latched instead of following the key.",
-         scenario_buttons("selection")),
+         _panel_taps("selection")),
         ("Error panel", lambda: client.update_panel(PANEL_SCENARIOS["error"][0]),
-         PANEL_SCENARIOS["error"][1], scenario_buttons("error")),
+         PANEL_SCENARIOS["error"][1], _panel_taps("error")),
         ("Layout stress", lambda: client.update_panel(PANEL_SCENARIOS["stress"][0]),
-         PANEL_SCENARIOS["stress"][1], scenario_buttons("stress")),
+         PANEL_SCENARIOS["stress"][1], _panel_taps("stress")),
+        ("Button styles", lambda: _walkthrough_styles(client, "styles"),
+         PANEL_SCENARIOS["styles"][1] + "\n          Tap \"unavailable\": today it still reports a press.",
+         _panel_taps("styles")),
+        ("Style fallback", lambda: _walkthrough_styles(client, "style-fallback"),
+         PANEL_SCENARIOS["style-fallback"][1], _panel_taps("style-fallback")),
+        ("A POI tap dims the others", lambda: _walkthrough_poi_step(client, args, screen_moves_on),
+         ("The POIs were read back above (one per object, all opaque); --no-taps\n"
+          "          skipped the tap itself." if args.no_taps else
+          "The tapped POI stayed bright and every other POI dropped to the layer's\n"
+          "          UnselectedPOIOpacity; tapping empty background brought them all back.\n"
+          "          Both were read back above. If you hid the scene camera to see the\n"
+          "          POIs, press the status bar's camera toggle again: the next steps\n"
+          "          draw boxes on it.\n" + (
+          "          From here on the panel shows one Next button. It, or a tap on any box\n"
+          "          or POI on screen, moves the walkthrough on. A POI tap also dims the\n"
+          "          other POIs until you tap the background -- that is the feature."
+          if screen_moves_on else
+          "          From here on, press Enter in the terminal to go on.")),
+         _next_taps(scene)._replace(rebaseline=True)),
         ("Detected objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "cup_1",
                                      _scene_stream_id(client))),
@@ -1868,37 +3197,40 @@ def _walkthrough_steps(client, args):
          "          they do not move with the frame size -- but the scene CAMERA is\n"
          "          collapsed until its first frame arrives, so with nothing streaming\n"
          "          expect the POIs alone and no boxes. (The overlay is not open yet;\n"
-         "          that is checked at \"Both cameras at once\".)", []),
+         "          that is checked at \"Both cameras at once\".)", _next_taps(scene)),
         ("Selection moves", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "bowl_2",
                                      _scene_stream_id(client))),
-         "Same three boxes, highlight moves to bowl_2.", []),
+         "Same three boxes, highlight moves to bowl_2.", _next_taps(scene)),
         ("Objects replaced", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene", variant="b"), "jug_5",
                                      _scene_stream_id(client))),
          "A DIFFERENT three objects -- jug_5, plate_6, knife_7 -- with jug_5\n"
          "          highlighted. None of cup_1, bowl_2 or tap_3 may still be on\n"
-         "          screen: six at once means the layer adds without removing.", []),
+         "          screen: six at once means the layer adds without removing.", _next_taps(scene_b)),
         ("One object dropped", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene", variant="b", count=1), "",
                                      _scene_stream_id(client))),
          "Exactly ONE object, jug_5, nothing highlighted. plate_6 and knife_7 are\n"
-         "          gone -- each push is the full set, so what it leaves out is over.", []),
+         "          gone -- each push is the full set, so what it leaves out is over.",
+         _next_taps(scene_b[:1])),
         ("Objects without ids", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene", variant="unkeyed"), "",
                                      _scene_stream_id(client))),
          "Two objects labelled \"unknown\", and jug_5 gone. These carry no\n"
-         "          instance_id, so nothing can key a marker on them and a tap on one\n"
-         "          sends nothing at all -- the marker refuses to post without an id.", []),
+         "          instance_id, so a tap on one should send nothing at all: a box's\n"
+         "          marker refuses to post without an id. Their POIs do not refuse today\n"
+         "          -- tap one with the scene camera hidden, and the walkthrough flags the\n"
+         "          object_tapped it posts." + (" Tap Next to go on." if screen_moves_on else ""), _next_taps()),
         ("Objects cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _scene_stream_id(client))),
          "Every box and POI disappears -- not just the scene camera's. An empty\n"
-         "          list is the full set, so it clears every stream.", []),
+         "          list is the full set, so it clears every stream.", _next_taps()),
         ("Overlay camera opened", _optional(client.open_camera_feed, "OpenCameraFeed"),
          "The engine overlay's window appears. OpenCameraFeed drives this, so it\n"
          "          has to come BEFORE the overlay's objects: boxes and POIs are drawn\n"
          "          over an image, and until that image is up there is nothing to draw\n"
-         "          them on.", []),
+         "          them on.", _next_taps()),
         ("Overlay objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("overlay"), "bowl_2",
                                      _overlay_stream_id(client))),
@@ -1906,11 +3238,11 @@ def _walkthrough_steps(client, args):
          "          the scene camera stays empty. The two cameras are independent\n"
          "          surfaces: each needs its own frames, its own objects, and its own\n"
          "          POI layer, because a centroid is normalized to the image it was\n"
-         "          found in.", []),
+         "          found in.", _next_taps(sample_objects("overlay"))),
         ("Overlay cleared", lambda: client.update_detected_objects(
             detected_objects_payload([], "", _overlay_stream_id(client))),
          "The overlay's boxes and POIs disappear. (An empty list clears every\n"
-         "          stream; only the overlay had anything to lose here.)", []),
+         "          stream; only the overlay had anything to lose here.)", _next_taps()),
         ("Both cameras at once", lambda: client.update_detected_objects(
             detected_objects_payload(
                 sample_objects("scene") + sample_objects("overlay", variant="b"),
@@ -1921,48 +3253,54 @@ def _walkthrough_steps(client, args):
          "          takes it, not the push's stream_id. An object must NOT appear on\n"
          "          both, and must not appear on the wrong one: that would mean a\n"
          "          surface is accepting every source and placing another camera's\n"
-         "          coordinates against its own rectangle.", []),
+         "          coordinates against its own rectangle.",
+         _next_taps(scene, sample_objects("overlay", variant="b"))),
         ("Cleared the way the bridge clears", lambda: client.update_detected_objects(
             detected_objects_payload([], "", "")),
          "EVERYTHING disappears, from both layers at once. This is the real\n"
          "          bridge's clear: an empty objects list with an EMPTY stream_id.\n"
          "          stream_id is never consulted on a clear, so it clears every\n"
-         "          stream -- boxes and POIs alike.", []),
+         "          stream -- boxes and POIs alike.", _next_taps()),
         ("Overlay camera closed", _optional(client.close_camera_feed, "CloseCameraFeed"),
-         "The engine overlay's window disappears. Its POIs and boxes go with it.", []),
+         "The engine overlay's window disappears. Its POIs and boxes go with it.", _next_taps()),
         ("Arm stowed", joints.step(lambda rig: rig.send(rig.poses()[0])),
          "The 3D robot's arm folds into its stowed pose beside the seat, and the\n"
          "          status bar's arm text reads Stowed. The joint targets were read back,\n"
-         "          so this also proves the push reached the running display.", []),
+         "          so this also proves the push reached the running display.", _next_taps()),
         ("Arm active", joints.step(lambda rig: rig.send(rig.poses()[1])),
          "ONE arm joint swings well out of the stowed pose and the arm text reads\n"
          "          Active. The rest of the arm, the wheels and the gripper do not move:\n"
-         "          the push carries every joint, and only one of them changed.", []),
+         "          the push carries every joint, and only one of them changed.", _next_taps()),
         ("Arm stowed again", joints.step(lambda rig: rig.send(rig.poses()[0])),
          "The arm returns and the text reads Stowed again. Two real transitions,\n"
-         "          because the monitor only announces a change.", []),
+         "          because the monitor only announces a change.", _next_taps()),
         ("Wheels drive, then park", joints.step(lambda rig: _drive_and_park(rig)),
          "While that ran, the drive wheels turned and the chair text read DRIVING;\n"
-         "          it now reads PARKED, because the wheel targets stopped changing.", []),
+         "          it now reads PARKED, because the wheel targets stopped changing.", _next_taps()),
     ]
 
     def run_steps():
-        for index, (title, action, expectation, ids) in enumerate(steps, 1):
+        for index, (title, action, expectation, taps) in enumerate(steps, 1):
             print(f"\n[{index}/{len(steps)}] {title}")
-            since = _current_sequence(client) if (ids and not args.no_taps) else None
+            # Taken before the push, so a tap that lands while the step is still pushing counts.
+            since = None if args.no_taps else _current_sequence(client)
             try:
                 action()
             except BridgeError as exc:
                 print(f"  FAILED: {exc}")
                 return 1
+            if taps.rebaseline and since is not None:
+                since = _current_sequence(client)
             print(f"  expect: {expectation}")
-            if ids and not args.no_taps:
-                print(f"  tap any of {ids} (or press Enter to skip)")
-                if _await_button(client, ids, args.timeout, allow_skip=True,
-                                 since=since) == 1:
-                    return 1
-            else:
+            if args.no_taps or not (_can_poll_stdin() or taps.checked):
+                # No taps wanted, or no terminal to notice Enter in while also watching for taps.
                 input("  press Enter to continue ")
+            elif _can_poll_stdin():
+                print(_step_prompt(taps))
+                _await_step(client, taps, since, args.timeout if taps.checked else None)
+            else:
+                print(f"  tap any of {list(taps.buttons)} (no tty: waiting up to {args.timeout:.0f}s)")
+                _await_step(client, taps, since, args.timeout)
         return 0
 
     try:
@@ -2018,7 +3356,7 @@ def _describe(event):
             text += f" at ({point[0]:.1f}, {point[1]:.1f})"
             if isinstance(size, list) and len(size) == 2:
                 text += f" of {size[0]}x{size[1]}"
-        return text
+        return text + f" [{tap_origin(event)}]"
     return json.dumps(event)
 
 
@@ -2040,9 +3378,8 @@ def _await(client, wanted, timeout, kind, allow_skip=False, since=None):
     if since is None:
         since = _current_sequence(client)
     deadline = time.monotonic() + timeout
-    # Enter-to-skip needs a selectable stdin, which Windows does not give us for
-    # console handles; there we just wait the timeout out.
-    can_skip = allow_skip and os.name != "nt" and sys.stdin is not None and sys.stdin.isatty()
+    # Enter-to-skip needs a terminal to poll; piped stdin just waits the timeout out.
+    can_skip = allow_skip and _can_poll_stdin()
     if allow_skip:
         print("  waiting ..." + ("" if can_skip else " (no tty: waiting for the timeout)"))
     while time.monotonic() < deadline:
@@ -2053,8 +3390,7 @@ def _await(client, wanted, timeout, kind, allow_skip=False, since=None):
             if event.get("event_type") == kind and _event_id(event) in wanted:
                 print(f"  OK: {_event_id(event)!r} round-tripped")
                 return 0
-        if can_skip and select.select([sys.stdin], [], [], 0)[0]:
-            sys.stdin.readline()
+        if can_skip and _enter_pressed():
             print("  skipped")
             return 0
         time.sleep(0.4)
@@ -2134,6 +3470,29 @@ def main():
     p.add_argument("--timeout", type=float, default=0.0)
     p.add_argument("--interval", type=float, default=0.4)
 
+    p = sub.add_parser("styles", help="push a button-style panel and check what each button draws")
+    p.add_argument("--scenario", choices=["styles", "style-fallback", "stress", "error"], default="styles")
+    p.add_argument("--wait", action="store_true", help="then wait for a tap on one of its buttons")
+    p.add_argument("--timeout", type=_positive_float, default=60.0)
+
+    p = sub.add_parser("pois", help="push objects to the POI layer and check the POIs (and tap dimming)")
+    p.add_argument("--tap", action="store_true", help="ask for a tap on a POI, then on the background, "
+                   "and check the dimming each time")
+    p.add_argument("--timeout", type=_positive_float, default=60.0)
+
+    p = sub.add_parser("markers", help="world markers derived from 2D: stream a camera with known geometry "
+                       "and check where its centroids land (editor play session, via the editor's Python)")
+    p.add_argument("--editor-project", default=os.environ.get("RAMMS_EDITOR_PROJECT", "RammpUI"),
+                   help="the editor's project to run the checks in (default RammpUI; '*' takes any)")
+    p.add_argument("--timeout", type=_positive_float, default=8.0,
+                   help="how long to wait for the streamed camera to give a position (default 8 s)")
+    p.add_argument("--metadata", choices=("depth", "both"), default="depth",
+                   help="which frames carry the camera's intrinsics and pose: depth only, as the UI bridge "
+                   "sends them (default), or colour and depth")
+    p.add_argument("--scene", action="store_true",
+                   help="stream the test camera AS the scene camera (its stream ids), so objects tagged "
+                   "source \"scene\" -- as the bridge tags them -- are checked too; takes over the scene view")
+
     p = sub.add_parser("joints", help="drive the robot display's arm and wheels; check the indicators")
     act = p.add_mutually_exclusive_group()
     act.add_argument("--check", action="store_true",
@@ -2162,6 +3521,7 @@ def main():
         "discover": cmd_discover, "selftest": cmd_selftest, "panel": cmd_panel,
         "objects": cmd_objects, "worldstate": cmd_worldstate, "camera": cmd_camera,
         "stream": cmd_stream, "events": cmd_events, "joints": cmd_joints,
+        "styles": cmd_styles, "pois": cmd_pois, "markers": cmd_markers,
         "walkthrough": cmd_walkthrough,
     }
     try:
