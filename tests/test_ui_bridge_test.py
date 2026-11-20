@@ -781,3 +781,18 @@ def test_scale_pairs_are_equivalent_values_on_the_two_scales():
 def test_scale_pairs_include_the_ambiguous_one():
     """1.0 vs 100 is the pair the rule has to make a choice about, so it is covered."""
     assert (1.0, 100.0) in PROGRESS_SCALE_PAIRS
+
+
+# ── object taps: where on the image ──────────────────────────────────
+
+def test_an_image_tap_is_described_with_its_pixel():
+    from ramms_tools.scripts.ui_bridge_test import _describe
+    event = {"event_type": "object_tapped", "instance_id": "cup_1", "stream_id": "camera/scene/color",
+             "tap_point": [412.5, 233.25], "image_size": [1280, 720], "seq": 1}
+    assert _describe(event) == "object_tapped 'cup_1' on 'camera/scene/color' at (412.5, 233.2) of 1280x720"
+
+
+def test_a_3d_tap_is_described_as_before():
+    from ramms_tools.scripts.ui_bridge_test import _describe
+    assert _describe({"event_type": "object_tapped", "instance_id": "tap_3", "stream_id": "scene"}) == \
+        "object_tapped 'tap_3' on 'scene'"
