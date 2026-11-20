@@ -3,6 +3,14 @@
 Python tools for interacting with RAMMS-based Unreal Engine projects via the
 [Remote Control API](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-control-for-unreal-engine).
 
+Related repositories:
+
+- [rammp-org/rammp-ui](https://github.com/rammp-org/rammp-ui), the RAMMP user interface (RammpUI).
+  Tools here drive it, test it, and replay robot recordings into it: see
+  [`ramms-bag`](#ramms-bag--replay-a-recorded-rammp-bag-into-rammpui) and
+  [`ramms-ui-bridge-test`](#ramms-ui-bridge-test--rammp-ui-bridge-interfaces).
+- [rammp-org/ramms-sim](https://github.com/rammp-org/ramms-sim), the RAMMS simulation.
+
 ## Installation
 
 ```bash
@@ -41,6 +49,7 @@ pip install -e '.[exr]'
 - For moving traffic (`ramms-worldgen traffic`): the **RammsCrowd** plugin on a traffic level
 - For skeletal pose control: the **RammsCore** plugin with `URammsSkeletalPoseComponent`
 - For UI features: the **RammsUI** plugin with `URammsRemoteBridge`
+- For replaying robot bags into the UI (`ramms-bag`): a running [RammpUI](https://github.com/rammp-org/rammp-ui)
 - For binary streaming: the **RammsStreaming** plugin (TCP port 30030)
 - For world generation: the **RammsWorldGen** plugin with `URammsWorldGenBridge`
 - The **Textual** TUI library (`pip install 'ramms-tools[tui]'` or `pip install textual`)
@@ -827,6 +836,71 @@ ramms-bag play BAG --dry-run                # send nothing; count what would be 
 
 BAG is a rosbag2 directory (`metadata.yaml` plus `.db3` files). A zipped bag
 has to be extracted first; `ramms-bag` prints the `unzip` command.
+
+#### Running a bag through RammpUI, step by step
+
+1. **The UI.** Clone [rammp-org/rammp-ui](https://github.com/rammp-org/rammp-ui)
+   with its submodules, open `RammpUI.uproject` in Unreal Engine 5.8 and press
+   **Play**. `Map_UI` loads by default. Playing starts the RMSS server (port
+   30030) and Remote Control (port 30010); a packaged or `-game` build works too.
+   Its README has a short version of these steps, under
+   [Replaying robot recordings](https://github.com/rammp-org/rammp-ui#replaying-robot-recordings).
+2. **This package.** `pip install -e .` from this repository (NumPy is the only
+   requirement; `--overlay segmenter` also needs Pillow).
+3. **The bag.** Copy the recording to the machine and extract it if it is a zip,
+   so that `BAG` is the directory holding `metadata.yaml`. Then check what it has:
+   ```bash
+   ramms-bag info BAG
+   ```
+   It lists the topics, both cameras' intrinsics and poses, the tracked object
+   ids and segmentation classes, and warns when the bag cannot show 3D (see
+   *frozen* below).
+4. **Play it.**
+   ```bash
+   ramms-bag play BAG --start 25 --end 45          # 20 s of it: cameras, objects, joints, the wrist camera
+   ```
+   - **Toggle Scene Camera** in the status bar switches between the scene
+     camera, with each tracked object's 2D box, and the 3D view: the point cloud
+     from the bag's depth, with a marker and label for each tracked object where
+     the bag says it is.
+   - Objects with a 3D marker get no POI pill; objects without one (2D only,
+     occluded, or no depth for a derived marker) keep theirs.
+   - The overlay window opens by itself. It shows the wrist camera, or with
+     `--overlay segmentation` the scene frame the segmenter ran on, plus the
+     segmenter's own boxes.
+   - The robot display follows the arm's recorded joints.
+5. **Segmentation masks** are a data stream of the overlay window, not its
+   default view. Select it in the editor's Python console while the replay runs:
+   ```python
+   import unreal
+   w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()
+   for cam in unreal.ObjectIterator(unreal.RammsCameraWidget):
+       if cam.get_world() == w and cam.get_stream_set() == unreal.RammsCameraStreamSet.ENGINE_OVERLAY:
+           ids = [str(d.get_editor_property("stream_id")) for d in cam.get_data_streams()]
+           cam.set_data_stream_index(next(i for i, d in enumerate(ids) if d.endswith("segmentation")))
+           cam.set_view_mode(unreal.RammsCameraViewMode.OVERLAY)           # RGB to go back
+   ```
+   Select it before the masks arrive: changing the data stream drops the
+   current frame until the next one comes.
+6. **Check it** (editor PIE only):
+   ```bash
+   ramms-bag play BAG --start 30 --end 40 --verify
+   ramms-bag play BAG --start 30 --end 40 --positions derived --verify
+   ```
+   `--verify` reads the world markers back through the editor's Python remote
+   execution, which RammpUI enables in `Config/DefaultEngine.ini`. It prints
+   one line per check and exits non-zero if any fails.
+
+When something is missing:
+
+| Symptom | Cause |
+|---|---|
+| `cannot reach the UI's Remote Control preset` / `cannot connect to RMSS` | The UI is not playing, or is on another host (`--host`, `--rc-port`, `--rmss-port`) |
+| `joints not replayed` | No robot display with joint targets in the level; everything else still plays |
+| Markers stay where the robot began while the camera moves | The bag has no `odom->base_link` (*frozen*): use its `_vo` version, or `--positions derived` |
+| `--start ... / --end ... select no part of this ... bag` | The window is outside the bag; `ramms-bag info` gives its length |
+| `the --start/--end window holds none of the played topics' messages` | The window is too short to hold a frame (frames are 66 ms apart at 15 Hz) |
+| `colour encoding ... is not sent` | Only bgr8, rgb8, bgra8, rgba8 and mono8 colour go out; that camera's depth and the objects still do |
 
 **What goes where:**
 
