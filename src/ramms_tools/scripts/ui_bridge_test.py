@@ -2010,7 +2010,15 @@ def _describe(event):
         return f"button_press {event.get('button_id')!r}"
     if kind == "object_tapped":
         where = event.get("stream_id")
-        return f"object_tapped {event.get('instance_id')!r}" + (f" on {where!r}" if where else "")
+        text = f"object_tapped {event.get('instance_id')!r}" + (f" on {where!r}" if where else "")
+        # A tap on a camera image also says where it landed, in that frame's pixels; a tap in the
+        # 3D view leaves both keys out.
+        point, size = event.get("tap_point"), event.get("image_size")
+        if isinstance(point, list) and len(point) == 2:
+            text += f" at ({point[0]:.1f}, {point[1]:.1f})"
+            if isinstance(size, list) and len(size) == 2:
+                text += f" of {size[0]}x{size[1]}"
+        return text
     return json.dumps(event)
 
 
