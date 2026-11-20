@@ -13,6 +13,7 @@ import json
 import pytest
 
 from ramms_tools.scripts.ui_bridge_test import (
+    BUTTON_STYLES,
     PANEL_SCENARIOS,
     SAMPLE_SETS,
     BridgeClient,
@@ -66,7 +67,8 @@ def test_every_scenario_is_serialisable_and_well_formed(name):
     assert isinstance(round_tripped["buttons"], list)
     for btn in round_tripped["buttons"]:
         assert btn["button_id"] and btn["label"]
-        assert btn.get("style", "normal") in ("normal", "warning", "error")
+        if name != "style-fallback":  # sends unknown, empty and differently-cased names on purpose
+            assert btn.get("style", "normal") in BUTTON_STYLES
     assert expectation, "each scenario documents what the operator should see"
 
 
@@ -789,10 +791,11 @@ def test_an_image_tap_is_described_with_its_pixel():
     from ramms_tools.scripts.ui_bridge_test import _describe
     event = {"event_type": "object_tapped", "instance_id": "cup_1", "stream_id": "camera/scene/color",
              "tap_point": [412.5, 233.25], "image_size": [1280, 720], "seq": 1}
-    assert _describe(event) == "object_tapped 'cup_1' on 'camera/scene/color' at (412.5, 233.2) of 1280x720"
+    assert _describe(event) == ("object_tapped 'cup_1' on 'camera/scene/color' at (412.5, 233.2) of 1280x720"
+                                " [camera image]")
 
 
 def test_a_3d_tap_is_described_as_before():
     from ramms_tools.scripts.ui_bridge_test import _describe
     assert _describe({"event_type": "object_tapped", "instance_id": "tap_3", "stream_id": "scene"}) == \
-        "object_tapped 'tap_3' on 'scene'"
+        "object_tapped 'tap_3' on 'scene' [3D view]"

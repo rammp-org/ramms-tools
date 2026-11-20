@@ -517,6 +517,10 @@ class _Args:
 def _fake_time(monkeypatch, engine):
     monkeypatch.setattr(ubt, "_sleep", engine.clock.sleep)
     monkeypatch.setattr(ubt, "_clock", engine.clock.time)
+    # This fake has a status bar but no panel or POI layer; those checks have their own fake HUD
+    # (tests/test_ui_bridge_hud.py).
+    monkeypatch.setattr(ubt, "run_style_checks", lambda *a, **k: [])
+    monkeypatch.setattr(ubt, "run_poi_checks", lambda *a, **k: ([], {}))
 
 
 def test_selftest_runs_the_joint_checks(monkeypatch, capsys):

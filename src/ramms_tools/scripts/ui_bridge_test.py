@@ -14,6 +14,9 @@ Usage:
     ramms-ui-bridge-test stream --seconds 10      # synthetic RMSS camera frames
     ramms-ui-bridge-test events --follow          # watch taps as you click
     ramms-ui-bridge-test events --expect probe:ok --timeout 30
+    ramms-ui-bridge-test styles                   # every button style, read back and checked
+    ramms-ui-bridge-test styles --scenario style-fallback   # unknown / differently-cased styles
+    ramms-ui-bridge-test pois --tap               # POIs, and a tap dimming the others
     ramms-ui-bridge-test joints                   # robot display: joints, monitor, status bar
     ramms-ui-bridge-test joints --check           # stow/activate/drive/park, all read back
     ramms-ui-bridge-test joints --set link_1=40   # by name; every other joint held
@@ -37,9 +40,18 @@ assert them. Writes go only to a running game -- PIE, or a packaged or -game bui
 in the editor with nothing playing, the editor's own level answers on the same
 paths and would be written instead, so selftest skips the joints and says so.
 
-Not automatic: whether a panel *looks* right. Nothing readable comes back for
-panel/world-state/camera-feed state, so each scenario prints what you should
-see and, where it matters, waits for you to tap and confirms the ID round-trips.
+Also automatic, in a running game: what the panel's buttons draw and what the
+POI layer shows. Each button's id, label, style, label text, label opacity and
+brush tint, and each POI's object and opacity, are readable widget properties, so
+`styles` checks that every button shows its own label, that unknown and
+differently-cased style names fall back as RAMMS_Button's switch does, and that
+its styles are told apart; `pois` checks one POI per object and, after a tap
+(`--tap`), that the others dim to the layer's UnselectedPOIOpacity.
+
+Not automatic: anything else about how the HUD *looks* -- layout, colours as a
+person sees them, the panel-level style (RAMMS_Panel does not draw it), world
+state and the camera feed. Those scenarios print what you should see and, where
+it matters, wait for a tap and confirm the ID round-trips.
 """
 
 import argparse
@@ -192,7 +204,9 @@ class BridgeClient:
         if not body.strip():
             return None
         try:
-            parsed = json.loads(body)
+            # strict=False: Remote Control puts raw newlines in some errorMessages. Strict parsing
+            # rejects the whole body, which for /remote/batch silently loses every response in it.
+            parsed = json.loads(body, strict=False)
         except json.JSONDecodeError:
             return body
         # Remote Control reports failures in-band with HTTP 200.
@@ -445,6 +459,21 @@ class BridgeClient:
 
 # ── payload builders (docs/USER_INPUT_JSON_SCHEMA.md) ────────────────
 
+# Button styles. The bridge contract (rammp-UI-bridge docs/USER_INPUT_JSON_SCHEMA.md §6.3) defines
+# normal | warning | error, and the Orchestrator sends its Cancel buttons as "warning". RAMMS_Button
+# (ramms-ui 4769575, read from its graph 2026-11-20) recognises valid | invalid | unavailable | cancel
+# | error, case-insensitively, and draws anything else -- normal, warning, absent, unknown -- as valid.
+CONTRACT_BUTTON_STYLES = ("normal", "warning", "error")
+UI_BUTTON_STYLES = ("valid", "invalid", "unavailable", "cancel", "error")
+BUTTON_STYLES = CONTRACT_BUTTON_STYLES + tuple(s for s in UI_BUTTON_STYLES if s not in CONTRACT_BUTTON_STYLES)
+
+
+def ui_button_style(style):
+    """The RAMMS_Button style a sent style selects: its own when it is one, else the fallback, valid."""
+    key = (style or "").lower()
+    return key if key in UI_BUTTON_STYLES else "valid"
+
+
 def button(button_id, label, style=None):
     b = {"button_id": button_id, "label": label}
     if style:
@@ -591,17 +620,53 @@ PANEL_SCENARIOS = {
             buttons=[button("retry", "Retry", "normal"), button("cancel", "Cancel", "error")],
             style="error",
         ),
-        "Panel-level error styling plus an error-styled button.",
+        "Retry looks normal and Cancel error-styled. The panel's own style is sent\n"
+        "          too, but RAMMS_Panel does not draw it: the panel looks like any other.\n"
+        "          Its only effect is that a style change under the same title replays\n"
+        "          the entrance animation, as a new panel would.",
+    ),
+    "styles": (
+        panel(
+            title="Button styles",
+            message="One button per style, each labelled with the style it was sent.",
+            buttons=[button("style:absent", "absent")]
+            + [button(f"style:{name}", name, name) for name in BUTTON_STYLES],
+        ),
+        "Every button reads its OWN label (the style name). RAMMS_Button today:\n"
+        "          absent, normal, warning, valid: blue, white label\n"
+        "          invalid: amber, dark label;  error: flat dark navy, white label\n"
+        "          unavailable: blue, label at half opacity (still clickable)\n"
+        "          cancel: KNOWN FAILURE -- drawn like invalid and reading \"OPEN\", not\n"
+        "          \"cancel\": SetStyle's cancel branch is not connected to SetStyle_Cancel.\n"
+        "          Also check: warning looks the same as normal, though the contract\n"
+        "          uses it for the Orchestrator's Cancel buttons. `styles` checks this.",
+    ),
+    "style-fallback": (
+        panel(
+            title="Style fallback",
+            message="Unknown styles fall back to valid; style names ignore case.",
+            buttons=[button("fallback:valid", "valid", "valid"),
+                     button("fallback:unavailable", "unavailable", "unavailable"),
+                     button("fallback:error", "error", "error"),
+                     button("fallback:bogus", "bogus", "bogus"),
+                     button("fallback:VALID", "VALID", "VALID"),
+                     button("fallback:Unavailable", "Unavailable", "Unavailable"),
+                     button("fallback:Error", "Error", "Error"),
+                     {"button_id": "fallback:empty", "label": "empty", "style": ""}],
+        ),
+        "The first three are the references. bogus, VALID and empty look like valid\n"
+        "          (blue); Unavailable looks like unavailable and Error like error --\n"
+        "          style names ignore case.",
     ),
     "stress": (
         panel(
             title="A title that is quite a lot longer than any real panel would ever use",
             message=("Long body text to check wrapping and clipping. " * 6
                      + "Unicode: café — ½° ✓ 日本語"),
-            buttons=[button(f"many:{i}", f"Button {i}", ["normal", "warning", "error"][i % 3])
+            buttons=[button(f"many:{i}", f"Button {i}", BUTTON_STYLES[i % len(BUTTON_STYLES)])
                      for i in range(8)],
         ),
-        "Long text and 8 buttons -- check wrapping, clipping and layout.",
+        "Long text and 8 buttons in every style -- check wrapping, clipping and layout.",
     ),
     "empty": (
         panel(),
@@ -1073,6 +1138,252 @@ def run_joint_checks(rig, check, sleep=None, clock=None, rate=10.0, step=5.0, fr
             check(False, "joint targets put back as found", f"{exc} -- the robot is left in the test's pose")
 
 
+# ── HUD readback: panel buttons and POIs ─────────────────────────────
+#
+# Everything the HUD draws for a push is a widget Remote Control can read: a panel button's
+# PanelButton (id, label, style), its label text and opacity and its brush, and a POI's object and
+# opacity. They live under the play session's game instance (measured in RammpUI PIE, 2026-11-20):
+#   buttons  <GameInstance>.W_RAMMS_UI_C_0.WidgetTree_0.RAMMS_Panel.WidgetTree_0.RAMMS_Button_C_<k>
+#   POIs     <GameInstance>.RAMMS_POI_C_<k>
+#   layer    <GameInstance>.W_RAMMS_UI_C_0.WidgetTree_0.RammsDetectionPOILayer
+# k only grows (UE never reuses an object name) and widgets a push replaced linger until garbage
+# collection, so a widget is live only while it is still in its parent: a non-empty Slot.
+
+PANEL_BUTTON_PATH = "{root}.W_RAMMS_UI_C_0.WidgetTree_0.RAMMS_Panel.WidgetTree_0.RAMMS_Button_C_{k}"
+POI_PATH = "{root}.RAMMS_POI_C_{k}"
+POI_LAYER_PATH = "{root}.W_RAMMS_UI_C_0.WidgetTree_0.RammsDetectionPOILayer"
+HUD_PROBE_CHUNK = 1024
+HUD_PROBE_LIMIT = 16384
+
+
+def find_game_instance(client):
+    """'/Engine/Transient.<engine>:GameInstance_<n>' of the running HUD, or None (one batch)."""
+    roots = [f"/Engine/Transient.{e}:GameInstance_{n}"
+             for e in STATUS_BAR_ENGINES for n in range(STATUS_BAR_INSTANCES)]
+    # Not caught: a refused connection or an in-band error is a real problem, not "no HUD". Paths that
+    # don't resolve come back as per-request 400s, which read_many leaves out.
+    found = client.read_many([(STATUS_BAR_PATH.format(engine=e, n=n, widget="TXT_ArmStatus"), "Text")
+                              for e in STATUS_BAR_ENGINES for n in range(STATUS_BAR_INSTANCES)])
+    return roots[max(found)] if found else None
+
+
+def probe_indexed(client, template, prop, chunk=HUD_PROBE_CHUNK, limit=HUD_PROBE_LIMIT, stop_after_empty=None):
+    """{k: value of prop} for every '<template with k>' that answers, one /remote/batch per chunk.
+
+    stop_after_empty=N stops after N empty chunks that follow a hit. That is safe only where the live
+    widgets are the newest ones, contiguous at the top: panel buttons, rebuilt on every push. POIs are
+    kept per object, so a long-lived one can sit far below newer ones; scan those to the limit. Past
+    the limit the scan carries on while chunks still answer, so a long session is not cut off.
+    """
+    hits, empty_after_hit, start = {}, 0, 0
+    while start < limit or (hits and max(hits) >= start - chunk):
+        ks = range(start, start + chunk)
+        found = client.read_many([(template.format(k=k), prop) for k in ks])
+        start += chunk
+        if found:
+            hits.update({ks[i]: value for i, value in found.items()})
+            empty_after_hit = 0
+        elif hits and stop_after_empty is not None:
+            empty_after_hit += 1
+            if empty_after_hit >= stop_after_empty:
+                break
+        if start >= 1 << 20:
+            break
+    return hits
+
+
+def unmangle(struct):
+    """A Blueprint struct's fields without their GUID suffix: label_4_2D47...F -> label."""
+    return {re.sub(r"_\d+_[0-9A-F]{32}$", "", key): value for key, value in (struct or {}).items()}
+
+
+def rich_tag(rich):
+    """'btn-light' from '<btn-light>Label</>'; None for plain text."""
+    match = re.match(r"\s*<([^/>]+)>", rich or "")
+    return match.group(1) if match else None
+
+
+def _tint(widget_style):
+    tint = ((widget_style or {}).get("Normal") or {}).get("TintColor") or {}
+    color = tint.get("SpecifiedColor") or {}
+    return tuple(round(float(color.get(c, 0.0)), 3) for c in "RGBA") if color else None
+
+
+def read_panel_buttons(client, root):
+    """The panel's live buttons, in creation order: id, label, style as sent, and what is drawn."""
+    template = PANEL_BUTTON_PATH.replace("{root}", root)
+    # Every push builds new buttons, so the live ones are the newest: stopping early is safe here.
+    panel_buttons = probe_indexed(client, template, "PanelButton", stop_after_empty=2)
+    ks = sorted(panel_buttons)
+    slots = client.read_many([(template.format(k=k), "Slot") for k in ks]) if ks else {}
+    live = [k for i, k in enumerate(ks) if slots.get(i)]
+    reads = []
+    for k in live:
+        path = template.format(k=k)
+        reads += [(f"{path}.WidgetTree_0.TXT_Button", "Text"), (f"{path}.WidgetTree_0.TXT_Button", "RenderOpacity"),
+                  (f"{path}.WidgetTree_0.BTN", "WidgetStyle")]
+    values = client.read_many(reads) if reads else {}
+    rows = []
+    for j, k in enumerate(live):
+        sent = unmangle(panel_buttons[k])
+        text = values.get(3 * j)
+        opacity = values.get(3 * j + 1)
+        rows.append({
+            "k": k, "button_id": sent.get("button_id", ""), "label": sent.get("label", ""),
+            "style": sent.get("style", ""), "text": plain_text(text) if text is not None else None,
+            "tag": rich_tag(text), "opacity": round(float(opacity), 3) if opacity is not None else None,
+            "tint": _tint(values.get(3 * j + 2)),
+        })
+    return rows
+
+
+def button_look(row):
+    """What a button looks like, as far as Remote Control can tell: brush tint, label opacity, text style."""
+    return (row["tint"], row["opacity"], row["tag"])
+
+
+def check_button_styles(pushed, rows):
+    """[(status, what, detail)] for a pushed panel against its live buttons; status pass | FAIL | warn.
+
+    Asserts what any intent for the styles needs: one live button per pushed one, each showing its own
+    label, unknown and differently-cased names drawn like the style they fall back to, and the UI's
+    styles told apart. A contract style drawn like another is a warning, not a failure: the UI may
+    have moved on from the contract on purpose, but whoever sends it should know.
+    """
+    results = []
+    by_id = {}
+    for row in rows:
+        by_id.setdefault(row["button_id"], []).append(row)
+    looks = {}
+    for b in pushed:
+        found = by_id.get(b["button_id"], [])
+        what = f"{b['button_id']} is on the panel once"
+        if len(found) != 1:
+            results.append(("FAIL", what, f"found {len(found)} live buttons with that id"))
+            continue
+        results.append(("pass", what, ""))
+        row = found[0]
+        shown = row["text"]
+        results.append(("pass" if shown == b["label"] else "FAIL", f"{b['button_id']} shows its label {b['label']!r}",
+                        f"it shows {shown!r}"))
+        looks[b["button_id"]] = (b.get("style"), button_look(row))
+
+    reference = {}
+    for style, look in looks.values():
+        if style and style in UI_BUTTON_STYLES:
+            reference.setdefault(style, look)
+    for button_id, (style, look) in looks.items():
+        target = ui_button_style(style)
+        # Only names that are not themselves a UI style; warning is reported against the contract below.
+        if style in UI_BUTTON_STYLES or style == "warning" or target not in reference:
+            continue
+        results.append(("pass" if look == reference[target] else "FAIL",
+                        f"{button_id} (style {style!r}) looks like {target}",
+                        f"{look} vs {target}'s {reference[target]}"))
+    names = [s for s in UI_BUTTON_STYLES if s in reference]
+    for i, a in enumerate(names):
+        for b2 in names[i + 1:]:
+            results.append(("pass" if reference[a] != reference[b2] else "FAIL", f"{a} and {b2} look different",
+                            f"both look like {reference[a]}"))
+    contract = {s: look for s, look in looks.values() if s in CONTRACT_BUTTON_STYLES}
+    if "warning" in contract and "normal" in contract and contract["warning"] == contract["normal"]:
+        results.append(("warn", "the contract's warning looks like normal",
+                        "the Orchestrator sends its Cancel buttons as \"warning\"; RAMMS_Button draws "
+                        "them like any other button"))
+    return results
+
+
+def read_pois(client, root, ks=None):
+    """The POI layer's live POIs: the object each shows, and its opacity (ColorAndOpacity alpha).
+
+    ks limits the read to POIs already found (re-reading opacity after a tap creates no new POIs);
+    without it every candidate name is scanned.
+    """
+    template = POI_PATH.replace("{root}", root)
+    if ks is None:
+        objects = probe_indexed(client, template, "DetectedObjectData")
+    else:
+        values = client.read_many([(template.format(k=k), "DetectedObjectData") for k in ks])
+        objects = {ks[i]: value for i, value in values.items()}
+    ks = sorted(objects)
+    reads = [(template.format(k=k), prop) for k in ks for prop in ("Slot", "ColorAndOpacity")]
+    values = client.read_many(reads) if reads else {}
+    rows = []
+    for j, k in enumerate(ks):
+        if not values.get(2 * j):
+            continue
+        color = values.get(2 * j + 1) or {}
+        data = objects[k] or {}
+        rows.append({"k": k, "instance_id": data.get("InstanceId", ""), "class": data.get("PerceptionClass", ""),
+                     "alpha": round(float(color.get("A", 1.0)), 3)})
+    return rows
+
+
+def read_poi_layer(client, root):
+    """The layer's dim opacity and visibility (None where Remote Control won't say)."""
+    path = POI_LAYER_PATH.replace("{root}", root)
+    values = client.read_many([(path, "UnselectedPOIOpacity"), (path, "Visibility")])
+    opacity = values.get(0)
+    return {"unselected_opacity": float(opacity) if opacity is not None else None, "visibility": values.get(1)}
+
+
+def check_pois(pushed_objects, rows):
+    """[(status, what, detail)]: one live POI per pushed object with an id, as many id-less ones as pushed."""
+    results = []
+    ids = [o.get("instance_id", "") for o in pushed_objects]
+    live_ids = [r["instance_id"] for r in rows]
+    for instance_id in [i for i in ids if i]:
+        n = live_ids.count(instance_id)
+        results.append(("pass" if n == 1 else "FAIL", f"one POI for {instance_id}", f"found {n}"))
+    unkeyed = ids.count("")
+    n = live_ids.count("")
+    results.append(("pass" if n == unkeyed else "FAIL", f"{unkeyed} POI(s) without an id", f"found {n}"))
+    extra = sorted({i for i in live_ids if i and i not in ids})
+    results.append(("pass" if not extra else "FAIL", "no POIs left over from an earlier push", f"still showing {extra}"))
+    return results
+
+
+def check_poi_dimming(rows, tapped_id, dim, tolerance=1e-3):
+    """[(status, what, detail)]: with tapped_id last tapped, it is opaque and every other POI is at dim.
+
+    tapped_id None means nothing is tapped (or the tapped object is gone): every POI opaque.
+    """
+    if dim is None:
+        return [("FAIL", "the POI layer's UnselectedPOIOpacity is readable",
+                 "no such property: this RammsUI predates POI dimming, or the layer has another name or path")]
+    results = []
+    for row in rows:
+        name = row["instance_id"] or f"(no id, POI {row['k']})"
+        want = 1.0 if tapped_id is None or row["instance_id"] == tapped_id else dim
+        results.append(("pass" if abs(row["alpha"] - want) <= tolerance else "FAIL",
+                        f"POI {name} at opacity {want:g}", f"it is at {row['alpha']:g}"))
+    return results
+
+
+def tap_origin(event):
+    """Which surface an object_tapped came from, by what it carries.
+
+    - 'camera image': a tap_point, or a camera stream id ('camera/scene/color', 'engine/overlay') --
+      a marker tap without a point (no frame yet) still names its camera's stream;
+    - '3D view': a bare source alias ('scene', 'overlay'), which world markers send;
+    - 'POI layer': neither. A world marker whose object had no source sends neither too, so this
+      one is a best guess.
+    """
+    stream_id = event.get("stream_id") or ""
+    if "tap_point" in event or "/" in stream_id:
+        return "camera image"
+    return "3D view" if stream_id else "POI layer"
+
+
+def report(results, check):
+    """Feed check_* results to a selftest-style check(); a warn only prints."""
+    for status, what, detail in results:
+        if status == "warn":
+            print(f"  warn  {what} -- {detail}")
+        else:
+            check(status == "pass", what, detail)
+
+
 def cmd_discover(client, args):
     preset = client.load_preset()
     print(f"preset: {preset.get('Name', client.preset)}")
@@ -1374,6 +1685,174 @@ def cmd_joints(client, args):
         print("  swept stowed -> active -> stowed")
     _describe_joints(rig)
     return 0
+
+
+def _hud_root_or_explain(client):
+    root = find_game_instance(client)
+    if root is None:
+        print("no HUD found: start PIE (or the game) with W_RAMMS_UI on screen. Remote Control can only "
+              "read widgets in a running game", file=sys.stderr)
+    return root
+
+
+def _print_buttons(rows):
+    for r in rows:
+        tint = "#" + "".join(f"{int(round(v * 255)):02X}" for v in r["tint"][:3]) if r["tint"] else "?"
+        print(f"  {r['button_id']:<22} style={r['style']!r:<14} shows={r['text']!r:<16} "
+              f"tag={r['tag']} opacity={r['opacity']} tint={tint}")
+
+
+def _await_buttons(client, root, pushed, timeout=3.0, sleep=None, clock=None):
+    """The live buttons once every pushed id is on the panel (the panel builds them a tick or two later)."""
+    sleep, clock = sleep or _sleep, clock or _clock
+    want = {b["button_id"] for b in pushed}
+    deadline = clock() + timeout
+    rows = read_panel_buttons(client, root)
+    while not want <= {r["button_id"] for r in rows} and clock() < deadline:
+        sleep(0.2)
+        rows = read_panel_buttons(client, root)
+    return rows
+
+
+def run_style_checks(client, root, scenario, check, sleep=None, clock=None):
+    """Push a style scenario and check the live buttons against it."""
+    pan = PANEL_SCENARIOS[scenario][0]
+    client.update_panel(pan)
+    rows = _await_buttons(client, root, pan["buttons"], sleep=sleep, clock=clock)
+    _print_buttons(rows)
+    report(check_button_styles(pan["buttons"], rows), check)
+    return rows
+
+
+def cmd_styles(client, args):
+    """Push a style panel, read back what each button draws, and check it."""
+    root = _hud_root_or_explain(client)
+    if root is None:
+        return 1
+    check, failures = _reporter()
+    print(f"panel scenario {args.scenario!r} on {root}")
+    run_style_checks(client, root, args.scenario, check)
+    if args.wait:
+        ids = scenario_buttons(args.scenario)
+        print(f"  tap any of {ids}: every style still reports its press today, unavailable included")
+        _await_button(client, ids, args.timeout, allow_skip=True)
+    print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all style checks passed'}")
+    return 1 if failures else 0
+
+
+def run_poi_checks(client, root, check, objects=None):
+    """Push the sample objects to the POI layer and check one POI per object, opacity untouched."""
+    objects = objects if objects is not None else sample_objects("scene")
+    client.update_detected_objects(detected_objects_payload(objects, "", _scene_stream_id(client)))
+    _sleep(0.5)
+    layer = read_poi_layer(client, root)
+    rows = read_pois(client, root)
+    for r in rows:
+        print(f"  POI {r['k']:<4} {r['instance_id'] or '(no id)':<10} {r['class']:<10} opacity={r['alpha']:g}")
+    if layer["visibility"] == "Collapsed":
+        print("  note: the POI layer is collapsed -- the scene camera is showing. Press the camera toggle on "
+              "the status bar to see (and tap) the POIs")
+    report(check_pois(objects, rows), check)
+    dim = layer["unselected_opacity"]
+    lit = [r for r in rows if r["alpha"] > (dim or 0) + 1e-3]
+    if dim is not None and rows and len(lit) == 1 and len(rows) > 1:
+        print(f"  note: {lit[0]['instance_id']!r} is still the last tapped POI from earlier, so the others "
+              "are dimmed. Tap empty background to clear it")
+    else:
+        report(check_poi_dimming(rows, None, dim or 0.0), check)
+    return rows, layer
+
+
+SKIPPED = "skipped"
+
+
+def _enter_pressed():
+    """Whether Enter was pressed (without blocking); False where stdin can't be polled."""
+    try:
+        if os.name == "nt" or sys.stdin is None or not sys.stdin.isatty():
+            return False
+        if select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _next_event(client, wanted, kind, timeout, since, sleep=None, clock=None):
+    """The first `kind` event after `since` carrying one of `wanted`; None at the timeout, SKIPPED on Enter."""
+    sleep, clock = sleep or _sleep, clock or _clock
+    deadline = clock() + timeout
+    while clock() < deadline:
+        if _enter_pressed():
+            return SKIPPED
+        _, events = client.poll_events(since)
+        for event in events:
+            since = max(since, int(event.get("seq", since)))
+            print(f"    [{event.get('seq')}] {_describe(event)}")
+            if event.get("event_type") == kind and _event_id(event) in wanted:
+                return event
+        sleep(0.4)
+    return None
+
+
+def _poll_dimming(client, root, ks, tapped_id, dim, timeout, sleep=None, clock=None):
+    """check_poi_dimming once it passes, or as it stands at the timeout; SKIPPED on Enter."""
+    sleep, clock = sleep or _sleep, clock or _clock
+    deadline = clock() + timeout
+    while True:
+        results = check_poi_dimming(read_pois(client, root, ks), tapped_id, dim)
+        if all(status == "pass" for status, _, _ in results) or clock() >= deadline:
+            return results
+        if _enter_pressed():
+            return SKIPPED
+        sleep(0.2)
+
+
+def _tap_round_trip(client, root, rows, dim, timeout, check):
+    """Ask for a tap on a POI, check the others dim; ask for a tap on the background, check they return."""
+    ks = [r["k"] for r in rows]
+    ids = [r["instance_id"] for r in rows if r["instance_id"]]
+    print(f"\n  tap one of the POIs {ids} (it dims the others to {dim:g}); Enter skips")
+    since = _current_sequence(client)
+    event = _next_event(client, set(ids), "object_tapped", timeout, since)
+    if event is SKIPPED:
+        print("  skipped")
+        return
+    if event is None:
+        check(False, "a POI was tapped", f"no object_tapped for {ids} within {timeout:g} s")
+        return
+    tapped = event.get("instance_id")
+    check(tap_origin(event) == "POI layer", f"the tap on {tapped} came from the POI layer",
+          f"it came from the {tap_origin(event)}: tap a POI, not a box on a camera image")
+    results = _poll_dimming(client, root, ks, tapped, dim, 2.0)
+    if results is SKIPPED:
+        print("  skipped")
+        return
+    report(results, check)
+    print("\n  now tap empty background: that clears the selection and every POI goes opaque again; Enter skips")
+    results = _poll_dimming(client, root, ks, None, dim, timeout)
+    if results is SKIPPED:
+        print("  skipped")
+        return
+    report(results, check)
+
+
+def cmd_pois(client, args):
+    """Push objects to the POI layer; check them, and with --tap, that a tap dims the rest."""
+    root = _hud_root_or_explain(client)
+    if root is None:
+        return 1
+    check, failures = _reporter()
+    rows, layer = run_poi_checks(client, root, check)
+    if args.tap and rows:
+        dim = layer["unselected_opacity"]
+        if dim is None:
+            report(check_poi_dimming(rows, None, None), check)
+        else:
+            _tap_round_trip(client, root, rows, dim, args.timeout, check)
+    print(f"\n{'FAILED: ' + str(len(failures)) if failures else 'all POI checks passed'}")
+    return 1 if failures else 0
 
 
 def _synthetic_frames(t, w, h):
@@ -1690,6 +2169,19 @@ def cmd_selftest(client, args):
     except BridgeError as exc:
         check(False, "PollUIEvents", str(exc))
 
+    print("button styles")
+    try:
+        hud = find_game_instance(client)
+        if hud is None:
+            print("  skip  no HUD found: the style and POI checks read widgets in a running game")
+        else:
+            for scenario in ("styles", "style-fallback"):
+                run_style_checks(client, hud, scenario, check)
+            print("POI layer")
+            run_poi_checks(client, hud, check)
+    except BridgeError as exc:
+        check(False, "HUD readback", str(exc))
+
     print("joints")
     skipped = None
     if JOINT_FUNCTION not in client._labels:
@@ -1817,6 +2309,27 @@ def _drive_and_park(rig, rate=10.0, step=5.0, frames=10):
         raise BridgeError("the wheels stopped changing but the monitor still says moving")
 
 
+def _walkthrough_styles(client, scenario):
+    root = find_game_instance(client)
+    if root is None:
+        client.update_panel(PANEL_SCENARIOS[scenario][0])
+        print("  (no HUD found to read the buttons back: judge by eye)")
+        return
+    check, failures = _reporter()
+    run_style_checks(client, root, scenario, check)
+    if failures:
+        print(f"  {len(failures)} style check(s) failed -- see above")
+
+
+def _walkthrough_poi_tap(client, args):
+    root = find_game_instance(client)
+    if root is None:
+        print("  SKIPPED: no HUD found to read the POIs back")
+        return
+    ns = argparse.Namespace(tap=not args.no_taps, timeout=args.timeout)
+    cmd_pois(client, ns)
+
+
 def _walkthrough_steps(client, args):
     joints = _WalkthroughJoints(client)
     steps = [
@@ -1860,6 +2373,19 @@ def _walkthrough_steps(client, args):
          PANEL_SCENARIOS["error"][1], scenario_buttons("error")),
         ("Layout stress", lambda: client.update_panel(PANEL_SCENARIOS["stress"][0]),
          PANEL_SCENARIOS["stress"][1], scenario_buttons("stress")),
+        ("Button styles", lambda: _walkthrough_styles(client, "styles"),
+         PANEL_SCENARIOS["styles"][1] + "\n          Tap \"unavailable\": today it still reports a press.",
+         scenario_buttons("styles")),
+        ("Style fallback", lambda: _walkthrough_styles(client, "style-fallback"),
+         PANEL_SCENARIOS["style-fallback"][1], []),
+        ("A POI tap dims the others", lambda: _walkthrough_poi_tap(client, args),
+         ("The POIs were read back above (one per object, all opaque); --no-taps\n"
+          "          skipped the tap itself." if args.no_taps else
+          "The tapped POI stayed bright and every other POI dropped to the layer's\n"
+          "          UnselectedPOIOpacity; tapping empty background brought them all back.\n"
+          "          Both were read back above. If you hid the scene camera to see the\n"
+          "          POIs, press the status bar's camera toggle again: the next steps\n"
+          "          draw boxes on it."), []),
         ("Detected objects", lambda: client.update_detected_objects(
             detected_objects_payload(sample_objects("scene"), "cup_1",
                                      _scene_stream_id(client))),
@@ -2018,7 +2544,7 @@ def _describe(event):
             text += f" at ({point[0]:.1f}, {point[1]:.1f})"
             if isinstance(size, list) and len(size) == 2:
                 text += f" of {size[0]}x{size[1]}"
-        return text
+        return text + f" [{tap_origin(event)}]"
     return json.dumps(event)
 
 
@@ -2134,6 +2660,16 @@ def main():
     p.add_argument("--timeout", type=float, default=0.0)
     p.add_argument("--interval", type=float, default=0.4)
 
+    p = sub.add_parser("styles", help="push a button-style panel and check what each button draws")
+    p.add_argument("--scenario", choices=["styles", "style-fallback", "stress", "error"], default="styles")
+    p.add_argument("--wait", action="store_true", help="then wait for a tap on one of its buttons")
+    p.add_argument("--timeout", type=_positive_float, default=60.0)
+
+    p = sub.add_parser("pois", help="push objects to the POI layer and check the POIs (and tap dimming)")
+    p.add_argument("--tap", action="store_true", help="ask for a tap on a POI, then on the background, "
+                   "and check the dimming each time")
+    p.add_argument("--timeout", type=_positive_float, default=60.0)
+
     p = sub.add_parser("joints", help="drive the robot display's arm and wheels; check the indicators")
     act = p.add_mutually_exclusive_group()
     act.add_argument("--check", action="store_true",
@@ -2162,6 +2698,7 @@ def main():
         "discover": cmd_discover, "selftest": cmd_selftest, "panel": cmd_panel,
         "objects": cmd_objects, "worldstate": cmd_worldstate, "camera": cmd_camera,
         "stream": cmd_stream, "events": cmd_events, "joints": cmd_joints,
+        "styles": cmd_styles, "pois": cmd_pois,
         "walkthrough": cmd_walkthrough,
     }
     try:

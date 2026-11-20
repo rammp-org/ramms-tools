@@ -823,6 +823,8 @@ ramms-ui-bridge-test objects --select cup_1   # tappable boxes, with one highlig
 ramms-ui-bridge-test camera open              # OpenCameraFeed / CloseCameraFeed
 ramms-ui-bridge-test stream --seconds 10 --overlay   # synthetic scene colour + depth + overlay
 ramms-ui-bridge-test events --follow          # watch button presses and object taps live
+ramms-ui-bridge-test styles                   # every button style, read back and checked
+ramms-ui-bridge-test pois --tap               # POIs, and a tap dimming the others
 ramms-ui-bridge-test joints                   # the robot display: joints, monitor, status bar
 ramms-ui-bridge-test joints --check           # stow, activate, drive, park -- all read back
 ramms-ui-bridge-test joints --set link_1=40   # set joints by name; every other joint held
@@ -863,9 +865,47 @@ is not enough — an orphaned entry is still listed and still answers HTTP 200.
 Projects disagree on the name (RammpUI binds it on `Content/RCPS`, the Ramms
 project has only `RCP_RammsBridge`), so any hardcoded default is wrong
 somewhere. `--preset` pins one, and a failed discovery names every candidate it
-rejected and why. What a panel *looks* like still needs eyes:
-no panel/world-state/camera state is readable back, so each scenario prints
-what you should see, and the tap round-trip is what gets asserted.
+rejected and why. Layout, world state and the camera feed still need eyes:
+those scenarios print what you should see, and the tap round-trip is what gets
+asserted.
+
+**Button styles and POIs** are read back from the running HUD (PIE or a game;
+in the editor with nothing playing there is no HUD and they are skipped):
+
+- `styles` pushes one button per style, then reads each live `RAMMS_Button`'s
+  `PanelButton`, label text, label opacity and brush tint. It checks:
+  - every pushed button is on the panel exactly once and shows its own label;
+  - names RAMMS_Button doesn't know (`normal`, absent, unknown, a different case)
+    are drawn like the style its case-insensitive switch falls back to;
+  - its styles (`valid`, `invalid`, `unavailable`, `cancel`, `error`) look
+    different from each other.
+
+  The contract's `warning` (the Orchestrator's Cancel buttons) drawn like
+  `normal` is printed as a warning, not a failure. `--scenario style-fallback`
+  sends unknown, empty and differently-cased names.
+- `pois` pushes objects to the POI layer and checks one live POI per object,
+  none left from an earlier push, all opaque. With `--tap` it asks for a tap on
+  a POI, checks the event came from the POI layer (no `stream_id`, no
+  `tap_point`) and that every other POI dims to the layer's
+  `UnselectedPOIOpacity`, then asks for a tap on the background and checks they
+  all come back.
+- `selftest` runs both (POIs without the tap). The walkthrough adds both,
+  with a tap.
+- `events` labels each object tap with where it came from:
+  - `[camera image]`: it carries `tap_point`, or a camera stream id such as
+    `camera/scene/color`;
+  - `[3D view]`: a bare source such as `scene`;
+  - `[POI layer]`: neither. A 3D tap on an object with no source looks the
+    same, so this one is a best guess.
+
+Live widgets are found by probing their object names (`RAMMS_Button_C_<k>`,
+`RAMMS_POI_C_<k>`), one `/remote/batch` call per 1024 names.
+- The number `k` only grows, and a replaced widget stays around with an empty
+  `Slot` until garbage collection, so only widgets with a `Slot` count.
+- Buttons are rebuilt on every push, so the probe stops shortly after the
+  newest.
+- POIs are kept per object, so a long-lived one can sit far below newer ones,
+  and they are scanned in full.
 
 **The robot display's joints** are checked automatically. They go through
 `SetAllJointTargets` (preset label `Set All Joint Targets`) on the display's
