@@ -825,6 +825,7 @@ ramms-ui-bridge-test stream --seconds 10 --overlay   # synthetic scene colour + 
 ramms-ui-bridge-test events --follow          # watch button presses and object taps live
 ramms-ui-bridge-test styles                   # every button style, read back and checked
 ramms-ui-bridge-test pois --tap               # POIs, and a tap dimming the others
+ramms-ui-bridge-test markers                  # world markers derived from 2D + depth (editor PIE)
 ramms-ui-bridge-test joints                   # the robot display: joints, monitor, status bar
 ramms-ui-bridge-test joints --check           # stow, activate, drive, park -- all read back
 ramms-ui-bridge-test joints --set link_1=40   # set joints by name; every other joint held
@@ -906,6 +907,50 @@ Live widgets are found by probing their object names (`RAMMS_Button_C_<k>`,
   newest.
 - POIs are kept per object, so a long-lived one can sit far below newer ones,
   and they are scanned in full.
+
+**World markers derived from 2D** (`markers`) check the depth fallback in
+`URammsDetectionWorldMarkers`. An object sent without `position_m` is placed by
+unprojecting its centroid through its camera's intrinsics, at the range read from
+that camera's depth stream, through the stream's pose.
+
+- **Run it in an editor play session.** It drives the marker component through the
+  editor's Python (Project Settings > Python > Remote Execution), not Remote Control:
+  the project's Remote Control allow-list covers only the bridge receiver, and should.
+  `--editor-project` picks the editor (default `RammpUI`).
+- **It streams its own camera** over RMSS, on `test/markers/color` and
+  `test/markers/depth`, with intrinsics and a pose in the metadata the stream bridge
+  already reads. The values are deliberately asymmetric (fx ≠ fy, an off-centre
+  principal point, a roll), so a swapped axis or a dropped angle can't pass. Depth is a
+  wall at 2 m, a box at 1.2 m and a patch with no return.
+- **What it checks:**
+  - whether a component in the level places markers from bridge pushes (one
+    `position_m` object pushed through the receiver);
+  - the whole app path: a 2D object pushed through the receiver in the bridge's
+    own form (`{"X", "Y"}` pixels) gets a derived marker from the level's
+    component;
+  - a derived position from current depth with nothing but the component itself;
+  - the projection at the centre, a corner, the opposite corner and the wall,
+    against positions computed independently;
+  - no position where depth has no return, or for a point outside the image;
+  - the bridge's `source: "scene"` alias. That needs the scene camera to
+    carry intrinsics, a pose and depth: `markers --scene` streams the test
+    camera on the scene camera's own stream ids (taking over the scene view
+    while it runs), which decides it and adds an object exactly as the bridge
+    sends one;
+  - one-object payloads in every form the bridge uses: `centroid` and `box` as
+    arrays and as `{"X", ...}` objects, normalized and in pixels, `source` on the
+    object or only on the push;
+  - sent `position_m` in both frames, as controls.
+- **It uses a temporary component of its own** for the derive and payload checks,
+  and holds a raw-depth request while it needs one. It destroys the one and releases
+  the other afterwards, also after a run that died half way. The level's projection
+  manager gives the test camera a projector of its own; that is removed too (not
+  under `--scene`, where the projector is the real scene camera's).
+- **Its own stream ids by default.** Before RammsUI's world-marker fixes, the stream
+  bridge read a stream's intrinsics and size only the first time it saw it, so a
+  scene stream first sent without intrinsics (the synthetic video in `walkthrough`
+  and `stream` sends none) never gained them. It now re-registers a stream when
+  either changes.
 
 **The robot display's joints** are checked automatically. They go through
 `SetAllJointTargets` (preset label `Set All Joint Targets`) on the display's
