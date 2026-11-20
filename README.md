@@ -3,6 +3,14 @@
 Python tools for interacting with RAMMS-based Unreal Engine projects via the
 [Remote Control API](https://dev.epicgames.com/documentation/en-us/unreal-engine/remote-control-for-unreal-engine).
 
+Related repositories:
+
+- [rammp-org/rammp-ui](https://github.com/rammp-org/rammp-ui), the RAMMP user interface (RammpUI).
+  Tools here drive it, test it, and replay robot recordings into it: see
+  [`ramms-bag`](#ramms-bag--replay-a-recorded-rammp-bag-into-rammpui) and
+  [`ramms-ui-bridge-test`](#ramms-ui-bridge-test--rammp-ui-bridge-interfaces).
+- [rammp-org/ramms-sim](https://github.com/rammp-org/ramms-sim), the RAMMS simulation.
+
 ## Installation
 
 ```bash
@@ -41,6 +49,7 @@ pip install -e '.[exr]'
 - For moving traffic (`ramms-worldgen traffic`): the **RammsCrowd** plugin on a traffic level
 - For skeletal pose control: the **RammsCore** plugin with `URammsSkeletalPoseComponent`
 - For UI features: the **RammsUI** plugin with `URammsRemoteBridge`
+- For replaying robot bags into the UI (`ramms-bag`): a running [RammpUI](https://github.com/rammp-org/rammp-ui)
 - For binary streaming: the **RammsStreaming** plugin (TCP port 30030)
 - For world generation: the **RammsWorldGen** plugin with `URammsWorldGenBridge`
 - The **Textual** TUI library (`pip install 'ramms-tools[tui]'` or `pip install textual`)
@@ -806,6 +815,126 @@ Requires the `exr` optional dependency for capture replay:
 ```bash
 pip install 'ramms-tools[exr]'   # OpenEXR + Imath
 ```
+
+### `ramms-bag` — Replay a recorded RAMMP bag into RammpUI
+
+Plays a ROS 2 bag recorded on the robot into a running RammpUI (PIE, `-game` or
+packaged) through the interfaces the robot itself uses: RMSS for the cameras,
+Remote Control for detected objects and the robot display's joints. No ROS
+install is needed: the rosbag2 sqlite files are read directly and the messages
+decoded by `ramms_tools.rosbag`.
+
+```bash
+ramms-bag info BAG                          # topics, cameras, objects, and what a replay will and will not show
+ramms-bag play BAG                          # real time
+ramms-bag play BAG --rate 2 --start 30 --end 60 --loop
+ramms-bag play BAG --overlay segmentation   # the overlay slot: wrist (default) | segmentation | segmenter | none
+ramms-bag play BAG --positions derived      # no 3D from the tracker: RammsUI derives markers from depth
+ramms-bag play BAG --verify                 # afterwards, check the 3D markers landed where the bag says
+ramms-bag play BAG --dry-run                # send nothing; count what would be sent
+```
+
+BAG is a rosbag2 directory (`metadata.yaml` plus `.db3` files). A zipped bag
+has to be extracted first; `ramms-bag` prints the `unzip` command.
+
+#### Running a bag through RammpUI, step by step
+
+1. **The UI.** Clone [rammp-org/rammp-ui](https://github.com/rammp-org/rammp-ui)
+   with its submodules, open `RammpUI.uproject` in Unreal Engine 5.8 and press
+   **Play**. `Map_UI` loads by default. Playing starts the RMSS server (port
+   30030) and Remote Control (port 30010); a packaged or `-game` build works too.
+   Its README has a short version of these steps, under
+   [Replaying robot recordings](https://github.com/rammp-org/rammp-ui#replaying-robot-recordings).
+2. **This package.** `pip install -e .` from this repository (NumPy is the only
+   requirement; `--overlay segmenter` also needs Pillow).
+3. **The bag.** Copy the recording to the machine and extract it if it is a zip,
+   so that `BAG` is the directory holding `metadata.yaml`. Then check what it has:
+   ```bash
+   ramms-bag info BAG
+   ```
+   It lists the topics, both cameras' intrinsics and poses, the tracked object
+   ids and segmentation classes, and warns when the bag cannot show 3D (see
+   *frozen* below).
+4. **Play it.**
+   ```bash
+   ramms-bag play BAG --start 25 --end 45          # 20 s of it: cameras, objects, joints, the wrist camera
+   ```
+   - **Toggle Scene Camera** in the status bar switches between the scene
+     camera, with each tracked object's 2D box, and the 3D view: the point cloud
+     from the bag's depth, with a marker and label for each tracked object where
+     the bag says it is.
+   - Objects with a 3D marker get no POI pill; objects without one (2D only,
+     occluded, or no depth for a derived marker) keep theirs.
+   - The overlay window opens by itself. It shows the wrist camera, or with
+     `--overlay segmentation` the scene frame the segmenter ran on, plus the
+     segmenter's own boxes.
+   - The robot display follows the arm's recorded joints.
+5. **Segmentation masks** are a data stream of the overlay window, not its
+   default view. Select it in the editor's Python console while the replay runs:
+   ```python
+   import unreal
+   w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_game_world()
+   for cam in unreal.ObjectIterator(unreal.RammsCameraWidget):
+       if cam.get_world() == w and cam.get_stream_set() == unreal.RammsCameraStreamSet.ENGINE_OVERLAY:
+           ids = [str(d.get_editor_property("stream_id")) for d in cam.get_data_streams()]
+           cam.set_data_stream_index(next(i for i, d in enumerate(ids) if d.endswith("segmentation")))
+           cam.set_view_mode(unreal.RammsCameraViewMode.OVERLAY)           # RGB to go back
+   ```
+   Select it before the masks arrive: changing the data stream drops the
+   current frame until the next one comes.
+6. **Check it** (editor PIE only):
+   ```bash
+   ramms-bag play BAG --start 30 --end 40 --verify
+   ramms-bag play BAG --start 30 --end 40 --positions derived --verify
+   ```
+   `--verify` reads the world markers back through the editor's Python remote
+   execution, which RammpUI enables in `Config/DefaultEngine.ini`. It prints
+   one line per check and exits non-zero if any fails.
+
+When something is missing:
+
+| Symptom | Cause |
+|---|---|
+| `cannot reach the UI's Remote Control preset` / `cannot connect to RMSS` | The UI is not playing, or is on another host (`--host`, `--rc-port`, `--rmss-port`) |
+| `joints not replayed` | No robot display with joint targets in the level; everything else still plays |
+| Markers stay where the robot began while the camera moves | The bag has no `odom->base_link` (*frozen*): use its `_vo` version, or `--positions derived` |
+| `--start ... / --end ... select no part of this ... bag` | The window is outside the bag; `ramms-bag info` gives its length |
+| `the --start/--end window holds none of the played topics' messages` | The window is too short to hold a frame (frames are 66 ms apart at 15 Hz) |
+| `colour encoding ... is not sent` | Only bgr8, rgb8, bgra8, rgba8 and mono8 colour go out; that camera's depth and the objects still do |
+
+**What goes where:**
+
+| Bag | UI |
+|---|---|
+| `/scene_camera/color/image_raw` | RMSS ch 0 `camera/scene/color`, with intrinsics (CameraInfo) and the camera's pose (TF) |
+| `/scene_camera/depth/image_rect_raw` (16UC1 mm) | RMSS ch 1 `camera/scene/depth`, the same |
+| `/perception/object_detections` (the tracker) | `UpdateDetectedObjects`: normalized 2D boxes, and 3D markers from each object's camera-frame pose, size and orientation, with `time_since_detection_s` |
+| `/joint_states` | `SetAllJointTargets` on the robot display, by joint name (`arm_joint_N` to `link_{N-1}` in degrees; the gripper's knuckle to its fingers) |
+| overlay slot (`--overlay`) | `wrist`: the wrist camera with its moving pose (ch 2 `engine/overlay`, ch 4 `engine/overlay/depth`). `segmentation`: the scene frame with the segmenter's masks, one value per class (ch 3 `engine/overlay/segmentation`), and the segmenter's own boxes on the overlay (2D only, ids `seg:...`); the overlay's depth channel is emptied first, so an earlier wrist replay's depth cannot place those boxes in 3D. `segmenter`: the segmenter's own rendering (needs Pillow) |
+
+- **Camera poses** are the camera body frame in `base_link`, sent `relative`,
+  so the UE stream receiver stands for the robot's base. Both camera streams
+  carry them, where the UI bridge sends them on depth only; RammsUI takes either.
+- **Staleness** (`time_since_detection_s`) is counted from the last time the
+  5 Hz segmenter actually saw the object: a raw box overlapping the tracked one,
+  whatever class the segmenter gave it. A tracker carrying an object forward is
+  not a sighting, so an occluded object's age keeps growing. On the `_vo` bag
+  this matches the producer's own values within 0.04 s 91% of the time.
+- **On exit** (the end, Ctrl-C or an error) the UI is put back: detections are
+  cleared, the overlay window closed and the joints restored.
+- **`--verify`** re-pushes the newest set of 3D objects and reads back, through
+  the editor's Python, where the world markers landed. Each must be within 1 cm
+  of the bag's own pose, composed with the stream receiver's transform. With
+  `--positions derived`, within 1 cm of where RammsUI must derive it from the
+  last depth frame sent (the distance to the tracker's own 3D centre is printed
+  as well). Joint targets are read back too.
+- **`--loop`** repeats the window; each pass lasts the whole window (at least
+  50 ms), however early its last message.
+- **The Nov 19 2026 main bag's 3D is frozen.** It has no `odom->base_link` in
+  `/tf`, so each tracked object keeps the position it had when the bag began
+  while the camera drives on. `info` and `play` warn about this. Use the bag
+  re-processed with visual odometry (`_vo`) for 3D markers, or
+  `--positions derived`.
 
 ### `ramms-ui-bridge-test` — RAMMP UI Bridge Interfaces
 
