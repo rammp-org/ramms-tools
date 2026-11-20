@@ -807,6 +807,61 @@ Requires the `exr` optional dependency for capture replay:
 pip install 'ramms-tools[exr]'   # OpenEXR + Imath
 ```
 
+### `ramms-bag` — Replay a recorded RAMMP bag into RammpUI
+
+Plays a ROS 2 bag recorded on the robot into a running RammpUI (PIE, `-game` or
+packaged) through the interfaces the robot itself uses: RMSS for the cameras,
+Remote Control for detected objects and the robot display's joints. No ROS
+install is needed: the rosbag2 sqlite files are read directly and the messages
+decoded by `ramms_tools.rosbag`.
+
+```bash
+ramms-bag info BAG                          # topics, cameras, objects, and what a replay will and will not show
+ramms-bag play BAG                          # real time
+ramms-bag play BAG --rate 2 --start 30 --end 60 --loop
+ramms-bag play BAG --overlay segmentation   # the overlay slot: wrist (default) | segmentation | segmenter | none
+ramms-bag play BAG --positions derived      # no 3D from the tracker: RammsUI derives markers from depth
+ramms-bag play BAG --verify                 # afterwards, check the 3D markers landed where the bag says
+ramms-bag play BAG --dry-run                # send nothing; count what would be sent
+```
+
+BAG is a rosbag2 directory (`metadata.yaml` plus `.db3` files). A zipped bag
+has to be extracted first; `ramms-bag` prints the `unzip` command.
+
+**What goes where:**
+
+| Bag | UI |
+|---|---|
+| `/scene_camera/color/image_raw` | RMSS ch 0 `camera/scene/color`, with intrinsics (CameraInfo) and the camera's pose (TF) |
+| `/scene_camera/depth/image_rect_raw` (16UC1 mm) | RMSS ch 1 `camera/scene/depth`, the same |
+| `/perception/object_detections` (the tracker) | `UpdateDetectedObjects`: normalized 2D boxes, and 3D markers from each object's camera-frame pose, size and orientation, with `time_since_detection_s` |
+| `/joint_states` | `SetAllJointTargets` on the robot display, by joint name (`arm_joint_N` to `link_{N-1}` in degrees; the gripper's knuckle to its fingers) |
+| overlay slot (`--overlay`) | `wrist`: the wrist camera with its moving pose (ch 2 `engine/overlay`, ch 4 `engine/overlay/depth`). `segmentation`: the scene frame with the segmenter's masks, one value per class (ch 3 `engine/overlay/segmentation`), and the segmenter's own boxes on the overlay (2D only, ids `seg:...`); the overlay's depth channel is emptied first, so an earlier wrist replay's depth cannot place those boxes in 3D. `segmenter`: the segmenter's own rendering (needs Pillow) |
+
+- **Camera poses** are the camera body frame in `base_link`, sent `relative`,
+  so the UE stream receiver stands for the robot's base. Both camera streams
+  carry them, where the UI bridge sends them on depth only; RammsUI takes either.
+- **Staleness** (`time_since_detection_s`) is counted from the last time the
+  5 Hz segmenter actually saw the object: a raw box overlapping the tracked one,
+  whatever class the segmenter gave it. A tracker carrying an object forward is
+  not a sighting, so an occluded object's age keeps growing. On the `_vo` bag
+  this matches the producer's own values within 0.04 s 91% of the time.
+- **On exit** (the end, Ctrl-C or an error) the UI is put back: detections are
+  cleared, the overlay window closed and the joints restored.
+- **`--verify`** re-pushes the newest set of 3D objects and reads back, through
+  the editor's Python, where the world markers landed. Each must be within 1 cm
+  of the bag's own pose, composed with the stream receiver's transform. With
+  `--positions derived`, within 1 cm of where RammsUI must derive it from the
+  last depth frame sent (the distance to the tracker's own 3D centre is printed
+  as well). Joint targets are read back too.
+- **`--loop`** repeats the window; each pass lasts the whole window (at least
+  50 ms), however early its last message.
+- **The Nov 19 2026 main bag's 3D is frozen.** It has no `odom->base_link` in
+  `/tf`, so each tracked object keeps the position it had when the bag began
+  while the camera drives on. `info` and `play` warn about this. Use the bag
+  re-processed with visual odometry (`_vo`) for 3D markers, or
+  `--positions derived`.
+
 ### `ramms-ui-bridge-test` — RAMMP UI Bridge Interfaces
 
 Exercise the `RammsBridgeReceiver` surfaces the RAMMP UI bridge drives —
